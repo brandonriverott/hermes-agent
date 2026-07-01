@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import agent.cc_prompt_capture as cc_prompt_capture
 from agent.copilot_acp_client import CopilotACPClient
 
 
@@ -103,10 +104,16 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.assertEqual(chunks[1].choices, [])
 
     def test_timeout_object_is_coerced_for_streaming_requests(self) -> None:
-        captured: dict[str, float] = {}
+        captured: dict[str, object] = {}
 
-        def fake_run_prompt(prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+        def fake_run_prompt(
+            prompt_text: str,
+            *,
+            timeout_seconds: float,
+            model: str | None = None,
+        ) -> tuple[str, str]:
             captured["timeout"] = timeout_seconds
+            captured["model"] = model
             return "ok", ""
 
         timeout = type(
@@ -126,6 +133,7 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
             )
 
         self.assertEqual(captured["timeout"], 12.0)
+        self.assertEqual(captured["model"], "copilot-acp")
 
     def _dispatch(self, message: dict, *, cwd: str) -> dict:
         process = _FakeProcess()
@@ -260,6 +268,8 @@ if __name__ == "__main__":
 from unittest.mock import patch as _patch
 import pytest
 
+import agent.dispatch_logging as dispatch_logging
+
 
 def _make_home_client(tmp_path):
     return CopilotACPClient(
@@ -280,6 +290,8 @@ def _fake_popen_capture(captured):
 
 
 def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch, tmp_path):
+    monkeypatch.setattr(dispatch_logging, "dispatch_log_path", lambda: tmp_path / "dispatch.jsonl")
+    monkeypatch.setattr(cc_prompt_capture, "cc_prompts_dir", lambda: tmp_path / "cc_prompts")
     hermes_home = tmp_path / "hermes"
     (hermes_home / "home").mkdir(parents=True)
     real_home = tmp_path / "real-home"
@@ -300,6 +312,8 @@ def test_run_prompt_preserves_real_home_when_profile_home_available(monkeypatch,
 
 
 def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
+    monkeypatch.setattr(dispatch_logging, "dispatch_log_path", lambda: tmp_path / "dispatch.jsonl")
+    monkeypatch.setattr(cc_prompt_capture, "cc_prompts_dir", lambda: tmp_path / "cc_prompts")
     monkeypatch.delenv("HOME", raising=False)
     monkeypatch.delenv("HERMES_HOME", raising=False)
 

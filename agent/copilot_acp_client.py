@@ -26,7 +26,9 @@ from openai.types.chat.chat_completion_message_tool_call import (
     Function,
 )
 
+from agent.cc_prompt_capture import capture_cc_prompt
 from agent.file_safety import get_read_block_error, is_write_denied
+from agent.dispatch_logging import log_acp_subprocess_dispatch, prompt_hash_from_value
 from agent.redact import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
 
@@ -473,6 +475,7 @@ class CopilotACPClient:
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
+            model=model,
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
@@ -501,8 +504,40 @@ class CopilotACPClient:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        model: str | None = None,
+    ) -> tuple[str, str]:
         try:
+            prompt_hash = prompt_hash_from_value(prompt_text)
+            log_acp_subprocess_dispatch(
+                command=self._acp_command,
+                args=list(self._acp_args),
+                cwd=self._acp_cwd,
+                prompt_text=prompt_text,
+                model=model,
+                prompt_hash=prompt_hash,
+            )
+            capture_cc_prompt(
+                prompt_text,
+                prompt_hash,
+                {
+                    "seat": (
+                        os.environ.get("HERMES_AGENT_SEAT")
+                        or os.environ.get("HERMES_PROFILE")
+                        or os.environ.get("HERMES_KANBAN_ASSIGNEE")
+                        or "unknown"
+                    ),
+                    "session_id": os.environ.get("HERMES_SESSION_ID") or None,
+                    "dispatch_path": "acp.subprocess.Popen",
+                    "model": model,
+                    "command_name": Path(str(self._acp_command)).name,
+                    "cwd": self._acp_cwd,
+                },
+            )
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
                 stdin=subprocess.PIPE,
