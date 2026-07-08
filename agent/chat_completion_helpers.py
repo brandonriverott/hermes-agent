@@ -752,6 +752,13 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
+        # Prompt-cache knobs from the provider/profile config (carried on
+        # request_overrides): a per-profile prompt_cache_key override and the
+        # OpenAI Responses prompt_cache_retention window. Passed as first-class
+        # params so the transport can validate/backend-gate them; the transport
+        # drops the raw copies from request_overrides to avoid double-handling.
+        _ro = agent.request_overrides if isinstance(agent.request_overrides, dict) else {}
+
         return _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
@@ -761,6 +768,8 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
+            prompt_cache_key=_ro.get("prompt_cache_key"),
+            prompt_cache_retention=_ro.get("prompt_cache_retention"),
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,

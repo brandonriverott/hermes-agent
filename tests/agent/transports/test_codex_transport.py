@@ -521,6 +521,147 @@ class TestCodexBuildKwargs:
         assert "reasoning" not in kw
 
 
+class TestCodexPromptCacheRetention:
+    """OpenAI Responses ``prompt_cache_retention`` — defaults to '24h' for the
+    gpt-5.5 family, supports 'in_memory', OpenAI-native only."""
+
+    @pytest.fixture
+    def transport(self):
+        from agent.transports.codex import ResponsesApiTransport
+        return ResponsesApiTransport()
+
+    def test_gpt55_defaults_to_24h(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=[{"role": "user", "content": "Hi"}], tools=[],
+        )
+        assert kw.get("prompt_cache_retention") == "24h"
+
+    def test_gpt55_variant_defaults_to_24h(self, transport):
+        for model in ("gpt-5.5-pro", "gpt-5.5-2026-04-23", "openai/gpt-5.5"):
+            kw = transport.build_kwargs(
+                model=model, messages=[{"role": "user", "content": "Hi"}], tools=[],
+            )
+            assert kw.get("prompt_cache_retention") == "24h", model
+
+    def test_non_gpt55_omits_retention(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=[{"role": "user", "content": "Hi"}], tools=[],
+        )
+        assert "prompt_cache_retention" not in kw
+
+    def test_explicit_in_memory_supported(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=[{"role": "user", "content": "Hi"}], tools=[],
+            prompt_cache_retention="in_memory",
+        )
+        assert kw.get("prompt_cache_retention") == "in_memory"
+
+    def test_explicit_24h_on_non_family_model(self, transport):
+        """An explicit config value applies even to models outside the family."""
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=[{"role": "user", "content": "Hi"}], tools=[],
+            prompt_cache_retention="24h",
+        )
+        assert kw.get("prompt_cache_retention") == "24h"
+
+    def test_invalid_value_falls_back_to_family_default(self, transport):
+        # gpt-5.5: unrecognized value ignored → family default 24h.
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=[{"role": "user", "content": "Hi"}], tools=[],
+            prompt_cache_retention="forever",
+        )
+        assert kw.get("prompt_cache_retention") == "24h"
+        # non-family: unrecognized value ignored → field omitted.
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=[{"role": "user", "content": "Hi"}], tools=[],
+            prompt_cache_retention="forever",
+        )
+        assert "prompt_cache_retention" not in kw
+
+    def test_retention_not_sent_to_xai(self, transport):
+        """prompt_cache_retention is OpenAI-native — xAI rejects unknown fields."""
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=[{"role": "user", "content": "Hi"}], tools=[],
+            is_xai_responses=True,
+            prompt_cache_retention="24h",
+        )
+        assert "prompt_cache_retention" not in kw
+        assert "prompt_cache_retention" not in kw.get("extra_body", {})
+
+    def test_retention_not_sent_to_github(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.5", messages=[{"role": "user", "content": "Hi"}], tools=[],
+            is_github_responses=True,
+            prompt_cache_retention="24h",
+        )
+        assert "prompt_cache_retention" not in kw
+
+    def test_raw_retention_in_request_overrides_stripped(self, transport):
+        """A raw prompt_cache_retention on request_overrides must not bypass the
+        first-class handling (it would 400 on non-native backends)."""
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=[{"role": "user", "content": "Hi"}], tools=[],
+            request_overrides={"prompt_cache_retention": "in_memory"},
+        )
+        # request_overrides alone doesn't drive the field — only the first-class
+        # param does. gpt-5.4 has no family default, so the field is omitted.
+        assert "prompt_cache_retention" not in kw
+
+    def test_preflight_allows_retention(self, transport):
+        from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+        result = _preflight_codex_api_kwargs({
+            "model": "gpt-5.5",
+            "instructions": "test",
+            "input": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "pck_abc",
+            "prompt_cache_retention": "24h",
+        })
+        assert result["prompt_cache_retention"] == "24h"
+
+
+class TestCodexPromptCacheKeyOverride:
+    """Per-profile ``prompt_cache_key`` override — replaces the derived pck_ key."""
+
+    @pytest.fixture
+    def transport(self):
+        from agent.transports.codex import ResponsesApiTransport
+        return ResponsesApiTransport()
+
+    def test_override_replaces_derived_key(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=[{"role": "user", "content": "Hi"}], tools=[],
+            session_id="sess-1",
+            prompt_cache_key="team-shared-bucket",
+        )
+        assert kw.get("prompt_cache_key") == "team-shared-bucket"
+
+    def test_blank_override_falls_back_to_derived_key(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=[{"role": "user", "content": "Hi"}], tools=[],
+            prompt_cache_key="   ",
+        )
+        assert kw.get("prompt_cache_key", "").startswith("pck_")
+
+    def test_override_flows_into_xai_extra_body(self, transport):
+        kw = transport.build_kwargs(
+            model="grok-4.3", messages=[{"role": "user", "content": "Hi"}], tools=[],
+            session_id="conv-xai-1",
+            is_xai_responses=True,
+            prompt_cache_key="team-shared-bucket",
+        )
+        assert "prompt_cache_key" not in kw
+        assert kw.get("extra_body", {}).get("prompt_cache_key") == "team-shared-bucket"
+
+    def test_raw_override_in_request_overrides_stripped(self, transport):
+        """A raw prompt_cache_key on request_overrides is dropped (handled as a
+        first-class knob instead); the derived key stands when no param is set."""
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=[{"role": "user", "content": "Hi"}], tools=[],
+            request_overrides={"prompt_cache_key": "raw-leak"},
+        )
+        assert kw.get("prompt_cache_key", "").startswith("pck_")
+
+
 class TestCodexValidateResponse:
 
     def test_none_response(self, transport):

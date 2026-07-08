@@ -46,6 +46,45 @@ def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]])
     return f"pck_{digest}"
 
 
+# Recognized values for the OpenAI Responses ``prompt_cache_retention`` field.
+# ``24h`` opts into extended (24-hour) prompt-cache retention; ``in_memory`` is
+# the standard short-lived cache. Any other configured value is ignored and the
+# family default (below) applies.
+_PROMPT_CACHE_RETENTION_VALUES = {"24h", "in_memory"}
+
+
+def _is_gpt55_family(model: Optional[str]) -> bool:
+    """True for the gpt-5.5 model family (gpt-5.5, gpt-5.5-pro, dated snapshots).
+
+    Matched by the bare slug so aggregator prefixes (``openai/gpt-5.5``) and
+    variant suffixes are all covered without re-listing every snapshot.
+    """
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return (
+        bare == "gpt-5.5"
+        or bare.startswith("gpt-5.5-")
+        or bare.startswith("gpt-5.5.")
+    )
+
+
+def _resolve_prompt_cache_retention(configured: Any, model: str) -> Optional[str]:
+    """Resolve the OpenAI Responses ``prompt_cache_retention`` field.
+
+    An explicit, recognized config value (``24h`` or ``in_memory``) wins. When
+    none is configured the gpt-5.5 family defaults to ``24h`` — its long-running
+    Codex sessions benefit from the extended prompt-cache retention — and every
+    other model omits the field so the provider applies its own default.
+    Returns None when the field should not be sent.
+    """
+    if isinstance(configured, str):
+        normalized = configured.strip().lower()
+        if normalized in _PROMPT_CACHE_RETENTION_VALUES:
+            return normalized
+    if _is_gpt55_family(model):
+        return "24h"
+    return None
+
+
 class ResponsesApiTransport(ProviderTransport):
     """Transport for api_mode='codex_responses'.
 
@@ -120,6 +159,12 @@ class ResponsesApiTransport(ProviderTransport):
             is_codex_backend: bool — chatgpt.com/backend-api/codex
             is_xai_responses: bool — xAI/Grok backend
             github_reasoning_extra: dict | None — Copilot reasoning params
+            prompt_cache_key: str | None — per-profile override for the
+                content-addressed cache key (from provider config). When a
+                non-empty string is given it replaces the derived ``pck_`` key.
+            prompt_cache_retention: str | None — OpenAI Responses cache
+                retention ('24h' or 'in_memory'). Defaults to '24h' for the
+                gpt-5.5 family, omitted otherwise. OpenAI-native only.
         """
         from agent.codex_responses_adapter import (
             _chat_messages_to_responses_input,
@@ -255,12 +300,29 @@ class ResponsesApiTransport(ProviderTransport):
         # per-fire timestamp in session_id (cron_<id>_<ts>) that made every run
         # cache-cold. session_id is left untouched for transcript isolation and
         # the cache-scope routing headers below. Falls back to session_id when
-        # there is no static content to hash.
-        cache_key = _content_cache_key(instructions, response_tools) or session_id
+        # there is no static content to hash. A per-profile ``prompt_cache_key``
+        # override (from provider config) wins over the derived key when set —
+        # lets operators pin several agents to a shared warm cache bucket.
+        cache_key_override = params.get("prompt_cache_key")
+        if isinstance(cache_key_override, str) and cache_key_override.strip():
+            cache_key = cache_key_override.strip()
+        else:
+            cache_key = _content_cache_key(instructions, response_tools) or session_id
+
+        # OpenAI Responses prompt-cache retention. Native-OpenAI-only field
+        # (xAI/GitHub reject unknown request fields), so it's set alongside the
+        # native prompt_cache_key below. Defaults to '24h' for the gpt-5.5
+        # family, omitted otherwise.
+        prompt_cache_retention = _resolve_prompt_cache_retention(
+            params.get("prompt_cache_retention"), model
+        )
+
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
         if not is_github_responses and not is_xai_responses and cache_key:
             kwargs["prompt_cache_key"] = cache_key
+            if prompt_cache_retention:
+                kwargs["prompt_cache_retention"] = prompt_cache_retention
 
         if reasoning_enabled and is_xai_responses:
             from agent.model_metadata import grok_supports_reasoning_effort
@@ -294,7 +356,16 @@ class ResponsesApiTransport(ProviderTransport):
 
         request_overrides = params.get("request_overrides")
         if request_overrides:
-            kwargs.update(request_overrides)
+            # prompt_cache_key / prompt_cache_retention are handled above as
+            # first-class knobs (validated, backend-gated). Drop any raw copies
+            # here so they can't bypass that handling or leak a top-level field
+            # onto xAI/GitHub, which reject unknown request fields.
+            _overrides = {
+                k: v for k, v in request_overrides.items()
+                if k not in ("prompt_cache_key", "prompt_cache_retention")
+            }
+            if _overrides:
+                kwargs.update(_overrides)
 
         # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not
         # supported: service_tier") — hit when ``/fast`` priority-processing
