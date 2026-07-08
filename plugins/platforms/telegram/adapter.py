@@ -5288,6 +5288,32 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    def _resolve_cc_builder_quarantine(self, callback_data: str) -> dict:
+        """Hand a ccbq: callback to the external cc-helper approval module.
+
+        The module lives OUTSIDE this repo (~/.hermes/cc-helper/telegram_approval.py)
+        by design — the builder sandbox denies ~/.hermes reads, so it can't be
+        vendored here. It parses "ccbq:<event_id>:<action>" itself, audits the
+        verdict, and on approve copies the quarantined artifact for review.
+        CC_TELEGRAM_APPROVAL_HELPER overrides the path (tests)."""
+        import importlib.util
+
+        helper = _Path(
+            os.environ.get(
+                "CC_TELEGRAM_APPROVAL_HELPER",
+                str(_Path.home() / ".hermes" / "cc-helper" / "telegram_approval.py"),
+            )
+        )
+        if not helper.exists():
+            return {"ok": False, "error": f"approval helper not found: {helper}"}
+        try:
+            spec = importlib.util.spec_from_file_location("cc_telegram_approval", helper)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.handle_telegram_callback(callback_data)
+        except Exception as exc:  # never let a verdict tap crash the adapter
+            return {"ok": False, "error": str(exc)}
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -5320,6 +5346,48 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_thread_id=query_thread_id,
                 query_user_name=query_user_name,
             )
+            return
+
+        # --- cc-builder quarantine Approve/Deny (ccbq:event_id:action) ---
+        # Buttons are sent by the cc-builder watchdog directly via the Bot API;
+        # this adapter is the only getUpdates consumer, so taps land here. The
+        # verdict machinery lives in cc-helper/telegram_approval.py — pass the
+        # raw callback_data through, it parses prefix:event:action itself.
+        if data.startswith("ccbq:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to resolve quarantines.")
+                return
+
+            result = self._resolve_cc_builder_quarantine(data)
+            parts = data.split(":", 2)
+            event_id = result.get("event_id") or (parts[1] if len(parts) > 1 else "")
+            if result.get("ok"):
+                label = (
+                    "✅ Approved — artifact copied for review"
+                    if result.get("action") == "approve"
+                    else "❌ Denied — artifact left quarantined"
+                )
+            else:
+                label = "⚠️ Could not record verdict — see gateway log"
+                logger.error("ccbq callback failed: %s", result.get("error"))
+            await query.answer(text=label)
+
+            user_display = getattr(query.from_user, "first_name", "User")
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(f"{label} by {user_display} · {event_id}"),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass  # non-fatal if edit fails
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
