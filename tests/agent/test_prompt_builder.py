@@ -1247,6 +1247,7 @@ class TestEnvironmentHints:
         assert "PowerShell" not in result
         assert "hostname" not in result
         assert "WSL" not in result
+        assert "macOS file-search note" not in result
 
     def test_build_environment_hints_on_windows_local(self, monkeypatch):
         import agent.prompt_builder as _pb
@@ -1278,6 +1279,36 @@ class TestEnvironmentHints:
         # macOS must NOT get the Windows-specific callouts.
         assert "PowerShell" not in result
         assert "hostname" not in result
+        assert "macOS file-search note" in result
+        assert "~/Library/Containers" in result
+        assert "include_tcc_paths=true" in result
+        assert "agent.search.include_tcc_paths" in result
+        for protected_name in (
+            "Group Containers",
+            "Mail",
+            "Messages",
+            "Calendars",
+            "Reminders",
+            "Mobile Documents",
+            "CloudStorage",
+            "Photos Library",
+        ):
+            assert protected_name in result
+
+    def test_macos_remote_backend_does_not_get_host_tcc_guidance(self, monkeypatch):
+        import agent.prompt_builder as _pb
+        import sys
+
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: None)
+        _pb._clear_backend_probe_cache()
+
+        result = _pb.build_environment_hints()
+
+        assert "Terminal backend: docker" in result
+        assert "macOS file-search note" not in result
 
     def test_build_environment_hints_suppresses_host_on_docker_backend(self, monkeypatch):
         """Docker/remote backends must hide host info — the agent can only touch the backend."""

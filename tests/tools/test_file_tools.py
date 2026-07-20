@@ -397,10 +397,12 @@ class TestSearchHandler:
 
         from tools.file_tools import search_tool
         search_tool(pattern="class", target="files", path="/src",
-                    file_glob="*.py", limit=10, offset=5, output_mode="count", context=2)
+                    file_glob="*.py", limit=10, offset=5, output_mode="count", context=2,
+                    include_tcc_paths=True)
         mock_ops.search.assert_called_once_with(
             pattern="class", path="/src", target="files", file_glob="*.py",
             limit=10, offset=5, output_mode="count", context=2,
+            include_tcc_paths=True,
         )
 
     @patch("tools.file_tools._get_file_ops")
@@ -416,7 +418,29 @@ class TestSearchHandler:
         mock_ops.search.assert_called_once_with(
             pattern="class", path="/src", target="files", file_glob=None,
             limit=1, offset=0, output_mode="content", context=0,
+            include_tcc_paths=False,
         )
+
+    def test_search_schema_exposes_macos_tcc_override(self):
+        from tools.file_tools import SEARCH_FILES_SCHEMA
+
+        prop = SEARCH_FILES_SCHEMA["parameters"]["properties"]["include_tcc_paths"]
+        assert prop["type"] == "boolean"
+        assert prop["default"] is False
+        assert "macOS" in prop["description"]
+        assert "TCC" in prop["description"]
+        for protected_name in (
+            "Containers",
+            "Group Containers",
+            "Mail",
+            "Messages",
+            "Calendars",
+            "Reminders",
+            "Mobile Documents",
+            "CloudStorage",
+            "Photos Library",
+        ):
+            assert protected_name in prop["description"]
 
     @patch("tools.file_tools._get_file_ops")
     def test_search_exception_returns_error(self, mock_get):

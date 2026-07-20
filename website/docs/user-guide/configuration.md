@@ -656,6 +656,20 @@ file_read_max_chars: 30000
 
 The agent also deduplicates file reads automatically — if the same file region is read twice and the file hasn't changed, a lightweight stub is returned instead of re-sending the content. This resets on context compression so the agent can re-read files after their content is summarized away.
 
+## macOS Protected-Path Search
+
+On macOS, broad `search_files` calls omit TCC-protected app-data locations by default: `~/Library/Containers`, Group Containers, Mail, Messages, Calendars, Reminders, Mobile Documents, CloudStorage, and Photos Library. This prevents a home-directory search from repeatedly triggering macOS privacy prompts. Searches rooted directly inside one of those locations are treated as explicit path intent.
+
+For a single broad search that intentionally needs those paths, pass `include_tcc_paths: true` to `search_files`. To opt in persistently, set:
+
+```yaml
+agent:
+  search:
+    include_tcc_paths: true
+```
+
+The override does not grant access by itself. macOS may still require Full Disk Access for the terminal or app that launches Hermes.
+
 ## Tool Output Truncation Limits
 
 Three related caps control how much raw output a tool can return before Hermes truncates it:
