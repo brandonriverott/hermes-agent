@@ -320,6 +320,21 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
     return False
 
 
+def current_environment_signature() -> tuple:
+    """Return a deterministic signature of the active runtime environments.
+
+    Derived from the *same* per-environment detection ``skill_matches_environment``
+    uses (``_detect_environment`` over ``_KNOWN_ENVIRONMENTS``), so the signature
+    changes exactly when the environment-filtered skills offer would change.
+    Callers fold this into cache keys so a change in active environment yields a
+    freshly filtered block instead of reusing an index built for a different
+    environment. Unknown tags never appear here — they fail open at match time.
+    """
+    return tuple(
+        (env, _detect_environment(env)) for env in sorted(_KNOWN_ENVIRONMENTS)
+    )
+
+
 # ── Disabled skills ───────────────────────────────────────────────────────
 
 

@@ -20,6 +20,7 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS,
     SKILL_SUPPORT_DIRS,
+    current_environment_signature,
     extract_skill_conditions,
     extract_skill_description,
     get_all_skills_dirs,
@@ -1323,7 +1324,10 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-_SKILLS_SNAPSHOT_VERSION = 1
+# v2 added persisted frontmatter ``environments`` so the disk-snapshot fast path
+# can reapply ``skill_matches_environment`` (v1 snapshots omitted it and would
+# fail open). Old snapshots are rejected by the version check and re-scanned.
+_SKILLS_SNAPSHOT_VERSION = 2
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1365,6 +1369,29 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
                 continue
             manifest[path[prefix_len:]] = [st.st_mtime_ns, st.st_size]
     return manifest
+
+
+def _skills_manifest_fingerprint(
+    skills_dir: Path, external_dirs: "list[Path]"
+) -> tuple:
+    """Deterministic, hashable fingerprint of every SKILL.md / DESCRIPTION.md
+    across the local and external skill dirs (mtime + size).
+
+    Folded into the in-process cache key so that any added, removed, or changed
+    skill file invalidates a cached prompt for the *next* prompt build — the LRU
+    can no longer return a block assembled from a stale file tree without a
+    manual clear. Byte-stable for an unchanged tree, so repeated builds within a
+    conversation stay identical.
+    """
+    def _items(manifest: dict) -> tuple:
+        return tuple((k, tuple(v)) for k, v in sorted(manifest.items()))
+
+    local = _build_skills_manifest(skills_dir) if skills_dir.exists() else {}
+    parts: list[tuple] = [("", _items(local))]
+    for ext_dir in external_dirs:
+        ext = _build_skills_manifest(ext_dir) if ext_dir.exists() else {}
+        parts.append((str(ext_dir), _items(ext)))
+    return tuple(parts)
 
 
 def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
@@ -1424,12 +1451,20 @@ def _build_snapshot_entry(
     if isinstance(platforms, str):
         platforms = [platforms]
 
+    # Persist the raw environment tags so the disk-snapshot fast path can
+    # reapply skill_matches_environment. Keep unknown tags verbatim — they must
+    # still fail open at match time exactly as the cold path does.
+    environments = frontmatter.get("environments") or []
+    if isinstance(environments, str):
+        environments = [environments]
+
     return {
         "skill_name": skill_name,
         "category": category,
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
+        "environments": [str(e).strip() for e in environments if str(e).strip()],
         "conditions": extract_skill_conditions(frontmatter),
     }
 
@@ -1515,6 +1550,9 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    progressive: bool = False,
+    priority_skills: "frozenset[str] | None" = None,
+    priority_categories: "frozenset[str] | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1535,6 +1573,20 @@ def build_skills_system_prompt(
     the rendered index. Nothing is ever hidden: every skill name stays
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
+
+    ``progressive`` (opt-in, ``skills.progressive.enabled`` in config.yaml)
+    switches the startup index to progressive-disclosure mode: only skills in
+    the high-priority set — ``priority_skills`` by frontmatter name, plus every
+    skill in a ``priority_categories`` category — keep their one-sentence
+    descriptions. Every other eligible skill is collapsed into a single compact
+    per-category coverage line that reports how many more skills the category
+    holds *without* listing their names or descriptions, so the startup block
+    stays short. Those non-priority skills are found on demand via
+    ``skills_list(query=...)`` (matched by name, description, category, or tag)
+    + ``skill_view(name)``. The legacy full catalog is the default
+    (``progressive=False``) and is unchanged. Rendering is a pure function of
+    the on-disk skills plus these arguments, so the block is byte-stable for the
+    life of a conversation.
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
@@ -1545,8 +1597,19 @@ def build_skills_system_prompt(
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
+    #
+    # The key is validity-aware: it folds in a fingerprint of every skill file
+    # (local + external, mtime/size) and a signature of the currently-active
+    # runtime environments. Because the LRU returns before disk-manifest
+    # validation, a key that ignored these would let a later conversation
+    # inherit a block built from stale files or a different environment filter.
+    # With them, a changed/added/removed skill or a changed active environment
+    # deterministically produces a fresh block on the next build — without a
+    # manual clear — while an unchanged tree stays byte-stable.
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    priority_skills = frozenset(priority_skills or ())
+    priority_categories = frozenset(priority_categories or ())
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -1555,6 +1618,11 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        bool(progressive),
+        tuple(sorted(priority_skills)),
+        tuple(sorted(priority_categories)),
+        _skills_manifest_fingerprint(skills_dir, external_dirs),
+        current_environment_signature(),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1578,6 +1646,15 @@ def build_skills_system_prompt(
             frontmatter_name = entry.get("frontmatter_name") or skill_name
             platforms = entry.get("platforms") or []
             if not skill_matches_platform_list(platforms):
+                continue
+            # Reapply the environment relevance gate on the fast path — the cold
+            # scan applied it via _parse_skill_file, but the snapshot persists
+            # every parsed skill regardless, so without this a skill gated to an
+            # inactive environment would resurface from disk. Unknown tags still
+            # fail open (skill_matches_environment handles that).
+            if not skill_matches_environment(
+                {"environments": entry.get("environments") or []}
+            ):
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
@@ -1689,25 +1766,42 @@ def build_skills_system_prompt(
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
 
     # Posture-driven category demotion (e.g. non-coding skills while pairing
-    # on code). Demoted categories stay in the index as a single names-only
-    # line — descriptions are dropped to cut noise, but every skill name
-    # remains visible so memory-anchored recall ("load <name>") keeps working.
-    # NEVER remove entries entirely: agent-created skills are the model's
-    # project memory, and models don't reach for skills_list to rediscover
-    # what the index stops showing them. Match on the top-level category
-    # segment so nested categories ("social-media/twitter") are demoted with
-    # their parent.
+    # on code). In the legacy renderer demoted categories stay in the index as a
+    # single names-only line — descriptions are dropped to cut noise, but every
+    # skill name remains visible so memory-anchored recall ("load <name>") keeps
+    # working. NEVER remove entries entirely in legacy mode: agent-created skills
+    # are the model's project memory, and models don't reach for skills_list to
+    # rediscover what the index stops showing them. (Progressive mode is the
+    # deliberate exception: it collapses non-priority skills to a compact count
+    # and directs the model to skills_list(query=...) for rediscovery.) Match on
+    # the top-level category segment so nested categories
+    # ("social-media/twitter") are demoted with their parent.
     demoted = frozenset(
         cat for cat in skills_by_category
         if cat.split("/", 1)[0] in (compact_categories or frozenset())
     )
 
+    # The [names only] demotion note only applies to the legacy renderer. In
+    # progressive mode demoted categories are handled by the compact per-
+    # category coverage line (no names are dumped), and the progressive note
+    # below already explains how to rediscover any omitted skill.
     hidden_note = ""
-    if demoted:
+    if demoted and not progressive:
         hidden_note = (
             "\n(Categories marked [names only] are outside the current coding "
             "context, so their descriptions are omitted — the skills work "
             "normally and load with skill_view(name) as usual.)"
+        )
+
+    progressive_note = ""
+    if progressive:
+        progressive_note = (
+            "\n(Progressive index: only high-priority skills show a description. "
+            "Every other category is summarized by a compact coverage line that "
+            "counts how many more skills it holds without listing them, to keep "
+            "this block short. Every skill still works — to find one that isn't "
+            "described here, search all skills by name, description, category, or "
+            "tag with skills_list(query='...'), then load it with skill_view(name).)"
         )
 
     if not skills_by_category:
@@ -1717,7 +1811,10 @@ def build_skills_system_prompt(
         for category in sorted(skills_by_category.keys()):
             # Deduplicate and sort skills within each category
             seen = set()
-            if category in demoted:
+            # Legacy posture demotion dumps every name on one line. In
+            # progressive mode this branch is skipped so demoted categories fall
+            # through to the compact coverage line below (no names dumped).
+            if category in demoted and not progressive:
                 names = sorted({name for name, _ in skills_by_category[category]})
                 index_lines.append(f"  {category} [names only]: {', '.join(names)}")
                 continue
@@ -1726,10 +1823,42 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
+
+            # Ordered, de-duplicated entries for this category.
+            entries: list[tuple[str, str]] = []
             for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
                 if name in seen:
                     continue
                 seen.add(name)
+                entries.append((name, desc))
+
+            # Progressive mode: keep descriptions only for the high-priority
+            # set (priority_skills by name, or every skill in a priority
+            # category). Every other eligible skill in the category is collapsed
+            # into a single compact coverage line reporting how many were
+            # omitted — no names or descriptions are printed, so the block stays
+            # short. Those skills are rediscovered on demand via
+            # skills_list(query=...) + skill_view(name).
+            category_is_priority = (
+                progressive
+                and category.split("/", 1)[0] in priority_categories
+            )
+            if progressive and not category_is_priority:
+                described = [(n, d) for n, d in entries if n in priority_skills]
+                omitted_count = sum(1 for n, _ in entries if n not in priority_skills)
+                for name, desc in described:
+                    if desc:
+                        index_lines.append(f"    - {name}: {desc}")
+                    else:
+                        index_lines.append(f"    - {name}")
+                if omitted_count:
+                    # Compact per-category coverage: a deterministic count of the
+                    # omitted skills, no names. The progressive note explains how
+                    # to rediscover them via skills_list(query=...).
+                    index_lines.append(f"    (+{omitted_count} more not shown)")
+                continue
+
+            for name, desc in entries:
                 if desc:
                     index_lines.append(f"    - {name}: {desc}")
                 else:
@@ -1763,6 +1892,7 @@ def build_skills_system_prompt(
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
             + hidden_note
+            + progressive_note
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────

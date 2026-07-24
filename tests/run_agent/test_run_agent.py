@@ -1462,6 +1462,66 @@ class TestBuildSystemPrompt:
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
 
+    def test_skills_prompt_defaults_to_legacy_full_catalog(self):
+        """With progressive disabled (default), the real prompt path must pass
+        progressive=False so the legacy full catalog renders unchanged."""
+        tools = _make_tool_defs("skills_list", "skill_view")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.get_toolset_for_tool", create=True, return_value="skills"),
+            patch("run_agent.build_skills_system_prompt", return_value="SKILLS_PROMPT") as mock_skills,
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent._build_system_prompt()
+
+        assert mock_skills.call_args.kwargs["progressive"] is False
+        assert mock_skills.call_args.kwargs["priority_skills"] is None
+        assert mock_skills.call_args.kwargs["priority_categories"] is None
+
+    def test_skills_progressive_config_reaches_real_prompt_path(self):
+        """skills.progressive config must be wired into the actual system-prompt
+        construction path — not merely declared. When enabled, the prompt build
+        passes progressive=True plus the configured priority sets through to
+        build_skills_system_prompt."""
+        tools = _make_tool_defs("skills_list", "skill_view")
+        progressive_cfg = {
+            "skills": {
+                "progressive": {
+                    "enabled": True,
+                    "priority_skills": ["axolotl"],
+                    "priority_categories": ["coding", "github"],
+                }
+            }
+        }
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.get_toolset_for_tool", create=True, return_value="skills"),
+            patch("run_agent.build_skills_system_prompt", return_value="SKILLS_PROMPT") as mock_skills,
+            patch("run_agent.OpenAI"),
+            patch("hermes_cli.config.load_config_readonly", return_value=progressive_cfg),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent._build_system_prompt()
+
+        assert mock_skills.call_args.kwargs["progressive"] is True
+        assert mock_skills.call_args.kwargs["priority_skills"] == frozenset({"axolotl"})
+        assert mock_skills.call_args.kwargs["priority_categories"] == frozenset(
+            {"coding", "github"}
+        )
+
 
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""

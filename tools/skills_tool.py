@@ -666,16 +666,23 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _find_all_skills(
+    *, skip_disabled: bool = False, include_tags: bool = False
+) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
         skip_disabled: If True, return ALL skills regardless of disabled
             state (used by ``hermes skills`` config UI). Default False
             filters out disabled skills.
+        include_tags: If True, each dict also carries a ``tags`` list parsed
+            from the skill frontmatter. Used by the bounded
+            ``skills_list(query=...)`` search so a skill can be found by tag.
+            Off by default so the standard listing output is unchanged.
 
     Returns:
-        List of skill metadata dicts (name, description, category).
+        List of skill metadata dicts (name, description, category), plus
+        ``tags`` when ``include_tags`` is set.
 
     Results are cached per-session; the cache is invalidated when the scan
     signature changes (dir/category mtimes or the disabled-set) and expires
@@ -684,6 +691,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
 
     cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+    if include_tags:
+        cache_key = cache_key + "_tags"
 
     # Load disabled set once (not per-skill). Part of the cache signature:
     # disabling a skill is a config change with no filesystem mtime bump.
@@ -754,11 +763,20 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 category = _get_category_from_path(skill_md)
 
                 seen_names.add(name)
-                skills.append({
+                skill_entry = {
                     "name": name,
                     "description": description,
                     "category": category,
-                })
+                }
+                if include_tags:
+                    hermes_meta = {}
+                    metadata = frontmatter.get("metadata")
+                    if isinstance(metadata, dict):
+                        hermes_meta = metadata.get("hermes", {}) or {}
+                    skill_entry["tags"] = _parse_tags(
+                        hermes_meta.get("tags") or frontmatter.get("tags", "")
+                    )
+                skills.append(skill_entry)
 
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
@@ -782,16 +800,59 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
-def skills_list(category: str = None, task_id: str = None) -> str:
+def _max_query_results(default: int = 20) -> int:
+    """Resolve the bound on ``skills_list(query=...)`` results from config.
+
+    Reads ``skills.progressive.max_query_results`` so the on-demand search
+    stays deterministic and cheap. Falls back to *default* on any error or a
+    non-positive value.
     """
-    List all available skills (progressive disclosure tier 1 - minimal metadata).
+    try:
+        from hermes_cli.config import load_config
+
+        raw = ((load_config().get("skills") or {}).get("progressive") or {}).get(
+            "max_query_results"
+        )
+        value = int(raw)
+        return value if value > 0 else default
+    except Exception:
+        return default
+
+
+def _skill_matches_query(skill: Dict[str, Any], query: str) -> bool:
+    """Case-insensitive substring match over name, description, category, tags."""
+    haystack = [
+        str(skill.get("name") or ""),
+        str(skill.get("description") or ""),
+        str(skill.get("category") or ""),
+    ]
+    haystack.extend(str(t) for t in (skill.get("tags") or []))
+    blob = "\n".join(haystack).lower()
+    return query in blob
+
+
+def skills_list(
+    category: str = None,
+    query: str = None,
+    task_id: str = None,
+    limit: int = None,
+) -> str:
+    """
+    List available skills (progressive disclosure tier 1 - minimal metadata).
 
     Returns only name + description to minimize token usage. Use skill_view() to
     load full content, tags, related files, etc.
 
     Args:
         category: Optional category filter (e.g., "mlops")
+        query: Optional free-text search. When set, skills are matched
+            (case-insensitive substring) against name, description, category,
+            and tags, and the result is bounded to a deterministic number of
+            hits. This is how skills omitted from the progressive startup index
+            are rediscovered on demand before loading with skill_view(name).
         task_id: Optional task identifier used to probe the active backend
+        limit: Optional cap on the number of query results (defaults to
+            ``skills.progressive.max_query_results``). Ignored without a query.
 
     Returns:
         JSON string with minimal skill info: name, description, category
@@ -810,8 +871,12 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Find all skills
-        all_skills = _find_all_skills()
+        normalized_query = (query or "").strip().lower()
+
+        # Only pull tags into the scan when actually searching by query — the
+        # default listing output stays byte-for-byte identical (name,
+        # description, category only).
+        all_skills = _find_all_skills(include_tags=bool(normalized_query))
 
         if not all_skills:
             return json.dumps(
@@ -828,13 +893,53 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
 
-        # Sort by category then name
+        # Sort by category then name (deterministic for both paths)
         all_skills = _sort_skills(all_skills)
 
-        # Extract unique categories
+        # Extract unique categories from the full (pre-query) candidate set so
+        # the caller still sees the category landscape even when searching.
         categories = sorted(
             {s.get("category") for s in all_skills if s.get("category")}
         )
+
+        if normalized_query:
+            matches = [
+                s for s in all_skills if _skill_matches_query(s, normalized_query)
+            ]
+            total_matches = len(matches)
+            bound = _max_query_results() if limit is None else max(int(limit), 0)
+            truncated = total_matches > bound
+            matches = matches[:bound]
+            # Project back to the stable {name, description, category} shape —
+            # tags were only carried for matching.
+            skills_out = [
+                {
+                    "name": s.get("name"),
+                    "description": s.get("description"),
+                    "category": s.get("category"),
+                }
+                for s in matches
+            ]
+            return json.dumps(
+                {
+                    "success": True,
+                    "skills": skills_out,
+                    "categories": categories,
+                    "count": len(skills_out),
+                    "query": query,
+                    "total_matches": total_matches,
+                    "limit": bound,
+                    "truncated": truncated,
+                    "hint": (
+                        "Use skill_view(name) to load a matching skill. Narrow "
+                        "the query for fewer, more precise hits."
+                        if not truncated
+                        else "More matches exist — narrow the query to see them, "
+                        "then load one with skill_view(name)."
+                    ),
+                },
+                ensure_ascii=False,
+            )
 
         return json.dumps(
             {
@@ -1683,14 +1788,18 @@ if __name__ == "__main__":
 
 SKILLS_LIST_SCHEMA = {
     "name": "skills_list",
-    "description": "List available skills (name + description). Use skill_view(name) to load full content.",
+    "description": "List or search available skills (name + description). Pass query to search all skills by name, description, category, or tag when a skill isn't shown in the startup index; bounded, deterministic results. Use skill_view(name) to load full content.",
     "parameters": {
         "type": "object",
         "properties": {
             "category": {
                 "type": "string",
                 "description": "Optional category filter to narrow results",
-            }
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional free-text search over skill name, description, category, and tags. Returns a bounded set of the most relevant skills — use it to find a skill that isn't listed with a description in the startup index, then load it with skill_view(name).",
+            },
         },
         "required": [],
     },
@@ -1720,7 +1829,9 @@ registry.register(
     toolset="skills",
     schema=SKILLS_LIST_SCHEMA,
     handler=lambda args, **kw: skills_list(
-        category=args.get("category"), task_id=kw.get("task_id")
+        category=args.get("category"),
+        query=args.get("query"),
+        task_id=kw.get("task_id"),
     ),
     check_fn=check_skills_requirements,
     emoji="📚",

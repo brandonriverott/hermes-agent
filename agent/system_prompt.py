@@ -313,10 +313,38 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
         except Exception:
             _compact_cats = frozenset()
+        # Progressive live skill index (opt-in via skills.progressive.enabled).
+        # When on, only high-priority skills keep their descriptions in the
+        # startup block; everything else collapses to names-only and is found
+        # on demand via skills_list(query=...). Off by default → legacy full
+        # catalog, byte-for-byte unchanged. Read once at prompt-build time so
+        # the rendered block stays stable for the life of the conversation.
+        _progressive = False
+        _priority_skills: "frozenset[str] | None" = None
+        _priority_categories: "frozenset[str] | None" = None
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _prog_cfg = (
+                (load_config_readonly().get("skills") or {}).get("progressive") or {}
+            )
+            if _prog_cfg.get("enabled"):
+                _progressive = True
+                _priority_skills = frozenset(
+                    str(s) for s in (_prog_cfg.get("priority_skills") or [])
+                )
+                _priority_categories = frozenset(
+                    str(c) for c in (_prog_cfg.get("priority_categories") or [])
+                )
+        except Exception:
+            _progressive = False  # Config read failure — legacy full catalog
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            progressive=_progressive,
+            priority_skills=_priority_skills,
+            priority_categories=_priority_categories,
         )
     else:
         skills_prompt = ""
