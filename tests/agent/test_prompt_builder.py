@@ -3,6 +3,7 @@
 import builtins
 import importlib
 import logging
+import re
 import sys
 
 import pytest
@@ -1636,6 +1637,232 @@ class TestBuildSkillsSystemPromptConditional:
             available_toolsets=set(),
         )
         assert "nested-null" in result
+
+
+class TestBuildSkillsSystemPromptProgressive:
+    """Progressive live skill index (skills.progressive) rendering behavior."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_skills_cache(self):
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        yield
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+
+    def _write_skill(self, home, category, name, description):
+        skill_dir = home / "skills" / category / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"
+        )
+
+    def test_legacy_full_catalog_unchanged_when_progressive_off(
+        self, monkeypatch, tmp_path
+    ):
+        """progressive=False (default) keeps every description — no collapsing,
+        no progressive note. This is the backward-compatible baseline."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_skill(tmp_path, "coding", "refactor", "Refactor code safely")
+        self._write_skill(tmp_path, "misc", "widgets", "Build widgets")
+
+        result = build_skills_system_prompt(
+            available_tools=set(), available_toolsets=set()
+        )
+
+        assert "refactor: Refactor code safely" in result
+        assert "widgets: Build widgets" in result
+        assert "[names only]" not in result
+        assert "Progressive index" not in result
+
+    def test_priority_skill_kept_non_priority_name_and_desc_omitted(
+        self, monkeypatch, tmp_path
+    ):
+        """In progressive mode, only priority_skills keep their descriptions;
+        every other skill is replaced by a compact per-category coverage count —
+        neither its name nor its description appears in the startup block. The
+        omitted skill is rediscovered via skills_list(query=...) (proven in
+        tests/tools/test_skills_tool.py)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_skill(tmp_path, "misc", "kept", "Keep this description")
+        self._write_skill(tmp_path, "misc", "hidden", "Do not show this description")
+
+        result = build_skills_system_prompt(
+            available_tools=set(),
+            available_toolsets=set(),
+            progressive=True,
+            priority_skills=frozenset({"kept"}),
+        )
+
+        # Priority skill keeps its one-line description.
+        assert "kept: Keep this description" in result
+        # Non-priority skill: BOTH its description and its name are absent — the
+        # old names-only dump is gone.
+        assert "Do not show this description" not in result
+        assert "hidden" not in result
+        assert "[names only]:" not in result
+        # Category coverage remains: the "misc" category and a deterministic
+        # omitted-count summary are present.
+        assert "misc:" in result
+        assert "+1 more not shown" in result
+        assert "Progressive index" in result
+
+    def test_priority_category_keeps_all_descriptions(self, monkeypatch, tmp_path):
+        """Every skill in a priority_categories category keeps its description,
+        while a non-priority category collapses to a compact coverage count with
+        no skill names."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_skill(tmp_path, "coding", "review", "Review pull requests")
+        self._write_skill(tmp_path, "trivia", "quiz", "Answer trivia")
+
+        result = build_skills_system_prompt(
+            available_tools=set(),
+            available_toolsets=set(),
+            progressive=True,
+            priority_categories=frozenset({"coding"}),
+        )
+
+        assert "review: Review pull requests" in result
+        # Non-priority category collapses: neither the description nor the name
+        # is printed, but the category header and coverage count remain.
+        assert "Answer trivia" not in result
+        assert "quiz" not in result
+        assert "trivia:" in result
+        assert "+1 more not shown" in result
+
+    def test_category_with_priority_and_non_priority_shows_count(
+        self, monkeypatch, tmp_path
+    ):
+        """A category holding both a priority skill and non-priority skills
+        renders the priority entry plus one compact omitted-count summary — the
+        non-priority names never appear."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_skill(tmp_path, "misc", "star", "Starred skill")
+        self._write_skill(tmp_path, "misc", "extra-a", "Extra A")
+        self._write_skill(tmp_path, "misc", "extra-b", "Extra B")
+
+        result = build_skills_system_prompt(
+            available_tools=set(),
+            available_toolsets=set(),
+            progressive=True,
+            priority_skills=frozenset({"star"}),
+        )
+
+        assert "star: Starred skill" in result
+        assert "extra-a" not in result
+        assert "extra-b" not in result
+        assert "Extra A" not in result
+        assert "Extra B" not in result
+        # Exactly one compact summary line covering the two omitted skills.
+        assert "+2 more not shown" in result
+        assert result.count("+2 more not shown") == 1
+
+    def test_demoted_category_does_not_dump_names_in_progressive(
+        self, monkeypatch, tmp_path
+    ):
+        """Posture-demoted categories must NOT dump every name in progressive
+        mode; they collapse to the same compact coverage count."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_skill(tmp_path, "trivia", "quiz-a", "Trivia A")
+        self._write_skill(tmp_path, "trivia", "quiz-b", "Trivia B")
+
+        result = build_skills_system_prompt(
+            available_tools=set(),
+            available_toolsets=set(),
+            progressive=True,
+            compact_categories=frozenset({"trivia"}),
+        )
+
+        assert "quiz-a" not in result
+        assert "quiz-b" not in result
+        assert "[names only]" not in result
+        assert "+2 more not shown" in result
+
+    def test_progressive_snapshot_byte_stable_across_calls(
+        self, monkeypatch, tmp_path
+    ):
+        """The rendered progressive block is a pure function of its inputs, so
+        repeated builds within a conversation are byte-identical."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_skill(tmp_path, "misc", "one", "First skill")
+        self._write_skill(tmp_path, "misc", "two", "Second skill")
+
+        kwargs = dict(
+            available_tools=set(),
+            available_toolsets=set(),
+            progressive=True,
+            priority_skills=frozenset({"one"}),
+        )
+        first = build_skills_system_prompt(**kwargs)
+        second = build_skills_system_prompt(**kwargs)
+        assert first == second
+
+    def test_large_catalog_progressive_block_stays_bounded(
+        self, monkeypatch, tmp_path
+    ):
+        """A realistic 156-skill catalog must render a compact progressive
+        startup block: at most one-third the size of the legacy full catalog and
+        at most 12,000 chars. Neither the description nor the name of a
+        non-priority skill appears — rediscovery happens via
+        skills_list(query=...)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        categories = [
+            "coding", "github", "research", "creative", "mlops",
+            "security", "health", "messaging", "finance", "misc",
+        ]
+        # 156 skills spread across categories with realistic one-sentence
+        # descriptions, plus one deliberately hard-to-find "hidden" skill whose
+        # description and name must NOT appear in the progressive startup block.
+        total = 0
+        for i in range(155):
+            cat = categories[i % len(categories)]
+            self._write_skill(
+                tmp_path,
+                cat,
+                f"skill-{i:03d}",
+                f"Automates a common {cat} workflow end to end for skill {i}.",
+            )
+            total += 1
+        self._write_skill(
+            tmp_path,
+            "misc",
+            "obscure-widget-forge",
+            "Forges obscure widgets from raw telemetry.",
+        )
+        total += 1
+        assert total == 156
+
+        # Legacy and progressive use distinct cache keys, so both render fresh.
+        legacy = build_skills_system_prompt(
+            available_tools=set(),
+            available_toolsets=set(),
+        )
+        # A small configured high-priority set keeps its descriptions; everything
+        # else collapses to compact per-category coverage counts.
+        progressive = build_skills_system_prompt(
+            available_tools=set(),
+            available_toolsets=set(),
+            progressive=True,
+            priority_skills=frozenset({"skill-000", "skill-001", "skill-002"}),
+        )
+
+        assert len(progressive) <= 12000, (
+            f"Progressive startup block is {len(progressive)} chars, "
+            f"expected <=12000"
+        )
+        assert len(progressive) * 3 <= len(legacy), (
+            f"Progressive block ({len(progressive)}) must be <= one-third of "
+            f"legacy ({len(legacy)})"
+        )
+        # The legacy block does show every skill's description and name.
+        assert "Forges obscure widgets from raw telemetry." in legacy
+        assert "obscure-widget-forge" in legacy
+        # The progressive block omits BOTH the hidden skill's description and its
+        # name; only compact per-category coverage remains.
+        assert "Forges obscure widgets from raw telemetry." not in progressive
+        assert "obscure-widget-forge" not in progressive
+        # Instead of dumping names, progressive mode emits a deterministic
+        # per-category coverage count of the omitted skills.
+        assert re.search(r"\(\+\d+ more not shown\)", progressive)
 
 
 # =========================================================================

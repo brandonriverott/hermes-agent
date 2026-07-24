@@ -774,6 +774,26 @@ skills:
   #   - ~/.agents/skills
   #   - /home/shared/team-skills
 
+  # Progressive skill index (opt-in). When enabled, the startup system prompt
+  # keeps a one-line description only for high-priority skills; every other
+  # skill collapses to a name-only entry so the block stays short as your
+  # catalog grows. Nothing is hidden — every skill name stays visible and
+  # loadable, and the agent rediscovers a collapsed skill on demand with
+  # skills_list(query='...') (searches name, description, category, and tags),
+  # then loads it with skill_view(name). Disabled by default → the legacy full
+  # catalog is rendered unchanged. The block is read once at prompt-build time,
+  # so it stays byte-stable for the life of a conversation.
+  # progressive:
+  #   enabled: false
+  #   # Skills (by frontmatter name) that keep their description in the index.
+  #   priority_skills:
+  #     - hermes-agent
+  #   # Whole categories whose skills all keep their descriptions.
+  #   priority_categories:
+  #     - coding
+  #   # Cap on skills_list(query=...) results (deterministic; default 20).
+  #   max_query_results: 20
+
 # =============================================================================
 # Agent Behavior
 # =============================================================================

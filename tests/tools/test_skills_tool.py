@@ -369,6 +369,256 @@ class TestSkillsList:
         assert result["skills"][0]["name"] == "knowledge-brain"
 
 
+def _tags_frontmatter(*tags):
+    """Build a metadata.hermes.tags block for _make_skill(frontmatter_extra=...)."""
+    tag_list = ", ".join(tags)
+    return f"metadata:\n  hermes:\n    tags: [{tag_list}]\n"
+
+
+class TestSkillsListQueryDiscovery:
+    """Bounded on-demand skill discovery via skills_list(query=...).
+
+    This is how skills omitted from a progressive startup index are
+    rediscovered before loading with skill_view(name)."""
+
+    def test_query_matches_by_name(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "kubernetes-deploy")
+            _make_skill(tmp_path, "write-poetry")
+            raw = skills_list(query="kubernetes")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert [s["name"] for s in result["skills"]] == ["kubernetes-deploy"]
+        assert result["query"] == "kubernetes"
+        assert result["total_matches"] == 1
+
+    def test_query_matches_by_description(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = tmp_path / "alpha"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: alpha\ndescription: Provisions clusters on demand.\n---\n"
+            )
+            _make_skill(tmp_path, "beta", body="Unrelated.")
+            raw = skills_list(query="provisions clusters")
+        result = json.loads(raw)
+        assert [s["name"] for s in result["skills"]] == ["alpha"]
+
+    def test_query_matches_by_category(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "one", category="devops")
+            _make_skill(tmp_path, "two", category="writing")
+            raw = skills_list(query="devops")
+        result = json.loads(raw)
+        assert [s["name"] for s in result["skills"]] == ["one"]
+
+    def test_query_matches_by_tag(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "tagged",
+                frontmatter_extra=_tags_frontmatter("helm", "gitops"),
+            )
+            _make_skill(tmp_path, "untagged")
+            raw = skills_list(query="gitops")
+        result = json.loads(raw)
+        # The tag is not part of name/description/category, so a match proves
+        # tags are searched.
+        assert [s["name"] for s in result["skills"]] == ["tagged"]
+
+    def test_query_is_bounded_and_deterministic(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            for i in range(10):
+                _make_skill(
+                    tmp_path,
+                    f"match-{i:02d}",
+                    frontmatter_extra=_tags_frontmatter("searchterm"),
+                )
+            with patch("tools.skills_tool._max_query_results", return_value=3):
+                first = json.loads(skills_list(query="searchterm"))
+                second = json.loads(skills_list(query="searchterm"))
+        assert first["count"] == 3
+        assert first["total_matches"] == 10
+        assert first["truncated"] is True
+        assert first["limit"] == 3
+        # Deterministic ordering (sorted by category, name) → stable slice.
+        assert [s["name"] for s in first["skills"]] == [
+            "match-00",
+            "match-01",
+            "match-02",
+        ]
+        assert first["skills"] == second["skills"]
+
+    def test_query_respects_explicit_limit(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            for i in range(5):
+                _make_skill(
+                    tmp_path,
+                    f"hit-{i}",
+                    frontmatter_extra=_tags_frontmatter("needle"),
+                )
+            raw = skills_list(query="needle", limit=2)
+        result = json.loads(raw)
+        assert result["count"] == 2
+        assert result["total_matches"] == 5
+        assert result["truncated"] is True
+
+    def test_query_excludes_disabled_skill(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "tools.skills_tool._get_disabled_skill_names",
+                return_value={"secret-skill"},
+            ),
+        ):
+            _make_skill(
+                tmp_path,
+                "secret-skill",
+                frontmatter_extra=_tags_frontmatter("magicword"),
+            )
+            _make_skill(
+                tmp_path,
+                "public-skill",
+                frontmatter_extra=_tags_frontmatter("magicword"),
+            )
+            raw = skills_list(query="magicword")
+        result = json.loads(raw)
+        assert [s["name"] for s in result["skills"]] == ["public-skill"]
+
+    def test_query_excludes_incompatible_platform(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("agent.skill_utils.sys") as mock_sys,
+        ):
+            mock_sys.platform = "linux"
+            _make_skill(
+                tmp_path,
+                "cross",
+                frontmatter_extra=_tags_frontmatter("findme"),
+            )
+            _make_skill(
+                tmp_path,
+                "mac-only",
+                frontmatter_extra="platforms: [macos]\n" + _tags_frontmatter("findme"),
+            )
+            raw = skills_list(query="findme")
+        result = json.loads(raw)
+        assert [s["name"] for s in result["skills"]] == ["cross"]
+
+    def test_query_excludes_skill_gated_to_inactive_environment(self, tmp_path):
+        """A skill declaring ``environments: [kanban]`` is offer-filtered out of
+        query results when that environment is not active (mirrors the index /
+        autocomplete offer gate). Environment detection is process-cached, so we
+        patch it to keep the assertion deterministic."""
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("agent.skill_utils._detect_environment", return_value=False),
+        ):
+            _make_skill(
+                tmp_path,
+                "kanban-only",
+                frontmatter_extra="environments: [kanban]\n"
+                + _tags_frontmatter("findme"),
+            )
+            _make_skill(
+                tmp_path,
+                "everywhere",
+                frontmatter_extra=_tags_frontmatter("findme"),
+            )
+            raw = skills_list(query="findme")
+        result = json.loads(raw)
+        assert [s["name"] for s in result["skills"]] == ["everywhere"]
+
+    def test_query_deduplicates_same_named_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "dup",
+                category="cat-a",
+                frontmatter_extra=_tags_frontmatter("dupquery"),
+            )
+            _make_skill(
+                tmp_path,
+                "dup",
+                category="cat-b",
+                frontmatter_extra=_tags_frontmatter("dupquery"),
+            )
+            raw = skills_list(query="dupquery")
+        result = json.loads(raw)
+        names = [s["name"] for s in result["skills"]]
+        assert names.count("dup") == 1
+
+    def test_query_ignores_term_present_only_in_body(self, tmp_path):
+        """A term that appears ONLY in the SKILL.md body must NOT match.
+
+        Query search is intentionally bounded to name, description, category,
+        and tags (see ``_skill_matches_query``); the full body is never
+        indexed. This guards against widening search to the body — which would
+        make results noisy and unbounded — and is why the fixtures above put
+        their query terms in tag metadata rather than the body.
+        """
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "body-only-skill",
+                body="bodyonlyterm lives here in the instructions.",
+            )
+            raw = skills_list(query="bodyonlyterm")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["skills"] == []
+        assert result["total_matches"] == 0
+
+    def test_no_query_keeps_legacy_listing_shape(self, tmp_path):
+        """Without a query the payload is byte-for-byte the legacy shape:
+        name/description/category only, and no query-specific keys."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "alpha",
+                frontmatter_extra=_tags_frontmatter("t1", "t2"),
+            )
+            raw = skills_list()
+        result = json.loads(raw)
+        assert set(result["skills"][0].keys()) == {"name", "description", "category"}
+        assert "query" not in result
+        assert "total_matches" not in result
+        assert "truncated" not in result
+
+    def test_registry_handler_passes_query_through(self, tmp_path):
+        """The skills_list schema declares `query`; the registered handler must
+        actually forward it so schema and implementation agree."""
+        from tools.registry import registry
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "needle-skill")
+            _make_skill(tmp_path, "haystack-skill")
+            raw = registry.dispatch("skills_list", {"query": "needle"})
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["query"] == "needle"
+        assert [s["name"] for s in result["skills"]] == ["needle-skill"]
+
+    def test_hidden_skill_found_via_query_then_loaded(self, tmp_path):
+        """End-to-end progressive-recovery path: a skill absent from a compact
+        index is rediscovered by query, then loaded with skill_view(name)."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "obscure-widget-forge",
+                category="misc",
+                body="Forge widgets from telemetry.",
+                frontmatter_extra=_tags_frontmatter("telemetry", "widgets"),
+            )
+            found = json.loads(skills_list(query="telemetry"))
+            assert [s["name"] for s in found["skills"]] == ["obscure-widget-forge"]
+
+            loaded = json.loads(skill_view("obscure-widget-forge"))
+        assert loaded["success"] is True
+        assert loaded["name"] == "obscure-widget-forge"
+        assert "Forge widgets from telemetry." in loaded["content"]
+
+
 # ---------------------------------------------------------------------------
 # skill_view
 # ---------------------------------------------------------------------------

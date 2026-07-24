@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.system_prompt import build_system_prompt_parts
 
 
@@ -145,3 +147,150 @@ class TestTelegramRichMessagesHint:
             stable = _stable_prompt(agent)
         assert "Standard Markdown is automatically converted" in stable
         assert "lean into it" not in stable
+
+
+class TestSkillsProgressiveConfigIntegration:
+    """The *real* system-prompt construction path must READ
+    ``skills.progressive`` from config and render the startup skills block
+    progressively.
+
+    The rendering unit tests in tests/agent/test_prompt_builder.py call
+    ``build_skills_system_prompt(progressive=True, ...)`` directly — they prove
+    the renderer works but not that a live session ever turns progressive on.
+    These tests drive ``build_system_prompt_parts`` (the path run_agent uses to
+    assemble the stable prompt) so the config→prompt wiring is exercised end to
+    end: ``skills.progressive`` is used in real sessions, not merely declared.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_skills_cache(self):
+        # The skills index is cached in-process and on disk; clear both so each
+        # case renders from its own isolated HERMES_HOME fixture.
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        yield
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+
+    def _write_skill(self, home, category, name, description):
+        skill_dir = home / "skills" / category / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"
+        )
+
+    def _stable_with_config(self, agent, config):
+        # Patch load_config_readonly (the symbol system_prompt reads for
+        # skills.progressive) and neutralize the coding-posture demotion so the
+        # only thing shaping the skills block is the progressive config.
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch(
+                "agent.coding_context.coding_compact_skill_categories",
+                return_value=frozenset(),
+            ),
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+        ):
+            return build_system_prompt_parts(agent)["stable"]
+
+    def _agent_with_skills(self):
+        return _make_agent(
+            valid_tool_names=["skills_list", "skill_view"], platform=""
+        )
+
+    def test_progressive_config_drives_real_session_prompt(
+        self, monkeypatch, tmp_path
+    ):
+        """With ``skills.progressive.enabled`` set in config, the real prompt
+        path renders progressively: priority-category skills keep descriptions,
+        every other skill collapses to a compact per-category coverage count
+        (neither its description nor its name is printed), and the progressive
+        note appears."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_skill(
+            tmp_path, "coding", "review", "Review pull requests carefully"
+        )
+        self._write_skill(
+            tmp_path,
+            "trivia",
+            "obscure-widget-forge",
+            "Forges obscure widgets from telemetry",
+        )
+
+        config = {
+            "skills": {
+                "progressive": {
+                    "enabled": True,
+                    "priority_categories": ["coding"],
+                }
+            }
+        }
+        stable = self._stable_with_config(self._agent_with_skills(), config)
+
+        # Progressive mode is active on the real path.
+        assert "Progressive index" in stable
+        # Priority-category skill keeps its one-line description.
+        assert "review: Review pull requests carefully" in stable
+        # Non-priority skill: both its description and its name are dropped; it
+        # is rediscoverable via skills_list(query=...) + skill_view(name). Its
+        # category coverage still appears.
+        assert "Forges obscure widgets from telemetry" not in stable
+        assert "obscure-widget-forge" not in stable
+        assert "trivia:" in stable
+
+    def test_priority_skills_from_config_keep_descriptions(
+        self, monkeypatch, tmp_path
+    ):
+        """``skills.progressive.priority_skills`` names are honored by the real
+        path — a named skill keeps its description even outside a priority
+        category."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_skill(tmp_path, "misc", "kept", "Keep this description")
+        self._write_skill(
+            tmp_path, "misc", "zz-nonpriority-slug", "Drop this description"
+        )
+
+        config = {
+            "skills": {
+                "progressive": {
+                    "enabled": True,
+                    "priority_skills": ["kept"],
+                }
+            }
+        }
+        stable = self._stable_with_config(self._agent_with_skills(), config)
+
+        assert "Progressive index" in stable
+        assert "kept: Keep this description" in stable
+        assert "Drop this description" not in stable
+        # Non-priority skill name is omitted too; rediscovered via skills_list.
+        assert "zz-nonpriority-slug" not in stable
+
+    def test_legacy_full_catalog_when_progressive_disabled_in_config(
+        self, monkeypatch, tmp_path
+    ):
+        """Default/absent progressive config leaves the legacy full catalog
+        untouched: every skill keeps its description and there is no
+        progressive note. Backward-compatible baseline on the real path."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_skill(
+            tmp_path, "coding", "review", "Review pull requests carefully"
+        )
+        self._write_skill(
+            tmp_path,
+            "trivia",
+            "obscure-widget-forge",
+            "Forges obscure widgets from telemetry",
+        )
+
+        config = {"skills": {"progressive": {"enabled": False}}}
+        stable = self._stable_with_config(self._agent_with_skills(), config)
+
+        assert "Progressive index" not in stable
+        assert "review: Review pull requests carefully" in stable
+        assert (
+            "obscure-widget-forge: Forges obscure widgets from telemetry" in stable
+        )

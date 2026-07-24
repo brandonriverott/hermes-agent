@@ -2511,6 +2511,29 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # Progressive live skill index (opt-in). Off by default, so the full
+        # skill catalog is injected at session start exactly as before
+        # (backward compatible). When enabled, the startup skills block shows
+        # compact category coverage plus one-sentence descriptions only for a
+        # configured high-priority set; every other skill collapses to a
+        # names-only line under its category and stays discoverable on demand
+        # through skills_list(query=...) + skill_view(name). This trades a
+        # large fixed prompt cost for a short scannable index without hiding
+        # any skill from recall. Byte-stable for the life of a conversation —
+        # the startup snapshot never mutates mid-session.
+        "progressive": {
+            # Master switch. False keeps the legacy full catalog.
+            "enabled": False,
+            # Skill names whose one-sentence descriptions stay in the startup
+            # index. Matched against the skill's frontmatter name.
+            "priority_skills": [],
+            # Whole categories (top-level segment) whose skills all keep their
+            # descriptions at startup, e.g. ["coding", "github"].
+            "priority_categories": [],
+            # Upper bound on results returned by a bounded skills_list(query=...)
+            # search, so on-demand discovery stays deterministic and cheap.
+            "max_query_results": 20,
+        },
     },
 
     # Curator — background skill maintenance.
