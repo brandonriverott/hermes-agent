@@ -25,6 +25,38 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _load_board_config() -> Any:
+    """Load config from the home that owns the KANBAN BOARD, not the process.
+
+    The board and its singleton dispatcher lock are machine-global
+    (``kanban_db.kanban_home()`` -> ``get_default_hermes_root()``, which strips
+    ``/profiles/<name>``), but ``load_config()`` is profile-scoped
+    (``hermes_cli/config.py`` -> ``get_hermes_home()/config.yaml``). Whichever
+    gateway wins the lock would otherwise impose ITS profile's ``kanban.*`` on
+    the shared board — which is exactly why ``auto_decompose: false`` in the root
+    config was ignored on 2026-07-24 while the ``--profile iris`` gateway held
+    the lock, causing a runaway fan-out. Resolve board policy from the root
+    config so the toggle's scope matches the board's scope.
+
+    Uses ``get_default_hermes_root()`` rather than ``kanban_home()`` on purpose:
+    ``HERMES_KANBAN_HOME`` may point at a board dir with no ``config.yaml``, and
+    falling back to DEFAULT_CONFIG there would fail OPEN (auto_decompose
+    defaults to True).
+    """
+    from hermes_cli.config import load_config as _lc
+    from hermes_constants import (
+        get_default_hermes_root,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(get_default_hermes_root())
+    try:
+        return _lc()
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -145,7 +177,7 @@ class GatewayKanbanWatchersMixin:
             logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
             return
         try:
-            cfg = _load_config()
+            cfg = _load_board_config()
         except Exception as exc:
             logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
             return
@@ -895,7 +927,7 @@ class GatewayKanbanWatchersMixin:
             return
 
         try:
-            cfg = _load_config()
+            cfg = _load_board_config()
         except Exception as exc:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
@@ -1250,7 +1282,7 @@ class GatewayKanbanWatchersMixin:
         # disabled" because the gateway had captured its boot-time value.)
         def _read_auto_decompose_settings() -> tuple[bool, int]:
             """Re-resolve (enabled, per_tick) from current config each tick."""
-            return _resolve_auto_decompose_settings(_load_config)
+            return _resolve_auto_decompose_settings(_load_board_config)
 
         def _auto_decompose_tick(auto_decompose_per_tick: int) -> int:
             """Run the auto-decomposer for up to N triage tasks across all
