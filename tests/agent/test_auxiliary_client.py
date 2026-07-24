@@ -5193,7 +5193,10 @@ class TestCodexAuxiliaryAdapterTimeout:
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
         class _SlowAliveCreateStream:
             def __iter__(self):
-                for _ in range(5):
+                # A "would-be" stream far longer than the timeout so the timeout's
+                # effect is unambiguous: consumed lazily, only the first few
+                # iterations actually run before the 0.05s timeout fires.
+                for _ in range(40):
                     time.sleep(0.03)
                     yield SimpleNamespace(type="response.in_progress")
 
@@ -5213,7 +5216,11 @@ class TestCodexAuxiliaryAdapterTimeout:
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        # The 0.05s timeout must cut the (up to 40 x 0.03s = 1.2s) stream short.
+        # A working timeout returns in ~0.05-0.2s; a broken one runs the full 1.2s.
+        # Bound with generous headroom so macOS scheduling jitter can't flake it
+        # while still proving the timeout fired well before the full stream.
+        assert time.monotonic() - started < 0.5
 
 
 class TestCodexAuxiliaryToolMessageConversion:
