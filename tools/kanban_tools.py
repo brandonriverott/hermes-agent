@@ -372,6 +372,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     children = kb.child_ids(conn, task.id)
     return {
         "id": task.id,
+        "display_number": task.display_number,
         "title": task.title,
         "assignee": task.assignee,
         "status": task.status,
@@ -421,7 +422,8 @@ def _handle_show(args: dict, **kw) -> str:
 
             def _task_dict(t):
                 return {
-                    "id": t.id, "title": t.title, "body": t.body,
+                    "id": t.id, "display_number": t.display_number,
+                    "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,

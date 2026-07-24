@@ -54,12 +54,16 @@ def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
     tenant = f" [{t.tenant}]" if t.tenant else ""
-    return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
+    return (
+        f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  "
+        f"{kb.task_display_title(t)}"
+    )
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
         "id": t.id,
+        "display_number": t.display_number,
         "title": t.title,
         "body": t.body,
         "assignee": t.assignee,
@@ -625,7 +629,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_unblock = sub.add_parser(
         "unblock",
-        help="Return blocked/scheduled tasks to ready, or todo while parents remain open",
+        help="Return blocked/scheduled or loop-routed triage tasks to the work queue",
     )
     p_unblock.add_argument(
         "--reason",
@@ -636,7 +640,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_promote = sub.add_parser(
         "promote",
-        help="Manually move one or more todo/blocked tasks to ready (recovery path)",
+        help="Manually move recoverable todo/blocked/triage tasks to ready",
     )
     p_promote.add_argument("task_id")
     p_promote.add_argument(
@@ -1656,7 +1660,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 
-    print(f"Task {task.id}: {task.title}")
+    print(f"Task {task.id}: {kb.task_display_title(task)}")
     print(f"  status:    {task.status}")
     print(f"  assignee:  {task.assignee or '-'}")
     if task.tenant:
@@ -2308,7 +2312,11 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                print(
+                    f"cannot unblock {tid} "
+                    f"(not blocked/scheduled or loop-routed triage?)",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1

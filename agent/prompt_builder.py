@@ -951,6 +951,16 @@ WSL_ENVIRONMENT_HINT = (
     "the Windows username if needed."
 )
 
+MACOS_TCC_FILE_SEARCH_HINT = (
+    "macOS file-search note: broad search_files calls exclude "
+    "~/Library/Containers, ~/Library/Group Containers, ~/Library/Mail, "
+    "~/Library/Messages, ~/Library/Calendars, ~/Library/Reminders, "
+    "~/Library/Mobile Documents, ~/Library/CloudStorage, and Photos Library "
+    "by default to avoid TCC permission prompts. When the user explicitly "
+    "wants those locations searched, use include_tcc_paths=true for that call; "
+    "the persistent override is agent.search.include_tcc_paths in config.yaml."
+)
+
 
 # Non-local terminal backends that run commands (and therefore every file
 # tool: read_file, write_file, patch, search_files) inside a separate
@@ -1184,6 +1194,8 @@ def build_environment_hints() -> str:
         # know this or it will issue PowerShell syntax and fail.
         if sys.platform == "win32" and not is_wsl():
             hints.append(_WINDOWS_BASH_SHELL_HINT)
+        elif sys.platform == "darwin":
+            hints.append(MACOS_TCC_FILE_SEARCH_HINT)
     else:
         # --- Remote backend block (host info suppressed) ---
         probe = _probe_remote_backend(backend)

@@ -1849,6 +1849,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
+                include_tcc_paths: bool = False,
                 task_id: str = "default") -> str:
     """Search for content or files."""
     try:
@@ -1865,6 +1866,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             file_glob or "",
             limit,
             offset,
+            bool(include_tcc_paths),
         )
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
@@ -1899,7 +1901,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
-            limit=limit, offset=offset, output_mode=output_mode, context=context
+            limit=limit, offset=offset, output_mode=output_mode, context=context,
+            include_tcc_paths=include_tcc_paths,
         )
         omitted = _filter_read_blocked_search_results(result, task_id)
         if hasattr(result, 'matches'):
@@ -2040,7 +2043,8 @@ SEARCH_FILES_SCHEMA = {
             "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
             "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
             "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
-            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
+            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0},
+            "include_tcc_paths": {"type": "boolean", "description": "macOS only: include TCC-protected app-data paths that broad searches omit by default (Containers, Group Containers, Mail, Messages, Calendars, Reminders, Mobile Documents, CloudStorage, and Photos Library). Use only when the user explicitly wants those locations searched and understands macOS may prompt for access.", "default": False}
         },
         "required": ["pattern"]
     }
@@ -2098,7 +2102,8 @@ def _handle_search_files(args, **kw):
     return search_tool(
         pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
+        output_mode=args.get("output_mode", "content"), context=args.get("context", 0),
+        include_tcc_paths=bool(args.get("include_tcc_paths", False)), task_id=tid)
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)

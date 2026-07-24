@@ -882,6 +882,9 @@ class Task:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     tenant: Optional[str]
+    # Board-local, permanently assigned human-facing card number. It remains
+    # nullable for archived/cancelled cards that predate the migration.
+    display_number: Optional[int] = None
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
@@ -964,6 +967,11 @@ class Task:
                 skills_value = None
         return cls(
             id=row["id"],
+            display_number=(
+                int(row["display_number"])
+                if "display_number" in keys and row["display_number"] is not None
+                else None
+            ),
             title=row["title"],
             body=row["body"],
             assignee=row["assignee"],
@@ -1135,6 +1143,9 @@ class Event:
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
     id                   TEXT PRIMARY KEY,
+    -- Board-local, immutable human-facing card number. NULL is retained for
+    -- archived/cancelled cards that existed before the numbering migration.
+    display_number       INTEGER,
     title                TEXT NOT NULL,
     body                 TEXT,
     assignee             TEXT,
@@ -1290,6 +1301,14 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     size         INTEGER NOT NULL DEFAULT 0,
     uploaded_by  TEXT,
     created_at   INTEGER NOT NULL
+);
+
+-- Small board-local metadata store. ``display_number_high_water_v1`` records
+-- the allocation boundary; each board has its own database, so this never
+-- becomes a global counter.
+CREATE TABLE IF NOT EXISTS kanban_metadata (
+    key                  TEXT PRIMARY KEY,
+    value                INTEGER NOT NULL
 );
 
 -- Subscription from a gateway source (platform + chat + thread) to a
@@ -2234,6 +2253,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     Called by ``init_db`` so opening an old DB is always safe.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "display_number" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "display_number", "display_number INTEGER"
+        )
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
     if "result" not in cols:
@@ -2386,6 +2409,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_display_number "
+        "ON tasks(display_number) WHERE display_number IS NOT NULL"
+    )
+    _migrate_display_numbers(conn)
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2758,6 +2786,121 @@ def _claimer_id() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Permanent board-local display numbers
+# ---------------------------------------------------------------------------
+
+_DISPLAY_NUMBER_HIGH_WATER_KEY = "display_number_high_water_v1"
+_DISPLAY_NUMBER_BACKFILL_KEY = "display_number_backfill_v1"
+
+
+def task_display_title(task: Task) -> str:
+    """Return the human-facing card label without mutating ``task.title``."""
+    if task.display_number is None:
+        return task.title
+    return f"#{task.display_number} — {task.title}"
+
+
+def _set_kanban_metadata(conn: sqlite3.Connection, key: str, value: int) -> None:
+    """Set board metadata while the caller holds ``write_txn``."""
+    updated = conn.execute(
+        "UPDATE kanban_metadata SET value = ? WHERE key = ?", (value, key)
+    )
+    if updated.rowcount == 0:
+        conn.execute(
+            "INSERT INTO kanban_metadata (key, value) VALUES (?, ?)", (key, value)
+        )
+
+
+def _display_number_high_water(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT value FROM kanban_metadata WHERE key = ?",
+        (_DISPLAY_NUMBER_HIGH_WATER_KEY,),
+    ).fetchone()
+    recorded = int(row["value"]) if row else 0
+    observed = int(
+        conn.execute(
+            "SELECT COALESCE(MAX(display_number), 0) AS n FROM tasks"
+        ).fetchone()["n"]
+    )
+    return max(recorded, observed)
+
+
+def _allocate_display_number(conn: sqlite3.Connection) -> int:
+    """Allocate one strictly increasing number inside ``write_txn``."""
+    next_number = _display_number_high_water(conn) + 1
+    _set_kanban_metadata(conn, _DISPLAY_NUMBER_HIGH_WATER_KEY, next_number)
+    return next_number
+
+
+def _migrate_display_numbers(conn: sqlite3.Connection) -> None:
+    """One-time, non-destructive backfill for legacy card display numbers.
+
+    Completed tasks are numbered by completion time, creation time, then task
+    id. All other active tasks follow by creation time then task id. Existing
+    assigned numbers are untouched; legacy archived/cancelled tasks stay NULL.
+    """
+    task_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+
+    def migrate() -> None:
+        """Run the backfill within the caller's write transaction."""
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS kanban_metadata "
+            "(key TEXT PRIMARY KEY, value INTEGER NOT NULL)"
+        )
+        already_migrated = conn.execute(
+            "SELECT 1 FROM kanban_metadata WHERE key = ?",
+            (_DISPLAY_NUMBER_BACKFILL_KEY,),
+        ).fetchone()
+        if already_migrated:
+            return
+
+        high_water = _display_number_high_water(conn)
+        required_columns = {"display_number", "status", "created_at", "completed_at"}
+        if not required_columns <= task_columns:
+            _set_kanban_metadata(conn, _DISPLAY_NUMBER_HIGH_WATER_KEY, high_water)
+            _set_kanban_metadata(conn, _DISPLAY_NUMBER_BACKFILL_KEY, 1)
+            return
+        ordered_rows = conn.execute(
+            """
+            SELECT id FROM tasks
+             WHERE display_number IS NULL AND status = 'done'
+             ORDER BY completed_at ASC, created_at ASC, id ASC
+            """
+        ).fetchall()
+        ordered_rows += conn.execute(
+            """
+            SELECT id FROM tasks
+             WHERE display_number IS NULL
+               AND status NOT IN ('done', 'archived', 'cancelled', 'canceled')
+             ORDER BY created_at ASC, id ASC
+            """
+        ).fetchall()
+        for row in ordered_rows:
+            high_water += 1
+            conn.execute(
+                "UPDATE tasks SET display_number = ? "
+                "WHERE id = ? AND display_number IS NULL",
+                (high_water, row["id"]),
+            )
+        _set_kanban_metadata(conn, _DISPLAY_NUMBER_HIGH_WATER_KEY, high_water)
+        _set_kanban_metadata(conn, _DISPLAY_NUMBER_BACKFILL_KEY, 1)
+
+    # The broader additive-schema migrator may already have started an
+    # implicit SQLite transaction (for example when it updated a legacy
+    # task_events row). Join it rather than attempting a nested BEGIN
+    # IMMEDIATE. When called independently, take the normal exclusive write
+    # transaction so calculating D/A and persisting the high-water mark remain
+    # atomic against card creation.
+    if conn.in_transaction:
+        migrate()
+    else:
+        with write_txn(conn):
+            migrate()
+
+
+# ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
 
@@ -3081,19 +3224,21 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                display_number = _allocate_display_number(conn)
                 conn.execute(
                     """
                     INSERT INTO tasks (
-                        id, title, body, assignee, status, priority,
+                        id, display_number, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
+                        display_number,
                         title.strip(),
                         body,
                         assignee,
@@ -5603,7 +5748,7 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a recoverable task to `ready`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
@@ -5611,19 +5756,25 @@ def promote_task(
     state (`done`/`archived`) unless ``force=True``. Does NOT change
     assignee or claim state. Returns ``(True, None)`` on success and
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
-    promotion would succeed without mutating state.
+    promotion would succeed without mutating state. Normal specification
+    triage still requires ``specify_triage_task``; only triage produced by
+    ``block_loop_detected`` is a recovery state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, block_recurrences FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
+    block_loop_triage = (
+        cur_status == "triage"
+        and int(row["block_recurrences"] or 0) >= BLOCK_RECURRENCE_LIMIT
+    )
+    if cur_status not in ("todo", "blocked") and not block_loop_triage:
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'blocked', or loop-routed 'triage'"
         )
 
     if not force:
@@ -5649,8 +5800,9 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
-            (task_id,),
+            "WHERE id = ? AND (status IN ('todo', 'blocked') OR ("
+            "status = 'triage' AND block_recurrences >= ?))",
+            (task_id, BLOCK_RECURRENCE_LIMIT),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
@@ -5665,7 +5817,7 @@ def promote_task(
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` -> ready or todo.
+    """Transition a blocked, scheduled, or loop-routed triage task.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -5677,8 +5829,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (task_id,),
+            "SELECT current_run_id FROM tasks WHERE id = ? AND ("
+            "status IN ('blocked', 'scheduled') OR (status = 'triage' AND "
+            "block_recurrences >= ?))",
+            (task_id, BLOCK_RECURRENCE_LIMIT),
         ).fetchone()
         if stale and stale["current_run_id"]:
             conn.execute(
@@ -5718,8 +5872,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (new_status, task_id),
+            "WHERE id = ? AND (status IN ('blocked', 'scheduled') OR ("
+            "status = 'triage' AND block_recurrences >= ?))",
+            (new_status, task_id, BLOCK_RECURRENCE_LIMIT),
         )
         if cur.rowcount != 1:
             return False
@@ -9002,7 +9157,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
 
     lines: list[str] = []
-    lines.append(f"# Kanban task {task.id}: {task.title}")
+    lines.append(f"# Kanban task {task_display_title(task)} ({task.id})")
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
@@ -9153,7 +9308,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # section above isn't duplicated. Safe on assignee=None (skipped).
     if task.assignee:
         role_rows = conn.execute(
-            "SELECT t.id, t.title, r.summary, r.ended_at "
+            "SELECT t.id, t.display_number, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
             "WHERE r.profile = ? AND r.task_id != ? "
             "  AND r.outcome = 'completed' "
@@ -9170,7 +9325,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 ts_disp = f"{ts}, {age}" if age else ts
                 s = (row["summary"] or "").strip().splitlines()
                 first = s[0][:200] if s else "(no summary)"
-                lines.append(f"- {row['id']} — {row['title']} ({ts_disp}): {first}")
+                display = (
+                    f"#{row['display_number']} — {row['title']}"
+                    if "display_number" in row.keys() and row["display_number"] is not None
+                    else row["title"]
+                )
+                lines.append(f"- {row['id']} — {display} ({ts_disp}): {first}")
             lines.append("")
 
     # Comments: cap at the most-recent _CTX_MAX_COMMENTS so

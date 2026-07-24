@@ -1222,7 +1222,7 @@
                   sev === "critical" ? "!!!" : sev === "error" ? "!!" : "⚠"),
                 h("span", { className: "hermes-kanban-attention-row-id" }, task.id),
                 h("span", { className: "hermes-kanban-attention-row-title" },
-                  task.title || tx(t, "untitled", "(untitled)")),
+                  taskDisplayTitle(task, tx(t, "untitled", "(untitled)"))),
                 h("span", { className: "hermes-kanban-attention-row-meta" },
                   task.assignee ? "@" + task.assignee : tx(t, "unassigned", "unassigned"),
                   " \u00b7 ",
@@ -2736,9 +2736,15 @@
     return "";
   }
 
+  function taskDisplayTitle(task, fallback) {
+    const title = task.title || fallback || "(untitled)";
+    return task.display_number == null ? title : `#${task.display_number} — ${title}`;
+  }
+
   function TaskCard(props) {
     const { t: i18n } = useI18n();
     const t = props.task;
+    const displayTitle = taskDisplayTitle(t, tx(i18n, "untitled", "(untitled)"));
     const cardRef = useRef(null);
 
     useEffect(function () {
@@ -2804,7 +2810,7 @@
       draggable: true,
       tabIndex: 0,
       role: "button",
-      "aria-label": `${t.title || "untitled"} — ${t.id} — ${t.status}`,
+      "aria-label": `${displayTitle} — ${t.id} — ${t.status}`,
       onDragStart: handleDragStart,
       onClick: handleClick,
       onKeyDown: handleKeyDown,
@@ -2868,7 +2874,7 @@
               : null,
           ),
           h("div", { className: "hermes-kanban-card-title" },
-            t.title || tx(i18n, "untitled", "(untitled)")),
+            displayTitle),
           h("div", { className: "hermes-kanban-card-row hermes-kanban-card-meta" },
             t.assignee
               ? h("span", { className: "hermes-kanban-assignee",
@@ -3090,7 +3096,7 @@
               h(SelectOption, { value: "" }, tx(t, "noParent", "— no parent —")),
               (props.allTasks || []).map(function (task) {
                 return h(SelectOption, { key: task.id, value: task.id },
-                  `${task.id} — ${(task.title || "").slice(0, 50)}`);
+                  `${task.id} — ${taskDisplayTitle(task, "").slice(0, 50)}`);
               }),
             ),
           ),
@@ -3573,7 +3579,7 @@
               className: "hermes-kanban-drawer-title-text",
               title: tx(i18n, "clickToEdit", "Click to edit"),
               onClick: function () { props.setEditing(true); },
-            }, t.title || tx(i18n, "untitled", "(untitled)")),
+            }, taskDisplayTitle(t, tx(i18n, "untitled", "(untitled)"))),
       ),
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
@@ -3669,7 +3675,7 @@
           return h("div", { key: child.id, className: "hermes-kanban-comment" },
             h("div", { className: "hermes-kanban-comment-head" },
               h("span", { className: "hermes-kanban-comment-author" },
-                `${child.id} · ${child.title || tx(i18n, "untitled", "(untitled)")}`),
+                `${child.id} · ${taskDisplayTitle(child, tx(i18n, "untitled", "(untitled)"))}`),
               h(Badge, { variant: "outline" }, child.status),
               h("button", {
                 type: "button",
@@ -4236,7 +4242,7 @@
           h(SelectOption, { value: "" }, tx(t, "addParent", "— add parent —")),
           candidatesFor(parentExclude).map(function (tk) {
             return h(SelectOption, { key: tk.id, value: tk.id },
-              `${tk.id} — ${(tk.title || "").slice(0, 50)}`);
+              `${tk.id} — ${taskDisplayTitle(tk, "").slice(0, 50)}`);
           }),
         ),
         h(Button, {
@@ -4274,7 +4280,7 @@
           h(SelectOption, { value: "" }, tx(t, "addChild", "— add child —")),
           candidatesFor(childExclude).map(function (tk) {
             return h(SelectOption, { key: tk.id, value: tk.id },
-              `${tk.id} — ${(tk.title || "").slice(0, 50)}`);
+              `${tk.id} — ${taskDisplayTitle(tk, "").slice(0, 50)}`);
           }),
         ),
         h(Button, {

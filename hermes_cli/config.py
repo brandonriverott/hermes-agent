@@ -1122,6 +1122,12 @@ DEFAULT_CONFIG = {
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
         "disabled_toolsets": [],
+        # macOS file-search privacy behavior. Broad searches omit TCC-protected
+        # app-data paths by default; set this only when persistent inclusion is
+        # intentional and the launching app has the required OS permissions.
+        "search": {
+            "include_tcc_paths": False,
+        },
 
         # Per-model reasoning effort overrides (spelling-tolerant).
         # Dict mapping model names (any reasonable spelling) to effort levels.

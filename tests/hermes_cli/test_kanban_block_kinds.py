@@ -34,9 +34,9 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def _running_task(conn, title="t"):
+def _running_task(conn, title="t", *, body=None, assignee="worker"):
     """Create a task and drive it to ``running`` so block_task can act."""
-    tid = kb.create_task(conn, title=title, assignee="worker")
+    tid = kb.create_task(conn, title=title, body=body, assignee=assignee)
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     claimed = kb.claim_task(conn, tid, claimer="worker")
@@ -128,6 +128,68 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         payload = events[-1].payload or {}
         assert payload.get("recurrences") == 2
         assert payload.get("kind") == "capability"
+
+
+@pytest.mark.parametrize("recovery_action", ["unblock", "promote"])
+def test_rerouted_block_loop_triage_resumes_same_card_on_new_assignee(
+    kanban_home: Path,
+    recovery_action: str,
+) -> None:
+    """A loop-routed triage card can resume without being re-specified."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(
+            conn,
+            title="preserved recovery card",
+            body="keep this exact body",
+            assignee="broken-worker",
+        )
+        kb.add_comment(conn, tid, "operator", "keep this history")
+
+        kb.block_task(conn, tid, reason="worker unavailable", kind="capability")
+        assert kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="still unavailable", kind="capability")
+        triaged = kb.get_task(conn, tid)
+        assert triaged is not None and triaged.status == "triage"
+
+        assert kb.reassign_task(conn, tid, "healthy-worker")
+        if recovery_action == "unblock":
+            recovered = kb.unblock_task(conn, tid)
+        else:
+            recovered, error = kb.promote_task(
+                conn,
+                tid,
+                actor="operator",
+                reason="rerouted to healthy worker",
+            )
+            assert error is None
+
+        assert recovered
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.assignee == "healthy-worker"
+        assert task.title == "preserved recovery card"
+        assert task.body == "keep this exact body"
+        assert any(c.body == "keep this history" for c in kb.list_comments(conn, tid))
+        assert any(
+            event.kind == "block_loop_detected"
+            for event in kb.list_events(conn, tid)
+        )
+
+
+def test_specification_triage_still_requires_specify(kanban_home: Path) -> None:
+    """Recovery must not bypass the normal specification-triage workflow."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="rough idea", triage=True)
+
+        assert not kb.unblock_task(conn, tid)
+        promoted, error = kb.promote_task(conn, tid, actor="operator")
+
+        assert not promoted
+        assert error is not None and "triage" in error
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "triage"
 
 
 # ---------------------------------------------------------------------------

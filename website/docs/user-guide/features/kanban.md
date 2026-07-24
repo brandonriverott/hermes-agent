@@ -59,7 +59,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Task** — a row with a permanent board-local display number (for example, `#897 — Fix worker branch collisions`), a descriptive title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | done | archived`), optional tenant namespace, and optional idempotency key (dedup for retried automation). The display number is structured data, never replaces the title, and is never reused after a card is completed, archived, or cancelled. Each board has its own independent sequence; the immutable `t_…` id remains the machine identity.
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
@@ -80,6 +80,7 @@ is opt-in.
 Per-board isolation is absolute:
 
 - Separate SQLite DB per board (`~/.hermes/kanban/boards/<slug>/kanban.db`).
+- Separate permanent card-number sequence. `#42` on one board is unrelated to `#42` on another, and neither board ever reuses a number.
 - Separate `workspaces/` and `logs/` directories.
 - Workers spawned for a task see **only** their board's tasks — the
   dispatcher sets `HERMES_KANBAN_BOARD` in the child env and every
