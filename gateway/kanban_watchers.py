@@ -1351,7 +1351,11 @@ class GatewayKanbanWatchersMixin:
                 # flipping kanban.auto_decompose=false to STOP runaway fan-out
                 # takes effect on the next tick, not on gateway restart (#49638).
                 _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
-                if _ad_enabled:
+                # DRAIN-OPERATOR 2026-07-24: auto-decompose HARD-DISABLED. The
+                # kanban.auto_decompose:false config was NOT honored on a gateway
+                # restart and caused a runaway fan-out. Restore this to
+                # `if _ad_enabled:` only after the config-loading divergence is fixed.
+                if False and _ad_enabled:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
