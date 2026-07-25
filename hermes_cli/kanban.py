@@ -18,6 +18,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -579,6 +580,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--expected-revision",
+        default=None,
+        metavar="SHA256",
+        help="Require the exact revision from `kanban show --json`; refuses a stale card read.",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -630,7 +637,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_unblock.add_argument(
         "--reason",
         default=None,
-        help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
+        help="Optional reason/note — recorded atomically with an accepted unblock. Quote multi-word reasons.",
+    )
+    p_unblock.add_argument(
+        "--expected-revision",
+        default=None,
+        metavar="SHA256",
+        help="Require the exact revision from `kanban show --json`; refuses a stale card read.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
@@ -659,6 +672,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--dry-run",
         action="store_true",
         help="Validate the promotion without mutating state",
+    )
+    p_promote.add_argument(
+        "--expected-revision",
+        default=None,
+        metavar="SHA256",
+        help="Require the exact revision from `kanban show --json`; refuses a stale card read.",
     )
     p_promote.add_argument(
         "--json",
@@ -1612,6 +1631,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        revision = kb.task_revision(conn, args.task_id)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1653,6 +1673,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 for r in runs
             ],
         }
+        payload["task"]["revision"] = revision
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 
@@ -2124,6 +2145,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    expected_revision = getattr(args, "expected_revision", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
@@ -2134,6 +2156,15 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             "Complete tasks one at a time, or drop the flags for the bulk close.",
             file=sys.stderr,
         )
+        return 2
+    if expected_revision and len(ids) != 1:
+        print(
+            "kanban: --expected-revision applies to exactly one task; complete cards one at a time.",
+            file=sys.stderr,
+        )
+        return 2
+    if expected_revision and not re.fullmatch(r"[0-9a-f]{64}", expected_revision, re.IGNORECASE):
+        print("kanban: --expected-revision must be a 64-character SHA-256 value from `kanban show --json`.", file=sys.stderr)
         return 2
     metadata = None
     if raw_meta:
@@ -2197,9 +2228,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                expected_revision=expected_revision,
             ):
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                reason = "expected revision did not match the current card" if expected_revision else "unknown id or terminal state"
+                print(f"cannot complete {tid} ({reason})", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -2298,17 +2331,32 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         print("at least one task_id is required", file=sys.stderr)
         return 1
     reason = getattr(args, "reason", None)
+    expected_revision = getattr(args, "expected_revision", None)
     if reason is not None:
         reason = reason.strip() or None
     author = _profile_author() if reason else None
+    if expected_revision and len(ids) != 1:
+        print(
+            "kanban: --expected-revision applies to exactly one task; unblock cards one at a time.",
+            file=sys.stderr,
+        )
+        return 2
+    if expected_revision and not re.fullmatch(r"[0-9a-f]{64}", expected_revision, re.IGNORECASE):
+        print("kanban: --expected-revision must be a 64-character SHA-256 value from `kanban show --json`.", file=sys.stderr)
+        return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid):
+            if not kb.unblock_task(
+                conn,
+                tid,
+                expected_revision=expected_revision,
+                comment_author=author,
+                comment_body=(f"UNBLOCK: {reason}" if reason else None),
+            ):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                reason_text = "expected revision did not match the current card" if expected_revision else "not blocked/scheduled?"
+                print(f"cannot unblock {tid} ({reason_text})", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
@@ -2326,6 +2374,16 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         if tid not in seen:
             ids.append(tid)
             seen.add(tid)
+    expected_revision = getattr(args, "expected_revision", None)
+    if expected_revision and len(ids) != 1:
+        print(
+            "kanban: --expected-revision applies to exactly one task; promote cards one at a time.",
+            file=sys.stderr,
+        )
+        return 2
+    if expected_revision and not re.fullmatch(r"[0-9a-f]{64}", expected_revision, re.IGNORECASE):
+        print("kanban: --expected-revision must be a 64-character SHA-256 value from `kanban show --json`.", file=sys.stderr)
+        return 2
 
     results: list[dict[str, object]] = []
     with kb.connect_closing() as conn:
@@ -2337,6 +2395,7 @@ def _cmd_promote(args: argparse.Namespace) -> int:
                 reason=reason,
                 force=bool(args.force),
                 dry_run=bool(args.dry_run),
+                expected_revision=expected_revision,
             )
             results.append({
                 "task_id": tid,

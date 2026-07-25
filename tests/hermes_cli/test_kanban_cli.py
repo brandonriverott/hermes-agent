@@ -159,6 +159,67 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_run_slash_expected_revision_guards_complete_and_unblock(kanban_home):
+    """The public CLI must reject stale card reads without mutating the card."""
+    import re
+
+    created = kc.run_slash("create 'revision guard' --assignee alice")
+    tid = re.search(r"(t_[a-f0-9]+)", created).group(1)
+    first = json.loads(kc.run_slash(f"show {tid} --json"))
+    revision = first["task"]["revision"]
+    assert len(revision) == 64
+
+    kc.run_slash(f"comment {tid} 'new approval context'")
+    stale_complete = kc.run_slash(
+        f"complete {tid} --expected-revision {revision} --result 'should not land'"
+    )
+    assert "expected revision" in stale_complete.lower()
+    assert json.loads(kc.run_slash(f"show {tid} --json"))["task"]["status"] == "ready"
+
+    current = json.loads(kc.run_slash(f"show {tid} --json"))["task"]["revision"]
+    assert "Completed" in kc.run_slash(
+        f"complete {tid} --expected-revision {current} --result 'revision matched'"
+    )
+
+    promoted = kc.run_slash("create 'revision guarded promotion' --assignee alice")
+    promoted_id = re.search(r"(t_[a-f0-9]+)", promoted).group(1)
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (promoted_id,))
+        conn.commit()
+    promote_revision = json.loads(kc.run_slash(f"show {promoted_id} --json"))["task"]["revision"]
+    kc.run_slash(f"comment {promoted_id} 'promotion context changed'")
+    stale_promote = kc.run_slash(
+        f"promote {promoted_id} --expected-revision {promote_revision}"
+    )
+    assert "expected revision" in stale_promote.lower()
+    assert json.loads(kc.run_slash(f"show {promoted_id} --json"))["task"]["status"] == "todo"
+    current_promote_revision = json.loads(kc.run_slash(f"show {promoted_id} --json"))["task"]["revision"]
+    assert "Promoted" in kc.run_slash(
+        f"promote {promoted_id} --expected-revision {current_promote_revision}"
+    )
+
+    blocked = kc.run_slash("create 'revision guarded unblock' --assignee alice")
+    blocked_id = re.search(r"(t_[a-f0-9]+)", blocked).group(1)
+    kc.run_slash(f"claim {blocked_id}")
+    assert "Blocked" in kc.run_slash(f"block {blocked_id} 'needs an approval'")
+    blocked_detail = json.loads(kc.run_slash(f"show {blocked_id} --json"))
+    stale_unblock_revision = blocked_detail["task"]["revision"]
+
+    kc.run_slash(f"comment {blocked_id} 'approval changed'")
+    stale_unblock = kc.run_slash(
+        f"unblock {blocked_id} --expected-revision {stale_unblock_revision} --reason 'must not write'"
+    )
+    assert "expected revision" in stale_unblock.lower()
+    after_stale = json.loads(kc.run_slash(f"show {blocked_id} --json"))
+    assert after_stale["task"]["status"] == "blocked"
+    assert all("must not write" not in comment["body"] for comment in after_stale["comments"])
+
+    current_unblock_revision = after_stale["task"]["revision"]
+    assert "Unblocked" in kc.run_slash(
+        f"unblock {blocked_id} --expected-revision {current_unblock_revision} --reason 'approved now'"
+    )
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)

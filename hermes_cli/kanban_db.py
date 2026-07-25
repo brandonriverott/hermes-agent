@@ -3168,6 +3168,70 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def task_revision(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the stable, human-reviewable revision for one task.
+
+    This is deliberately derived from the same card fields exposed by
+    ``kanban show --json`` and from its approval-relevant comments/dependency
+    links.  It is calculated *inside* the caller's ``BEGIN IMMEDIATE`` write
+    transaction before a conditional mutation, so a stale read cannot be
+    converted into a successful unblock or completion by a concurrent writer.
+    Volatile worker liveness fields are excluded: a heartbeat must not silently
+    invalidate a human decision, while task state, instructions, ownership,
+    dependencies, and comments always do.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    payload = {
+        "task": {
+            "id": task.id,
+            "title": task.title,
+            "body": task.body,
+            "assignee": task.assignee,
+            "status": task.status,
+            "priority": task.priority,
+            "tenant": task.tenant,
+            "workspace_kind": task.workspace_kind,
+            "workspace_path": task.workspace_path,
+            "branch_name": task.branch_name,
+            "project_id": task.project_id,
+            "created_by": task.created_by,
+            "created_at": task.created_at,
+            "started_at": task.started_at,
+            "completed_at": task.completed_at,
+            "result": task.result,
+            "skills": list(task.skills) if task.skills else [],
+            "max_retries": task.max_retries,
+            "model_override": task.model_override,
+            "provider_override": task.provider_override,
+            "session_id": task.session_id,
+            "workflow_template_id": task.workflow_template_id,
+            "current_step_key": task.current_step_key,
+            "block_kind": task.block_kind,
+            "block_recurrences": task.block_recurrences,
+        },
+        "parents": sorted(parent_ids(conn, task_id)),
+        "children": sorted(child_ids(conn, task_id)),
+        "comments": [
+            {
+                "id": comment.id,
+                "author": comment.author,
+                "body": comment.body,
+                "created_at": comment.created_at,
+            }
+            for comment in list_comments(conn, task_id)
+        ],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -4605,6 +4669,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_revision: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4667,6 +4732,8 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        if expected_revision is not None and task_revision(conn, task_id) != expected_revision:
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5602,6 +5669,7 @@ def promote_task(
     reason: Optional[str] = None,
     force: bool = False,
     dry_run: bool = False,
+    expected_revision: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Manually promote a `todo` or `blocked` task to `ready`.
 
@@ -5647,6 +5715,8 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        if expected_revision is not None and task_revision(conn, task_id) != expected_revision:
+            return False, "expected revision did not match the current card"
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -5664,7 +5734,14 @@ def promote_task(
     return True, None
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_revision: Optional[str] = None,
+    comment_author: Optional[str] = None,
+    comment_body: Optional[str] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -5676,6 +5753,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        if expected_revision is not None and task_revision(conn, task_id) != expected_revision:
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -5723,6 +5802,20 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        if comment_body:
+            if not comment_author or not comment_author.strip():
+                raise ValueError("comment author is required when recording an unblock reason")
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, comment_author.strip(), comment_body.strip(), now),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "commented",
+                {"author": comment_author.strip(), "len": len(comment_body)},
+            )
         _append_event(
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,
