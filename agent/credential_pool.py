@@ -2763,13 +2763,14 @@ def load_pool(provider: str) -> CredentialPool:
         ) != payload.get("auth_type", AUTH_TYPE_API_KEY)
         for payload in raw_entries
     )
+    # A profile may be reading this provider from the global-root fallback.
+    # Keep that fallback read-only: only the store that owns these rows may
+    # rewrite them. Loading the default/root profile will heal global rows.
+    active_pool = _load_auth_store().get("credential_pool")
+    active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
+    active_store_owns_rows = bool(active_entries)
     if raw_needs_auth_normalization:
-        # A profile may be reading this provider from the global-root fallback.
-        # Keep that fallback read-only: only the store that owns these rows may
-        # rewrite them. Loading the default/root profile will heal global rows.
-        active_pool = _load_auth_store().get("credential_pool")
-        active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
-        raw_needs_auth_normalization = bool(active_entries)
+        raw_needs_auth_normalization = active_store_owns_rows
 
     if provider.startswith(CUSTOM_POOL_PREFIX):
         # Custom endpoint pool — seed from custom_providers config and model config
@@ -2795,6 +2796,16 @@ def load_pool(provider: str) -> CredentialPool:
             prune_env_sources=False,
         )
         changed |= _normalize_pool_priorities(provider, entries)
+
+    if changed and raw_entries and not active_store_owns_rows:
+        # The global-root fallback is read-only for the WHOLE load, not just the
+        # auth-type normalization above. `raw_entries` came from another store,
+        # so persisting here would materialize a profile-local auth.json that
+        # duplicates that store's credential material to a second path on disk —
+        # exactly what read_credential_pool's "read-only fallback" contract
+        # forbids. Seeding still persists for a profile with no rows anywhere
+        # (empty `raw_entries`), which is a profile establishing its own store.
+        changed = False
 
     if changed:
         new_ids = {entry.id for entry in entries}
