@@ -17,10 +17,21 @@ export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMe
   return useMemo(() => {
     const items: { message: ThreadMessage; parentId: string | null }[] = []
     const branchParentByGroup = new Map<string, string | null>()
+    // assistant-ui's MessageRepository throws on a repeated id, during render —
+    // so one duplicate anywhere upstream replaces the whole chat pane with an
+    // error boundary. Dropping the repeat is the better failure: the transcript
+    // loses a row, the pane survives.
+    const seenIds = new Set<string>()
     let visibleParentId: string | null = null
     let headId: string | null = null
 
     for (const message of coalesceToolOnlyAssistants(messages, toolMergeCacheRef.current)) {
+      if (seenIds.has(message.id)) {
+        continue
+      }
+
+      seenIds.add(message.id)
+
       let parentId = visibleParentId
 
       if (message.role === 'assistant' && message.branchGroupId) {

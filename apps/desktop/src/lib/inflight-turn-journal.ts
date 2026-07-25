@@ -302,6 +302,16 @@ export function mergeInFlightMessages(
     return noop
   }
 
+  // The journal stores CLONES of live rows, so every row it folds back carries
+  // an id the base transcript may still hold. A row inserted under an id that
+  // is already in the array crashes assistant-ui's MessageRepository at render
+  // time ("a message with the same id already exists in the parent tree"),
+  // taking the whole workspace pane down — the content-level guards below
+  // (matching user text, a committed reply, a live projection row) all miss
+  // this, so every insertion site filters on id as well.
+  const baseIds = new Set(baseMessages.map(message => message.id))
+  const unseen = (messages: ChatMessage[]): ChatMessage[] => messages.filter(message => !baseIds.has(message.id))
+
   const tailUserIndex = tail.findIndex(message => message.role === 'user')
   const tailUser = tailUserIndex >= 0 ? tail[tailUserIndex] : null
   const tailAssistants = tail.slice(tailUserIndex + 1)
@@ -311,9 +321,16 @@ export function mergeInFlightMessages(
   if (matchingUserIndex < 0) {
     // Base doesn't know this turn at all (user row was never persisted):
     // append the whole tail.
-    const streamId = lastJournalRow?.id ?? null
+    const fresh = unseen(tail)
 
-    return { applied: true, caughtUp: false, messages: [...baseMessages, ...tail], streamId, turnStartedAt: null }
+    if (!fresh.some(assistantHasRecoverableContent)) {
+      // Every recoverable row is already in the transcript under its own id.
+      return noop
+    }
+
+    const streamId = fresh.findLast(assistantHasRecoverableContent)?.id ?? null
+
+    return { applied: true, caughtUp: false, messages: [...baseMessages, ...fresh], streamId, turnStartedAt: null }
   }
 
   const afterUser = baseMessages.slice(matchingUserIndex + 1)
@@ -333,16 +350,18 @@ export function mergeInFlightMessages(
   )
 
   if (projectionIndex < 0) {
-    if (tailAssistants.length === 0) {
+    const freshAssistants = unseen(tailAssistants)
+
+    if (freshAssistants.length === 0) {
       return noop
     }
 
-    const streamId = lastJournalRow?.id ?? null
+    const streamId = freshAssistants.findLast(assistantHasRecoverableContent)?.id ?? null
 
     return {
       applied: true,
       caughtUp: false,
-      messages: [...baseMessages, ...tailAssistants],
+      messages: [...baseMessages, ...freshAssistants],
       streamId,
       turnStartedAt: null
     }
@@ -354,8 +373,10 @@ export function mergeInFlightMessages(
   const projection = baseMessages[projectionIndex]
   const merged = lastJournalRow ? overlayProjectionRow(projection, lastJournalRow) : projection
 
-  const sealedRows = tailAssistants.filter(
-    message => message !== lastJournalRow && assistantHasRecoverableContent(message)
+  // `merged` re-uses the projection's id and replaces it in place below, so a
+  // sealed row may never claim that id either.
+  const sealedRows = unseen(tailAssistants).filter(
+    message => message !== lastJournalRow && message.id !== merged.id && assistantHasRecoverableContent(message)
   )
 
   const messages = [

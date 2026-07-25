@@ -237,4 +237,62 @@ describe('mergeInFlightMessages', () => {
     expect(result.applied).toBe(false)
     expect(result.caughtUp).toBe(false)
   })
+
+  // A duplicated id crashes assistant-ui's MessageRepository at render time
+  // ("a message with the same id already exists in the parent tree"), which
+  // takes the whole workspace pane down. The journal clones live rows, so
+  // every row it folds back already carries an id the base may still hold.
+  const duplicateIds = (messages: ChatMessage[]): string[] => {
+    const seen = new Set<string>()
+    const repeated: string[] = []
+
+    for (const message of messages) {
+      if (seen.has(message.id)) {
+        repeated.push(message.id)
+      }
+
+      seen.add(message.id)
+    }
+
+    return repeated
+  }
+
+  it('does not re-insert a sealed interim row the base transcript already holds', () => {
+    // The base sealed row carries no recoverable parts yet (so it is neither
+    // the turn's committed reply nor a live projection), which is what lets
+    // the overlay branch splice the journal's own copy in beside it.
+    const base = [
+      user('db-u1', 'do the thing'),
+      assistant('a-sealed', '', { interim: true }),
+      assistant('assistant-stream-1', 'partial answer', { pending: true })
+    ]
+
+    const tail = [
+      user('u1', 'do the thing'),
+      assistantWithTool('a-sealed', 'checking that', { interim: true }),
+      assistant('assistant-stream-1', 'partial answer with more', { pending: true })
+    ]
+
+    const result = mergeInFlightMessages(base, tail, { keepPending: true })
+
+    expect(duplicateIds(result.messages)).toEqual([])
+  })
+
+  it('does not append journal rows whose ids already exist when the user row did not match', () => {
+    const base = [user('db-u1', 'a different prompt'), assistantWithTool('a1', 'partial answer')]
+    const tail = [user('u1', 'do the thing'), assistantWithTool('a1', 'partial answer')]
+
+    const result = mergeInFlightMessages(base, tail)
+
+    expect(duplicateIds(result.messages)).toEqual([])
+  })
+
+  it('does not append journal rows whose ids already exist when the base row carries no content', () => {
+    const base = [user('db-u1', 'do the thing'), assistant('a1', '')]
+    const tail = [user('u1', 'do the thing'), assistantWithTool('a1', 'partial answer')]
+
+    const result = mergeInFlightMessages(base, tail)
+
+    expect(duplicateIds(result.messages)).toEqual([])
+  })
 })
