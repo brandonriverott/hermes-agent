@@ -11438,11 +11438,6 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         def append_message(self, **kwargs):
             seen["msgs"].append(kwargs)
 
-        def append_messages_batch(self, session_id, messages, **kwargs):
-            for m in messages:
-                seen["msgs"].append(dict(m, session_id=session_id))
-            return list(range(1, len(messages) + 1))
-
         def set_session_title(self, key, title):
             seen["title"] = (key, title)
             return True
@@ -11554,11 +11549,6 @@ def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_pa
 
         def append_message(self, **kwargs):
             seen["msgs"].append(kwargs)
-
-        def append_messages_batch(self, session_id, messages, **kwargs):
-            for m in messages:
-                seen["msgs"].append(dict(m, session_id=session_id))
-            return list(range(1, len(messages) + 1))
 
         def set_session_title(self, key, title):
             return True
@@ -16063,7 +16053,7 @@ def test_native_vision_turn_persists_a_renderable_image_ref(tmp_path):
 
     agent._flush_messages_to_session_db([{"role": "user", "content": native_parts}], [])
 
-    written = agent._session_db.append_messages_batch.call_args.kwargs["messages"][0]["content"]
+    written = agent._session_db.append_message.call_args.kwargs["content"]
     assert f"@image:`{img}`" in written
     assert "what is in this photo?" in written
     # The model keeps the pixels for the rest of the session.

@@ -4831,6 +4831,13 @@ def cmd_project(args):
     return projects_command(args)
 
 
+def cmd_jobs(args):
+    """Jobs control plane (independent of Kanban)."""
+    from hermes_cli.jobs import jobs_command
+
+    return jobs_command(args)
+
+
 def cmd_hooks(args):
     """Shell-hook inspection and management."""
     from hermes_cli.hooks import hooks_command
@@ -11480,6 +11487,14 @@ def main():
 
     project_parser = _build_project_parser(subparsers)
     project_parser.set_defaults(func=cmd_project)
+
+    # =========================================================================
+    # jobs command — independent Jobs control plane (Jobs Core V1)
+    # =========================================================================
+    from hermes_cli.jobs import build_parser as _build_jobs_parser
+
+    jobs_parser = _build_jobs_parser(subparsers)
+    jobs_parser.set_defaults(func=cmd_jobs)
 
     # =========================================================================
     # hooks command — shell-hook inspection and management

@@ -112,8 +112,8 @@ def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
 
     agent._flush_messages_to_session_db([{"role": "user", "content": api_content}], [])
 
-    batch = agent._session_db.append_messages_batch.call_args.kwargs["messages"]
-    assert batch[0]["content"] == "Describe this screenshot\n[screenshot]"
+    db_write = agent._session_db.append_message.call_args.kwargs
+    assert db_write["content"] == "Describe this screenshot\n[screenshot]"
     assert api_content[0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
 
 
@@ -135,17 +135,6 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.entered.set()
                 assert self.release.wait(timeout=5)
             self.rows.append(kwargs["content"])
-
-        def append_messages_batch(self, session_id, messages, **kwargs):
-            with self._lock:
-                self.calls += 1
-                first = self.calls == 1
-            if first:
-                self.entered.set()
-                assert self.release.wait(timeout=5)
-            for m in messages:
-                self.rows.append(m["content"])
-            return list(range(1, len(messages) + 1))
 
     db = _BarrierDB()
     agent._session_db = db
@@ -5602,10 +5591,8 @@ class TestPersistUserMessageOverride:
             "2-3 sentences max. No code blocks or markdown.] Hello there"
         )
         # But the DB write must get the override.
-        batch = agent._session_db.append_messages_batch.call_args_list[0].kwargs[
-            "messages"
-        ]
-        assert batch[0]["content"] == "Hello there"
+        first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
+        assert first_db_write["content"] == "Hello there"
 
 
 class TestReasoningReplayForStrictProviders:

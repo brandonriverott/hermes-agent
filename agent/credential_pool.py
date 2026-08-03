@@ -588,12 +588,7 @@ class CredentialPool:
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
-        # RLock: the mutation primitives below (_replace_entry/_persist)
-        # self-acquire this lock so the DEFERRED single-use-token refresh
-        # path (which runs network I/O outside the lock by design) still
-        # serializes its pool mutations. In-lock callers re-acquire
-        # reentrantly at negligible cost.
-        self._lock = threading.RLock()
+        self._lock = threading.Lock()
         self._active_leases: Dict[str, int] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
         # Monotonic timestamp of the last "no available entries" log, used to
@@ -623,36 +618,7 @@ class CredentialPool:
         # otherwise a status probe here can race a concurrent ``select`` /
         # rotation and tear ``self._entries`` or double-write auth.json.
         with self._lock:
-            available, _pending = self._available_entries()
-            return bool(available)
-
-    def next_available_at(self) -> Optional[float]:
-        """Earliest epoch time (seconds) any entry re-enters rotation.
-
-        Returns ``None`` when at least one entry is available right now, or
-        when no exhausted entry carries a usable recovery time (empty pool,
-        or only ``STATUS_DEAD`` entries, which never re-enter via TTL).
-        Callers must treat ``None`` as "no wait information", not
-        "unavailable".
-
-        Like :meth:`has_available`, expired cooldowns are left uncleared
-        (``clear_expired=False``); the only writes are the same
-        re-auth/token sync paths ``has_available`` already performs — which
-        is exactly why this must run under ``self._lock`` like every other
-        ``_available_entries`` caller (see the comment on ``has_available``).
-        """
-        with self._lock:
-            available, _pending = self._available_entries()
-            if available:
-                return None
-            candidates: List[float] = []
-            for entry in self._entries:
-                if entry.last_status != STATUS_EXHAUSTED:
-                    continue
-                until = _exhausted_until(entry)
-                if until is not None:
-                    candidates.append(until)
-            return min(candidates) if candidates else None
+            return bool(self._available_entries())
 
     def entries(self) -> List[PooledCredential]:
         with self._lock:
@@ -690,27 +656,18 @@ class CredentialPool:
             return matches[0].id if len(matches) == 1 else None
 
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
-        """Swap an entry in-place by id, preserving sort order.
-
-        Self-locking (RLock) so the deferred refresh path — which
-        deliberately runs outside the pool lock — cannot tear
-        ``self._entries`` against a concurrent select()/rotation.
-        """
-        with self._lock:
-            for idx, entry in enumerate(self._entries):
-                if entry.id == old.id:
-                    self._entries[idx] = new
-                    return
+        """Swap an entry in-place by id, preserving sort order."""
+        for idx, entry in enumerate(self._entries):
+            if entry.id == old.id:
+                self._entries[idx] = new
+                return
 
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
-        # Self-locking (RLock): snapshotting self._entries must not race a
-        # concurrent rotation when called from the deferred refresh path.
-        with self._lock:
-            write_credential_pool(
-                self.provider,
-                [entry.to_dict() for entry in self._entries],
-                removed_ids=removed_ids,
-            )
+        write_credential_pool(
+            self.provider,
+            [entry.to_dict() for entry in self._entries],
+            removed_ids=removed_ids,
+        )
 
     def _is_terminal_auth_failure(
         self,
@@ -1689,61 +1646,26 @@ class CredentialPool:
         return False
 
     def select(self) -> Optional[PooledCredential]:
-        entry, pending_refresh = self._select_under_lock()
-        if pending_refresh:
-            self._refresh_pending_entries(pending_refresh)
-        if entry is not None:
-            self._unmatched_rotation_streak = 0
-            return entry
-        # If no entry was available but we just refreshed some, re-select
-        # now that the refreshed entries are back in the pool.
-        if pending_refresh:
-            entry, _ = self._select_under_lock()
-            if entry is not None:
-                self._unmatched_rotation_streak = 0
-        return entry
-
-    def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[tuple]]:
-        """Run selection under the lock, returning entry + pending refreshes."""
         with self._lock:
-            return self._select_unlocked()
+            entry = self._select_unlocked()
+            if entry is not None:
+                # A normal (non-recovery) selection starts a fresh episode —
+                # don't let a leftover unmatched-rotation streak from an old
+                # failure trip the #70401 bound early next time.
+                self._unmatched_rotation_streak = 0
+            return entry
 
-    def _refresh_pending_entries(self, pending: List[tuple]) -> None:
-        """Refresh deferred single-use-token entries outside the lock.
-
-        Each entry is refreshed under the cross-process ``_auth_store_lock``
-        (which can block for 20+ seconds) and then merged into the pool.
-        On failure the entry is silently skipped.
-        """
-        for entry, sync_fn in pending:
-            # _refresh_entry already merges the refreshed entry into the
-            # pool internally (its mutation primitives are self-locking),
-            # so no second _replace_entry is needed here.
-            self._refresh_entry(entry, force=False)
-
-    def _available_entries(
-        self, *, clear_expired: bool = False, refresh: bool = False,
-    ) -> Tuple[List[PooledCredential], List[tuple]]:
-        """Return (available, pending_refresh) for entries not in cooldown.
+    def _available_entries(self, *, clear_expired: bool = False, refresh: bool = False) -> List[PooledCredential]:
+        """Return entries not currently in exhaustion cooldown.
 
         When *clear_expired* is True, entries whose cooldown has elapsed are
         reset to STATUS_OK and persisted.  When *refresh* is True, entries
         that need a token refresh are refreshed (skipped on failure).
-
-        Single-use-token refreshes (openai-codex, xai-oauth) are returned as
-        *pending_refresh* tuples so the caller can execute them outside the
-        lock, avoiding stalling all pool consumers during cross-process flock
-        acquisition + OAuth network I/O.
         """
         now = time.time()
         cleared_any = False
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
-        # Entries that need an OAuth refresh via a single-use token provider
-        # (openai-codex, xai-oauth).  These require a cross-process file lock
-        # that can block for 20+ seconds.  We collect them under self._lock
-        # and refresh outside the lock to avoid stalling all pool consumers.
-        pending_refresh: List[tuple] = []  # (entry, sync_entry_fn)
         for entry in self._entries:
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load.  A stale duplicate row
@@ -1852,16 +1774,6 @@ class CredentialPool:
                     entry = cleared
                     cleared_any = True
             if refresh and self._entry_needs_refresh(entry):
-                if self.provider in ("openai-codex", "xai-oauth"):
-                    # Defer single-use-token refresh to avoid holding the
-                    # threading lock during cross-process flock + network I/O.
-                    sync_fn = (
-                        self._sync_codex_entry_from_auth_store
-                        if self.provider == "openai-codex"
-                        else self._sync_xai_oauth_entry_from_pool_store
-                    )
-                    pending_refresh.append((entry, sync_fn))
-                    continue
                 refreshed = self._refresh_entry(entry, force=False)
                 if refreshed is None:
                     continue
@@ -1872,7 +1784,7 @@ class CredentialPool:
             self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
             self._persist(removed_ids=entries_to_prune)
-        return available, pending_refresh
+        return available
 
     def _log_no_available_entries(self) -> None:
         """Emit the empty-pool INFO line at most once per throttle window.
@@ -1888,17 +1800,12 @@ class CredentialPool:
         self._last_no_entries_log_at = now
         logger.info("credential pool: no available entries (all exhausted or empty)")
 
-    def _select_unlocked(self, *, refresh: bool = True) -> Tuple[Optional[PooledCredential], List[tuple]]:
-        """Select the best available credential entry.
-
-        Returns ``(entry, pending_refresh)`` where *pending_refresh* contains
-        single-use-token entries that must be refreshed outside the lock.
-        """
-        available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh)
+    def _select_unlocked(self, *, refresh: bool = True) -> Optional[PooledCredential]:
+        available = self._available_entries(clear_expired=True, refresh=refresh)
         if not available:
             self._current_id = None
             self._log_no_available_entries()
-            return None, pending_refresh
+            return None
 
         # A successful selection means the pool recovered; re-arm the throttle
         # so a later re-exhaustion logs immediately rather than being silenced
@@ -1908,7 +1815,7 @@ class CredentialPool:
         if self._strategy == STRATEGY_RANDOM:
             entry = random.choice(available)
             self._current_id = entry.id
-            return entry, pending_refresh
+            return entry
 
         if self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
             entry = min(available, key=lambda e: e.request_count)
@@ -1916,7 +1823,7 @@ class CredentialPool:
             updated = replace(entry, request_count=entry.request_count + 1)
             self._replace_entry(entry, updated)
             self._current_id = entry.id
-            return updated, pending_refresh
+            return updated
 
         if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
             entry = available[0]
@@ -1925,11 +1832,11 @@ class CredentialPool:
             self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
             self._persist()
             self._current_id = entry.id
-            return self._current_unlocked() or entry, pending_refresh
+            return self._current_unlocked() or entry
 
         entry = available[0]
         self._current_id = entry.id
-        return entry, pending_refresh
+        return entry
 
     def peek(self) -> Optional[PooledCredential]:
         # Single lock acquisition for the whole read; call the unlocked
@@ -1938,7 +1845,7 @@ class CredentialPool:
             current = self._current_unlocked()
             if current is not None:
                 return current
-            available, _pending = self._available_entries()
+            available = self._available_entries()
             return available[0] if available else None
 
     def mark_exhausted_and_rotate(
@@ -1987,8 +1894,7 @@ class CredentialPool:
                 # guessing and surface the error (no cooldown is written for
                 # anybody — healthy keys stay available for the next turn).
                 self._unmatched_rotation_streak += 1
-                available_count, _ = self._available_entries()
-                available_count = len(available_count)
+                available_count = len(self._available_entries())
                 if self._unmatched_rotation_streak > max(available_count, 1):
                     logger.warning(
                         "credential pool: failed credential identity matched no "
@@ -2007,9 +1913,8 @@ class CredentialPool:
                     self.provider,
                 )
                 self._current_id = None
-                next_entry, _pending = self._select_unlocked(refresh=False)
-                avail, _ = self._available_entries()
-                if next_entry is not None and len(avail) == 1:
+                next_entry = self._select_unlocked()
+                if next_entry is not None and len(self._available_entries()) == 1:
                     # A single-entry pool cannot rotate. Returning its only
                     # entry reports a successful recovery without changing
                     # the credential, so the caller retries the same 401
@@ -2022,7 +1927,7 @@ class CredentialPool:
             # streak is stale (this mark WILL advance pool state).
             self._unmatched_rotation_streak = 0
             if entry is None:
-                entry = self._current_unlocked() or self._select_unlocked(refresh=False)[0]
+                entry = self._current_unlocked() or self._select_unlocked()
             if entry is None:
                 return None
             _label = entry.label or entry.id[:8]
@@ -2067,7 +1972,7 @@ class CredentialPool:
                     _label, status_code,
                 )
             self._current_id = None
-            next_entry, _pending = self._select_unlocked(refresh=False)
+            next_entry = self._select_unlocked()
             if next_entry:
                 _next_label = next_entry.label or next_entry.id[:8]
                 logger.info("credential pool: rotated to %s", _next_label)
@@ -2081,24 +1986,15 @@ class CredentialPool:
         a stable tie-breaker. When every credential is already at the soft cap,
         still return the least-leased one instead of blocking.
         """
-        chosen_id, pending_refresh = self._acquire_lease_under_lock(credential_id)
-        if pending_refresh:
-            self._refresh_pending_entries(pending_refresh)
-        return chosen_id
-
-    def _acquire_lease_under_lock(
-        self, credential_id: Optional[str],
-    ) -> Tuple[Optional[str], List[tuple]]:
-        """Run lease acquisition under the lock, returning id + pending refreshes."""
         with self._lock:
             if credential_id:
                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
                 self._current_id = credential_id
-                return credential_id, []
+                return credential_id
 
-            available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
+            available = self._available_entries(clear_expired=True, refresh=True)
             if not available:
-                return None, pending_refresh
+                return None
 
             below_cap = [
                 entry for entry in available
@@ -2111,7 +2007,7 @@ class CredentialPool:
             )
             self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
             self._current_id = chosen.id
-            return chosen.id, pending_refresh
+            return chosen.id
 
     def release_lease(self, credential_id: str) -> None:
         """Release a previously acquired credential lease."""
@@ -2163,7 +2059,7 @@ class CredentialPool:
                 else:
                     entry = self._current_unlocked() or self._select_unlocked(
                         refresh=False
-                    )[0]
+                    )
             if entry is None:
                 return None
             self._current_id = entry.id

@@ -49,10 +49,7 @@ _strip_session_list_rows = late("_strip_session_list_rows")
 
 @list_router.get("/api/sessions")
 def get_sessions(
-    # ``le=100`` caps the page size (idea from #39200): an unbounded limit
-    # lets one request drag every session row (plus correlated-subquery
-    # preview work) out of SQLite in a single hit.
-    limit: int = Query(20, ge=0, le=100),
+    limit: int = Query(20, ge=0),
     offset: int = Query(0, ge=0),
     min_messages: int = 0,
     archived: str = "exclude",

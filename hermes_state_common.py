@@ -152,7 +152,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 24
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -187,11 +187,6 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS system_prompts (
-    hash TEXT PRIMARY KEY,
-    prompt TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
@@ -206,7 +201,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
-    system_prompt_hash TEXT,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
@@ -245,8 +239,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
-    FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
+    FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -375,8 +368,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
     ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
-CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
-    ON sessions(system_prompt_hash);
 """
 
 
@@ -428,11 +419,7 @@ BEGIN
     VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
 END;
 
--- UPDATE OF skips the trigger entirely for non-content column writes
--- (status/compacted/observed/etc.), which is stronger than the WHEN gate
--- alone and avoids FTS I/O saturation on large state.db (#68858 / #73639).
-CREATE TRIGGER IF NOT EXISTS messages_fts_update
-AFTER UPDATE OF content, tool_name, tool_calls ON messages
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages
 WHEN (old.content IS NOT new.content
     OR old.tool_name IS NOT new.tool_name
     OR old.tool_calls IS NOT new.tool_calls)
@@ -500,8 +487,7 @@ BEGIN
     VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update
-AFTER UPDATE OF content, tool_name, tool_calls, role ON messages
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages
 WHEN (old.content IS NOT new.content
     OR old.tool_name IS NOT new.tool_name
     OR old.tool_calls IS NOT new.tool_calls
@@ -562,8 +548,7 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_update
-AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
     DELETE FROM messages_fts WHERE rowid = old.id;
     INSERT INTO messages_fts(rowid, content) VALUES (
         new.id,
@@ -590,8 +575,7 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON message
     DELETE FROM messages_fts_trigram WHERE rowid = old.id;
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update
-AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON messages BEGIN
     DELETE FROM messages_fts_trigram WHERE rowid = old.id;
     INSERT INTO messages_fts_trigram(rowid, content) VALUES (
         new.id,

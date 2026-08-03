@@ -1,7 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { useEffect, useMemo, useState } from 'react'
 
-import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { ActionsContextMenu, type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
@@ -93,19 +92,17 @@ export function SidebarCronJobsSection({
   // Rows revealed so far; starts compact, grows in steps via "load more".
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_JOBS)
 
-  const visible = usePaneVisible()
-
   // One clock for the whole section (rows are pure) so the countdowns tick
-  // without re-rendering the rest of the sidebar. Only runs while expanded and visible.
+  // without re-rendering the rest of the sidebar. Only runs while expanded.
   useEffect(() => {
-    if (!open || !visible) {
+    if (!open) {
       return
     }
 
     const id = window.setInterval(() => setNowMs(Date.now()), 1000)
 
     return () => window.clearInterval(id)
-  }, [open, visible])
+  }, [open])
 
   // Upcoming first (soonest next run), jobs with no next run sink to the bottom,
   // then alphabetical for stability.
@@ -331,7 +328,6 @@ function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (s
   const changeEventsAvailable = useStore($changeEventsAvailable)
   const cronChangeTick = useStore($cronChangeTick)
   const [runs, setRuns] = useState<null | SessionInfo[]>(null)
-  const visible = usePaneVisible()
 
   useEffect(() => {
     let cancelled = false
@@ -349,15 +345,6 @@ function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (s
           }
         })
 
-    // Hidden pane: skip the peek entirely — no initial load, no interval.
-    // `visible` is in the dep array, so becoming visible re-runs this effect
-    // and starts the load + timer fresh (same shape as the section clock).
-    if (!visible) {
-      return () => {
-        cancelled = true
-      }
-    }
-
     void load()
 
     const intervalId = window.setInterval(
@@ -374,7 +361,7 @@ function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (s
       window.clearInterval(intervalId)
     }
     // cronChangeTick: a fired run reloads the peek immediately.
-  }, [changeEventsAvailable, cronChangeTick, jobId, visible])
+  }, [changeEventsAvailable, cronChangeTick, jobId])
 
   return (
     <div className="mb-1 ml-[1.375rem] flex flex-col gap-px">

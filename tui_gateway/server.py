@@ -2749,26 +2749,16 @@ def _persist_branch_seed(session: dict) -> None:
         if db is None:
             return
         try:
-            # Bounded-chunk transactions (see #23254): a branch seed can be
-            # hundreds of rows; chunking keeps each BEGIN IMMEDIATE short so
-            # concurrent writers aren't starved. Recovery semantics match the
-            # old per-row loop (mid-copy failure leaves a partial seed with
-            # _branch_seed_persisted unset).
-            db.append_messages_batch(
-                key,
-                [
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
-                        # Preserve the parent's original message timestamps —
-                        # append_message would otherwise stamp time.time() and the
-                        # branch's copied history would all appear authored "now".
-                        "timestamp": msg.get("timestamp"),
-                    }
-                    for msg in seed
-                ],
-                chunk_rows=500,
-            )
+            for msg in seed:
+                db.append_message(
+                    session_id=key,
+                    role=msg.get("role", "user"),
+                    content=msg.get("content"),
+                    # Preserve the parent's original message timestamps —
+                    # append_message would otherwise stamp time.time() and the
+                    # branch's copied history would all appear authored "now".
+                    timestamp=msg.get("timestamp"),
+                )
             session["_branch_seed_persisted"] = True
         except Exception as exc:
             from hermes_state import is_disk_full_error
@@ -8920,20 +8910,6 @@ def _collect_kanban_notifications(session: dict) -> list:
         if resolved in seen_db_paths:
             continue
         seen_db_paths.add(resolved)
-        # A poller runs per live TUI/Desktop session. Avoid opening this board
-        # writable unless it has a subscription owned by this exact session;
-        # subscriptions for gateways or other sessions are not actionable here.
-        try:
-            if _kb.count_notify_subs(
-                board=slug,
-                platform="tui",
-                chat_id=session_key,
-            ) == 0:
-                continue
-        except Exception:
-            # Preserve delivery if the read-only probe cannot inspect a
-            # locked, corrupt, or otherwise unusual database.
-            pass
         try:
             conn = _kb.connect(board=slug)
         except Exception:

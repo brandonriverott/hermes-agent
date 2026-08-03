@@ -214,11 +214,7 @@ export function FloatingPet() {
     // so no timer. Legacy backend: the historical poll.
     const timer = changeEventsAvailable
       ? null
-      : window.setInterval(() => {
-          if (document.visibilityState === 'visible') {
-            void pull()
-          }
-        }, active ? PET_ACTIVE_REFRESH_MS : PET_POLL_MS)
+      : window.setInterval(() => void pull(), active ? PET_ACTIVE_REFRESH_MS : PET_POLL_MS)
 
     return () => {
       cancelled = true

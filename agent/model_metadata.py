@@ -836,10 +836,7 @@ def _localhost_to_ipv4(url: str) -> str:
     ``http://localhost...`` (e.g. ``?upstream=http://localhost:11434``)
     passes through untouched.
     """
-    if not url or not isinstance(url, str):
-        # Non-string values (test doubles, lazily-resolved config objects)
-        # previously flowed through these call sites untouched — keep that
-        # contract; re.sub would raise TypeError.
+    if not url:
         return url
     return re.sub(
         r"^(https?://)localhost(?=[:/]|$)",
@@ -1187,11 +1184,7 @@ def fetch_endpoint_model_metadata(
             last_error = exc
 
     for candidate in candidates:
-        # normalized/candidates stay unrewritten (cache key stability); only
-        # the outbound request target is IPv4-resolved to skip the multi-second
-        # dual-stack IPv6 connect timeout (see _localhost_to_ipv4).
-        request_candidate = _localhost_to_ipv4(candidate)
-        url = request_candidate.rstrip("/") + "/models"
+        url = candidate.rstrip("/") + "/models"
         response = None
         try:
             response = requests.get(
@@ -1237,7 +1230,7 @@ def fetch_endpoint_model_metadata(
             if is_llamacpp:
                 try:
                     # Try /v1/props first (current llama.cpp); fall back to /props for older builds
-                    base = request_candidate.rstrip("/").replace("/v1", "")
+                    base = candidate.rstrip("/").replace("/v1", "")
                     _verify = _resolve_requests_verify()
                     props_resp = requests.get(base + "/v1/props", headers=headers, timeout=5, verify=_verify)
                     if not props_resp.ok:
