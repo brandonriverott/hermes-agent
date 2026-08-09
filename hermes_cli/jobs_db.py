@@ -69,6 +69,7 @@ JOB_STEPS = (
     "waiting_for_decision",
     "complete",
     "failed",
+    "cancelled",
 )
 
 # ---------------------------------------------------------------------------
@@ -3612,6 +3613,45 @@ def _transition_material(row: sqlite3.Row) -> tuple:
     )
 
 
+def _graph_public_state_locked(
+    conn: sqlite3.Connection, request: TransitionWrite
+) -> tuple[str, str, bool]:
+    nonterminal = {
+        "QUEUED": ("working", "routing"),
+        "ASSIGNED": ("working", "routing"),
+        "BUILDING": ("working", "building"),
+        "EVIDENCE_COLLECTING": ("working", "testing"),
+        "REVIEWING": ("working", "reviewing"),
+        "VERIFIED": ("working", "verifying"),
+    }
+    if request.target_state in nonterminal:
+        status, step = nonterminal[request.target_state]
+        return status, step, False
+    if request.target_state == "COMPLETED":
+        return "finished", "complete", True
+    if request.target_state == "CANCELLED":
+        return "finished", "cancelled", True
+    if request.target_state == "BLOCKED":
+        auth_block = request.failure_class == "AUTH_INFRA" or any(
+            marker in (request.blocker_code or "")
+            for marker in ("AUTH", "LOGIN", "SSH", "TOKEN")
+        )
+        return (
+            "needs_you",
+            "waiting_for_login" if auth_block else "waiting_for_decision",
+            True,
+        )
+    if request.target_state == "FAILED":
+        attempt = conn.execute(
+            "SELECT terminal_failure FROM job_attempts WHERE id = ?",
+            (request.attempt_id,),
+        ).fetchone()
+        if attempt is not None and attempt["terminal_failure"] == 1:
+            return "finished", "failed", True
+        return "working", "correcting", True
+    raise ValueError(f"unknown detailed Job state: {request.target_state!r}")
+
+
 def record_transition(
     conn: sqlite3.Connection,
     request: TransitionWrite,
@@ -3679,6 +3719,34 @@ def record_transition(
             expected_material,
         )
         transition_id = int(cursor.lastrowid)
+        status, step, clear_custody = _graph_public_state_locked(conn, request)
+        if clear_custody:
+            conn.execute(
+                "UPDATE jobs SET status = ?, step = ?, updated_at = ?, "
+                "revision = revision + 1, claimed_by = NULL, claim_token = NULL, "
+                "claim_acquired_at = NULL, lease_expires_at = NULL, "
+                "current_attempt_id = NULL WHERE id = ?",
+                (status, step, request.created_at, request.job_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET status = ?, step = ?, updated_at = ?, "
+                "revision = revision + 1 WHERE id = ?",
+                (status, step, request.created_at, request.job_id),
+            )
+        _append_event_locked(
+            conn,
+            request.job_id,
+            "reliability_transition",
+            data={
+                "transition_id": transition_id,
+                "attempt_id": request.attempt_id,
+                "target_state": request.target_state,
+                "receipt_id": request.receipt_id,
+            },
+            idempotency_key=f"reliability-transition:{request.attempt_id}:{request.idempotency_key}",
+            now=request.created_at,
+        )
     return transition_id
 
 
