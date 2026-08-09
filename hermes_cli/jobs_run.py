@@ -37,17 +37,80 @@ not passed to the worker, not logged, and not present in the returned result.
 from __future__ import annotations
 
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 from hermes_cli import jobs_adapter_claude as adapter
 from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_exec as jx
+from hermes_cli import jobs_loop
 from hermes_cli.jobs_contract import JobEnvelope
 
 # The Claude lane's wall clock. The lease is sized from this, not the other way
 # round, so a dead runner's claim expires shortly after the run could have ended.
 DEFAULT_WALL_CLOCK_SECONDS = 1500
+
+
+@dataclass(frozen=True)
+class GateEvidence:
+    """Graph-safe evidence derived from the authoritative gate adapter."""
+
+    action_outcome: str
+    identity_verified: bool
+    reason_code: str
+    commit: Optional[str]
+    themis_review_digest: Optional[str]
+    receipt_verification_digest: Optional[str]
+
+
+def adapt_gate_settlement(
+    result: Mapping[str, Any], *, job_dir, review_attempt: int
+) -> GateEvidence:
+    """Turn verified gate output into graph evidence digests.
+
+    ``done.json`` is intentionally absent from this interface.  The caller must
+    pass the normalized result of ``jobs_evidence_gate.graph_settlement``; only
+    a result whose identity was authoritatively re-verified can become a
+    successful graph decision.
+    """
+
+    reason_code = str(result.get("reason_code") or "GATE_EVIDENCE_INVALID")
+    identity_verified = result.get("identity_verified") is True
+    action_outcome = str(result.get("action_outcome") or "failed")
+    commit = result.get("commit")
+    clean_commit = commit if isinstance(commit, str) else None
+    if action_outcome != "succeeded" or not identity_verified:
+        return GateEvidence(
+            action_outcome="failed",
+            identity_verified=identity_verified,
+            reason_code=reason_code,
+            commit=clean_commit,
+            themis_review_digest=None,
+            receipt_verification_digest=None,
+        )
+
+    directory = Path(job_dir)
+    try:
+        review = (directory / f"review-{int(review_attempt)}.json").read_bytes()
+        gate_receipt = (directory / "gate.json").read_bytes()
+    except (OSError, ValueError, TypeError):
+        return GateEvidence(
+            action_outcome="failed",
+            identity_verified=False,
+            reason_code="GATE_EVIDENCE_READBACK_FAILED",
+            commit=clean_commit,
+            themis_review_digest=None,
+            receipt_verification_digest=None,
+        )
+    return GateEvidence(
+        action_outcome="succeeded",
+        identity_verified=True,
+        reason_code="OK",
+        commit=clean_commit,
+        themis_review_digest=jobs_loop.digest_bytes(review),
+        receipt_verification_digest=jobs_loop.digest_bytes(gate_receipt),
+    )
 
 
 def run_once(

@@ -1846,3 +1846,20 @@ def test_a_legacy_settled_event_grants_no_replay_authority(home, tmp_path, repo)
         ("legacy-req", res["attempt_id"])
     ]
     assert _run_once(tmp_path, path, base, request_id="legacy-req") == res
+
+
+def test_graph_gate_adapter_requires_authoritative_identity(tmp_path):
+    result = jobs_run.adapt_gate_settlement(
+        {
+            "action_outcome": "succeeded",
+            "identity_verified": False,
+            "reason_code": "EVIDENCE_MISSING",
+            "commit": "c" * 40,
+        },
+        job_dir=tmp_path,
+        review_attempt=0,
+    )
+
+    assert result.action_outcome == "failed"
+    assert result.identity_verified is False
+    assert result.reason_code == "EVIDENCE_MISSING"

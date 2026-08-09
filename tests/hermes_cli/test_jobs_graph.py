@@ -333,6 +333,38 @@ def test_blocked_attempt_maps_to_needs_you_without_claim_leak(graph_rig):
     assert job.claimed_by is None
 
 
+def test_retryable_failed_edge_closes_attempt_before_next_attempt(graph_rig):
+    graph_rig.advance("FAILED")
+
+    first = jdb.get_attempt(graph_rig.conn, graph_rig.attempt_id)
+    assert first["status"] == "failed"
+    claim = jdb.claim_job(
+        graph_rig.conn,
+        worker="retry-worker",
+        lease_seconds=60,
+        job=graph_rig.job_id,
+        now=100,
+    )
+    second_id = jdb.start_attempt(
+        graph_rig.conn,
+        graph_rig.job_id,
+        claim_token=claim.claim_token,
+        specialist="retry-worker",
+        base_commit="b" * 40,
+        now=101,
+    )
+
+    assert jdb.get_attempt(graph_rig.conn, second_id)["ordinal"] == 2
+
+
+def test_completed_edge_closes_attempt_as_succeeded(graph_rig):
+    graph_rig.advance("COMPLETED")
+
+    assert jdb.get_attempt(graph_rig.conn, graph_rig.attempt_id)["status"] == (
+        "succeeded"
+    )
+
+
 def test_projection_is_read_only_deterministic_and_preserves_history(tmp_path):
     path = tmp_path / "jobs.db"
     first = jdb.connect(path)

@@ -264,6 +264,30 @@ def test_a_builder_written_done_json_is_replaced_at_settlement(job_dir):
     assert done["outcome"] == "needs_attention"
 
 
+def test_forged_done_has_no_graph_verification_authority(job_dir):
+    (job_dir / "done.json").write_text(
+        json.dumps(
+            {
+                "outcome": "succeeded",
+                "claude_exit": 0,
+                "commit": CANDIDATE,
+                "branch": f"jobs/{JOB}",
+                "review_verdict": "PASS",
+                "review_rounds": 1,
+                "findings": 0,
+                "effort": "max",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = gate.graph_settlement(job_dir, job=JOB, base=BASE)
+
+    assert result["action_outcome"] == "failed"
+    assert result["identity_verified"] is False
+    assert result["reason_code"] == "EVIDENCE_MISSING"
+
+
 # ── 5. reviewer PASS cannot override failed required checks ───────────
 
 

@@ -1020,6 +1020,7 @@ class TransitionWrite:
     component_version: str
     idempotency_key: str
     created_at: int
+    commit: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -3701,6 +3702,15 @@ def record_transition(
             conn, request.job_id, request.expected_job_revision
         )
         _require_attempt_job_locked(conn, request.attempt_id, request.job_id)
+        attempt_row = conn.execute(
+            "SELECT * FROM job_attempts WHERE id = ?", (request.attempt_id,)
+        ).fetchone()
+        if (
+            request.target_state
+            in {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}
+            and attempt_row["status"] != "running"
+        ):
+            raise GraphConflict("terminal graph edge requires a running attempt")
         _insert_reliability_receipt_locked(
             conn,
             receipt_id=request.receipt_id,
@@ -3721,6 +3731,38 @@ def record_transition(
         transition_id = int(cursor.lastrowid)
         status, step, clear_custody = _graph_public_state_locked(conn, request)
         if clear_custody:
+            attempt_status = {
+                "COMPLETED": "succeeded",
+                "FAILED": "failed",
+                "BLOCKED": "failed",
+                "CANCELLED": "cancelled",
+            }[request.target_state]
+            conn.execute(
+                "UPDATE job_attempts SET status = ?, failure_class = ?, "
+                "finished_at = ?, commit_sha = COALESCE(commit_sha, ?) "
+                "WHERE id = ?",
+                (
+                    attempt_status,
+                    request.failure_class,
+                    request.created_at,
+                    request.commit,
+                    request.attempt_id,
+                ),
+            )
+            _append_event_locked(
+                conn,
+                request.job_id,
+                "attempt_finished",
+                data={
+                    "attempt_id": request.attempt_id,
+                    "status": attempt_status,
+                    "failure_class": request.failure_class,
+                },
+                idempotency_key=(
+                    f"reliability-attempt-finished:{request.attempt_id}"
+                ),
+                now=request.created_at,
+            )
             conn.execute(
                 "UPDATE jobs SET status = ?, step = ?, updated_at = ?, "
                 "revision = revision + 1, claimed_by = NULL, claim_token = NULL, "

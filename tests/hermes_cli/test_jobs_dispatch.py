@@ -9,8 +9,12 @@ or live repository is touched.
 from __future__ import annotations
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from hermes_cli import jobs_dispatch as dispatch
+from hermes_cli import jobs_db as jdb
+from hermes_cli import jobs_graph as graph
+from hermes_cli import jobs_harness as harness
 
 
 JOB_71_REPO_PATH = "/Users/brandon/Documents/Kava Bar Scan"
@@ -147,3 +151,61 @@ def test_invalid_legacy_execution_values_have_visible_refusal_codes(
 
     assert exc.value.code == code
     assert exc.value.key == key
+
+
+def test_dispatch_does_not_claim_when_preflight_blocks(tmp_path):
+    conn = jdb.connect(tmp_path / "jobs.db")
+    try:
+        job_id = jdb.create_job(conn, name="blocked", goal="do not launch")
+        repository = tmp_path / "repo"
+        output = tmp_path / "output"
+        memory = tmp_path / "memory.md"
+        repository.mkdir()
+        output.mkdir()
+        memory.write_text("scoped", encoding="utf-8")
+
+        def passed(_probe_input):
+            return harness.ProbeResult("PASS", "OK", {})
+
+        probes = harness.PreflightProbes(
+            **{name: passed for name in harness.CHECK_NAMES}
+        ).with_failure("auth_check", code="SSH_AUTH_FAILED")
+        private_key = Ed25519PrivateKey.generate()
+        signer = harness.ReceiptSigner("lane:test:v1", private_key)
+        verifier = graph.ReceiptVerifier(
+            trusted_keys={signer.key_id: private_key.public_key()}
+        )
+        worker_calls = []
+
+        result = dispatch.dispatch_once(
+            conn=conn,
+            job_id=job_id,
+            spec=dispatch.DispatchSpec(
+                repository=repository,
+                base_commit="b" * 40,
+                branch="jobs/test",
+                output_parents=(output,),
+                scoped_memory_paths=(memory,),
+                lane_id="lane:test",
+                executor="fake",
+                model="fake-model",
+            ),
+            probes=probes,
+            signer=signer,
+            verifier=verifier,
+            worker_id="worker:test",
+            executor=lambda _context: worker_calls.append("launched"),
+            gate=lambda _context, _execution: None,
+            activation_gate=lambda _context, _gate: None,
+            observed_at="2026-08-09T00:00:00Z",
+            now=1,
+        )
+
+        job = jdb.get_job(conn, job_id)
+        assert result.claimed is False
+        assert result.reason == "SSH_AUTH_FAILED"
+        assert job.claimed_by is None
+        assert jdb.get_attempts(conn, job_id) == []
+        assert worker_calls == []
+    finally:
+        conn.close()

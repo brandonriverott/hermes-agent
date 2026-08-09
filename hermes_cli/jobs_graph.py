@@ -152,6 +152,7 @@ def _write(request: TransitionRequest) -> jobs_db.TransitionWrite:
         component_version=request.component_version,
         idempotency_key=request.idempotency_key,
         created_at=request.created_at,
+        commit=request.commit,
     )
 
 
@@ -292,6 +293,8 @@ def transition_attempt(
         raise IllegalGraphTransition(
             f"illegal Job graph transition {current_state!r} -> {request.target_state!r}"
         )
+    if attempt["status"] != "running":
+        raise jobs_db.GraphConflict("new graph edge requires a running attempt")
     _validate_evidence(request)
     _verify_envelope(request, envelope, verifier)
     transition_id = jobs_db.record_transition(conn, _write(request), envelope)

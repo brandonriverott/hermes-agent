@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from hermes_cli import jobs_exec as jx
+from hermes_cli import jobs_receipts
 from hermes_cli import jobs_skills as jskills
 from hermes_cli.jobs_contract import JobEnvelope
 
@@ -101,6 +102,52 @@ class AdapterResult:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class ArtifactClaim:
+    """One executor-authored byte claim for dispatcher readback.
+
+    The executor captures the digest immediately after writing.  The dispatcher
+    reads the path independently before REVIEWING, so a later rewrite is
+    observable rather than silently becoming the new expected value.
+    """
+
+    name: str
+    path: Path
+    digest: str
+    size: int
+
+
+@dataclass(frozen=True)
+class ReliabilityExecution:
+    """Provider-neutral evidence returned to the reliability dispatcher."""
+
+    status: str
+    commit: Optional[str]
+    worktree: Path
+    artifacts: tuple[ArtifactClaim, ...]
+    executor_exit_digest: str
+    output_capture_digest: str
+    failure_reason_code: Optional[str] = None
+    http_status: Optional[int] = None
+    safety_gate: bool = False
+
+
+def claim_artifact(path: Path, *, name: str) -> ArtifactClaim:
+    """Capture a bounded identity claim without granting it authority."""
+
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("artifact name must not be empty")
+    source = Path(path)
+    data = source.read_bytes()
+    return ArtifactClaim(
+        name=clean_name,
+        path=source,
+        digest=jobs_receipts.digest_bytes(data),
+        size=len(data),
+    )
 
 
 def branch_name(envelope: JobEnvelope) -> str:

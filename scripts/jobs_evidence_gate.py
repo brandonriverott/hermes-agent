@@ -654,6 +654,34 @@ def verify_bridge_settlement(job_dir, *, job: str, base: str) -> dict:
     }
 
 
+def graph_settlement(job_dir, *, job: str, base: str) -> dict:
+    """Normalize bridge verification for the reliability graph.
+
+    The graph never reads ``done.json`` directly.  It receives a successful
+    decision only from :func:`verify_bridge_settlement`, which binds the gate,
+    compatibility document, tests, review, Job, attempt, base, and candidate
+    commit.  Invalid evidence is data here rather than an exception so the
+    dispatcher can record a typed terminal edge without accidentally treating
+    an unreadable gate as a crash outside the attempt.
+    """
+
+    try:
+        verified = verify_bridge_settlement(job_dir, job=job, base=base)
+    except EvidenceError as exc:
+        return {
+            "action_outcome": "failed",
+            "identity_verified": False,
+            "reason_code": exc.verdict,
+            "reason": exc.reason,
+            "commit": None,
+        }
+    return {
+        **verified,
+        "identity_verified": True,
+        "reason_code": "OK" if verified["action_outcome"] == "succeeded" else verified["review_verdict"],
+    }
+
+
 # ── CLI (the seam the runner calls) ───────────────────────────────────
 
 
