@@ -50,6 +50,7 @@ _DIRECTORIES = {
 _ALLOWED_ENVIRONMENT = {
     "PATH",
     "HOME",
+    "USER",
     "TMPDIR",
     "TEMP",
     "TMP",

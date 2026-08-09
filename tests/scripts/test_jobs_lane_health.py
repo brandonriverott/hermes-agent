@@ -189,6 +189,63 @@ def test_health_cli_returns_zero_only_for_a_fresh_idle_lane(tmp_path):
     assert payload["lanes"][0]["available_capacity"] == 1
 
 
+def test_health_cli_preserves_user_for_macos_credential_lookup(tmp_path):
+    host = "mac" if sys.platform == "darwin" else "pc"
+    lane_id = f"claude-{host}-1"
+    root = tmp_path / "lanes"
+    root.mkdir()
+    lane_dir = _provision_test_lane(root, lane_id)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    executor = bin_dir / "claude"
+    executor.write_text(
+        """#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "claude test-1.0"
+  exit 0
+fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  if [ -n "${USER:-}" ]; then
+    echo '{"loggedIn":true}'
+    exit 0
+  fi
+  echo '{"loggedIn":false}'
+  exit 1
+fi
+exit 1
+""",
+        encoding="utf-8",
+    )
+    executor.chmod(executor.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env["PATH"] = os.pathsep.join((str(bin_dir), env.get("PATH", "")))
+    env["USER"] = "lane-operator"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--host",
+            host,
+            "--root",
+            str(root),
+            "--lane",
+            lane_id,
+            "--json",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["lanes"][0]["status"] == "PASS"
+    assert payload["lanes"][0]["state"] == "IDLE"
+
+
 def test_health_cli_rejects_lane_from_another_host(tmp_path):
     root = tmp_path / "lanes"
     root.mkdir()
