@@ -478,6 +478,7 @@ def dispatch_once(
         force_blocked: bool = False,
     ) -> DispatchResult:
         decision = jobs_loop.classify_failure(signal)
+        reported_reason = decision.reason_code
         retry_action: Optional[str] = None
         recovery = decision.recovery_decision
         target = "FAILED"
@@ -523,6 +524,7 @@ def dispatch_once(
             if retry_action != "RETRY":
                 target = "BLOCKED"
                 blocker_code = str(stored["reason_code"])
+                reported_reason = blocker_code
         if force_blocked:
             target = "BLOCKED"
             retry_action = retry_action or "HUMAN_ACTION"
@@ -558,7 +560,7 @@ def dispatch_once(
             reason=(
                 "JOURNAL_WRITE_FAILED"
                 if journal_error is not None
-                else decision.reason_code
+                else reported_reason
             ),
             job_id=job.id,
             attempt_id=attempt_id,
