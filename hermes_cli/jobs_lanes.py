@@ -6,14 +6,26 @@ import hashlib
 import json
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path, PureWindowsPath
-from typing import Literal, Mapping
+from typing import Literal, Mapping, TypeAlias
 
 
 HostId = Literal["pc", "mac"]
 Executor = Literal["claude", "codex"]
+JsonScalar: TypeAlias = str | int | bool | None
+JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+LaneState = Literal[
+    "UNPROVISIONED",
+    "AUTH_REQUIRED",
+    "BLOCKED",
+    "IDLE",
+    "ASSIGNED",
+    "BUILDING",
+    "VERIFYING",
+    "FAILED",
+]
 
 
 class InvalidLaneRegistry(ValueError):
@@ -56,6 +68,54 @@ class LaneRegistry:
     fallback: FallbackPolicy
     lanes: tuple[LaneDefinition, ...]
     source_bytes: bytes
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """One sanitized result from an immutable lane-health snapshot."""
+
+    passed: bool
+    reason_code: str
+    failure_class: str | None = None
+    safe_detail: Mapping[str, JsonValue] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LeaseObservation:
+    """Current attempt custody for one lane."""
+
+    state: Literal["IDLE", "ASSIGNED", "BUILDING", "VERIFYING", "FAILED"]
+    reason_code: str
+
+
+@dataclass(frozen=True)
+class LaneProbes:
+    """All checks collected against one observation timestamp."""
+
+    observed_at: int
+    configuration: ProbeResult
+    permissions: ProbeResult
+    executable: ProbeResult
+    auth: ProbeResult
+    signer: ProbeResult
+    resources: ProbeResult
+    git: ProbeResult
+    host: ProbeResult
+    lease: LeaseObservation
+
+
+@dataclass(frozen=True)
+class LaneHealth:
+    lane_id: str
+    state: LaneState
+    status: Literal["PASS", "BLOCKED"]
+    failure_class: str | None
+    reason_code: str
+    observed_at: int
+    expires_at: int
+    executor_version: str | None
+    available_capacity: int
+    safe_detail: Mapping[str, JsonValue]
 
 
 _TOP_LEVEL_KEYS = {
@@ -336,3 +396,211 @@ def registry_digest(registry: LaneRegistry) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _sanitize_safe_value(value: object, *, depth: int = 0) -> JsonValue | None:
+    if depth > 4:
+        return None
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return None
+    if isinstance(value, str):
+        cleaned = "".join(character for character in value if character.isprintable())
+        return cleaned[:256]
+    if isinstance(value, list):
+        result: list[JsonValue] = []
+        for item in value[:32]:
+            safe_item = _sanitize_safe_value(item, depth=depth + 1)
+            if safe_item is not None:
+                result.append(safe_item)
+        return result
+    if isinstance(value, Mapping):
+        result_dict: dict[str, JsonValue] = {}
+        for key, item in list(value.items())[:32]:
+            if not isinstance(key, str) or _SECRET_FIELD.search(key):
+                continue
+            safe_item = _sanitize_safe_value(item, depth=depth + 1)
+            if safe_item is not None:
+                result_dict[key] = safe_item
+        return result_dict
+    return None
+
+
+def _safe_probe_details(
+    lane_dir: Path, probes: LaneProbes
+) -> tuple[dict[str, JsonValue], str | None]:
+    details: dict[str, JsonValue] = {"lane_dir": str(lane_dir)}
+    executor_version: str | None = None
+    for name in (
+        "configuration",
+        "permissions",
+        "executable",
+        "auth",
+        "signer",
+        "resources",
+        "git",
+        "host",
+    ):
+        probe = getattr(probes, name)
+        safe = _sanitize_safe_value(probe.safe_detail)
+        if isinstance(safe, dict) and safe:
+            details[name] = safe
+        if name == "executable" and isinstance(safe, dict):
+            version = safe.get("executor_version")
+            if isinstance(version, str) and version:
+                executor_version = version
+    return details, executor_version
+
+
+def _lane_health(
+    lane: LaneDefinition,
+    probes: LaneProbes,
+    *,
+    ttl_seconds: int,
+    state: LaneState,
+    status: Literal["PASS", "BLOCKED"],
+    failure_class: str | None,
+    reason_code: str,
+    lane_dir: Path,
+) -> LaneHealth:
+    safe_detail, executor_version = _safe_probe_details(lane_dir, probes)
+    return LaneHealth(
+        lane_id=lane.id,
+        state=state,
+        status=status,
+        failure_class=failure_class,
+        reason_code=reason_code,
+        observed_at=probes.observed_at,
+        expires_at=probes.observed_at + ttl_seconds,
+        executor_version=executor_version,
+        available_capacity=1 if state == "IDLE" and status == "PASS" else 0,
+        safe_detail=safe_detail,
+    )
+
+
+def evaluate_lane_health(
+    lane: LaneDefinition,
+    *,
+    root: Path,
+    probes: LaneProbes,
+    now: int,
+    ttl_seconds: int,
+) -> LaneHealth:
+    """Reduce ordered probe evidence without allowing later checks to mask failure."""
+
+    if not isinstance(lane, LaneDefinition):
+        raise TypeError("lane must be a LaneDefinition")
+    if isinstance(now, bool) or not isinstance(now, int):
+        raise TypeError("now must be an integer Unix timestamp")
+    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
+        raise TypeError("ttl_seconds must be an integer")
+    if ttl_seconds <= 0:
+        raise ValueError("ttl_seconds must be positive")
+    if isinstance(probes.observed_at, bool) or not isinstance(probes.observed_at, int):
+        raise TypeError("probes.observed_at must be an integer Unix timestamp")
+
+    lane_dir = Path(root) / lane.id
+    if not lane_dir.is_dir() or lane_dir.is_symlink():
+        return _lane_health(
+            lane,
+            probes,
+            ttl_seconds=ttl_seconds,
+            state="UNPROVISIONED",
+            status="BLOCKED",
+            failure_class="INFRA_FAILURE",
+            reason_code="LANE_UNPROVISIONED",
+            lane_dir=lane_dir,
+        )
+    if probes.observed_at > now:
+        return _lane_health(
+            lane,
+            probes,
+            ttl_seconds=ttl_seconds,
+            state="BLOCKED",
+            status="BLOCKED",
+            failure_class="INFRA_FAILURE",
+            reason_code="HEALTH_CLOCK_SKEW",
+            lane_dir=lane_dir,
+        )
+    if now > probes.observed_at + ttl_seconds:
+        return _lane_health(
+            lane,
+            probes,
+            ttl_seconds=ttl_seconds,
+            state="BLOCKED",
+            status="BLOCKED",
+            failure_class="INFRA_FAILURE",
+            reason_code="HEALTH_STALE",
+            lane_dir=lane_dir,
+        )
+
+    ordered_probes = (
+        ("configuration", probes.configuration),
+        ("permissions", probes.permissions),
+        ("executable", probes.executable),
+        ("auth", probes.auth),
+        ("signer", probes.signer),
+        ("resources", probes.resources),
+        ("git", probes.git),
+        ("host", probes.host),
+    )
+    for name, probe in ordered_probes:
+        if probe.passed:
+            continue
+        is_auth_required = name == "auth" and probe.reason_code in {
+            "AUTH_REQUIRED",
+            "TOKEN_EXPIRED",
+        }
+        default_failure = (
+            "AUTH_INFRA"
+            if name in {"auth", "signer"}
+            or probe.reason_code == "SSH_AUTH_FAILED"
+            else "INFRA_FAILURE"
+        )
+        return _lane_health(
+            lane,
+            probes,
+            ttl_seconds=ttl_seconds,
+            state="AUTH_REQUIRED" if is_auth_required else "BLOCKED",
+            status="BLOCKED",
+            failure_class=probe.failure_class or default_failure,
+            reason_code=probe.reason_code,
+            lane_dir=lane_dir,
+        )
+
+    lease = probes.lease
+    if lease.state == "FAILED":
+        return _lane_health(
+            lane,
+            probes,
+            ttl_seconds=ttl_seconds,
+            state="FAILED",
+            status="BLOCKED",
+            failure_class="INFRA_FAILURE",
+            reason_code=lease.reason_code,
+            lane_dir=lane_dir,
+        )
+    if lease.state in {"ASSIGNED", "BUILDING", "VERIFYING"}:
+        return _lane_health(
+            lane,
+            probes,
+            ttl_seconds=ttl_seconds,
+            state=lease.state,
+            status="PASS",
+            failure_class=None,
+            reason_code=lease.reason_code,
+            lane_dir=lane_dir,
+        )
+    if lease.state != "IDLE":
+        raise ValueError(f"unsupported lease state: {lease.state}")
+    return _lane_health(
+        lane,
+        probes,
+        ttl_seconds=ttl_seconds,
+        state="IDLE",
+        status="PASS",
+        failure_class=None,
+        reason_code=lease.reason_code,
+        lane_dir=lane_dir,
+    )
