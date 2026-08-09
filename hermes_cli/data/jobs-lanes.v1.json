@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "policy_version": "jobs-lanes.v1",
+  "health_ttl_seconds": 120,
+  "hosts": [
+    {"id": "pc", "preference": 0, "root_config_key": "jobs.lanes.roots.pc"},
+    {"id": "mac", "preference": 1, "root_config_key": "jobs.lanes.roots.mac"}
+  ],
+  "fallback": {
+    "name": "mac_when_pc_unavailable",
+    "enabled": true,
+    "preserve_executor": true,
+    "preserve_model": true,
+    "from_host": "pc",
+    "to_host": "mac",
+    "eligible_reason_codes": [
+      "HOST_UNREACHABLE",
+      "SSH_AUTH_FAILED",
+      "AUTH_REQUIRED",
+      "HEALTH_FAILED",
+      "CAPACITY_FULL"
+    ]
+  },
+  "lanes": [
+    {"id": "claude-pc-1", "host_id": "pc", "executor": "claude", "slot": 1, "model_patterns": ["claude-*"]},
+    {"id": "claude-pc-2", "host_id": "pc", "executor": "claude", "slot": 2, "model_patterns": ["claude-*"]},
+    {"id": "claude-pc-3", "host_id": "pc", "executor": "claude", "slot": 3, "model_patterns": ["claude-*"]},
+    {"id": "codex-pc-1", "host_id": "pc", "executor": "codex", "slot": 1, "model_patterns": ["gpt-*"]},
+    {"id": "codex-pc-2", "host_id": "pc", "executor": "codex", "slot": 2, "model_patterns": ["gpt-*"]},
+    {"id": "codex-pc-3", "host_id": "pc", "executor": "codex", "slot": 3, "model_patterns": ["gpt-*"]},
+    {"id": "claude-mac-1", "host_id": "mac", "executor": "claude", "slot": 1, "model_patterns": ["claude-*"]},
+    {"id": "claude-mac-2", "host_id": "mac", "executor": "claude", "slot": 2, "model_patterns": ["claude-*"]},
+    {"id": "claude-mac-3", "host_id": "mac", "executor": "claude", "slot": 3, "model_patterns": ["claude-*"]},
+    {"id": "codex-mac-1", "host_id": "mac", "executor": "codex", "slot": 1, "model_patterns": ["gpt-*"]},
+    {"id": "codex-mac-2", "host_id": "mac", "executor": "codex", "slot": 2, "model_patterns": ["gpt-*"]},
+    {"id": "codex-mac-3", "host_id": "mac", "executor": "codex", "slot": 3, "model_patterns": ["gpt-*"]}
+  ]
+}
