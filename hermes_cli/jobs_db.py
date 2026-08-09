@@ -41,7 +41,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing, write_txn
 from hermes_constants import get_hermes_home
@@ -424,6 +424,74 @@ CREATE TABLE IF NOT EXISTS job_retry_evidence (
     UNIQUE (chain_id, ordinal),
     UNIQUE (chain_id, evidence_digest)
 );
+
+-- Sanitized, append-only builder-lane observations. Authentication material
+-- never belongs in this table: callers provide a reduced LaneHealth value and
+-- record_lane_health bounds and screens safe_detail again at the DB boundary.
+CREATE TABLE IF NOT EXISTS job_lane_health (
+    id                    TEXT PRIMARY KEY,
+    lane_id               TEXT NOT NULL,
+    policy_version        TEXT NOT NULL,
+    policy_digest         TEXT NOT NULL,
+    state                 TEXT NOT NULL CHECK (state IN (
+                              'UNPROVISIONED', 'AUTH_REQUIRED', 'BLOCKED',
+                              'IDLE', 'ASSIGNED', 'BUILDING', 'VERIFYING', 'FAILED'
+                          )),
+    status                TEXT NOT NULL CHECK (status IN ('PASS', 'BLOCKED')),
+    failure_class         TEXT,
+    reason_code           TEXT NOT NULL,
+    observed_at           INTEGER NOT NULL,
+    expires_at            INTEGER NOT NULL,
+    executor_version      TEXT,
+    available_capacity    INTEGER NOT NULL CHECK (available_capacity IN (0, 1)),
+    safe_detail_json      TEXT NOT NULL,
+    created_at            INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_lane_health_latest
+    ON job_lane_health(lane_id, observed_at DESC);
+
+-- One immutable placement row owns a lane until evidence verification and
+-- cleanup move it out of an active state. The partial unique indexes are the
+-- database backstop against both lane overbooking and duplicate Job placement.
+CREATE TABLE IF NOT EXISTS job_lane_placements (
+    id                    TEXT PRIMARY KEY,
+    job_id                TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    attempt_id            TEXT REFERENCES job_attempts(id),
+    lane_id               TEXT NOT NULL,
+    preflight_id          TEXT NOT NULL REFERENCES job_preflights(id),
+    health_id             TEXT NOT NULL REFERENCES job_lane_health(id),
+    policy_version        TEXT NOT NULL,
+    policy_digest         TEXT NOT NULL,
+    executor              TEXT NOT NULL,
+    model                 TEXT NOT NULL,
+    fallback_applied      INTEGER NOT NULL CHECK (fallback_applied IN (0, 1)),
+    route_reason_code     TEXT NOT NULL,
+    state                 TEXT NOT NULL CHECK (state IN (
+                              'ASSIGNED', 'BUILDING', 'VERIFYING', 'IDLE', 'FAILED'
+                          )),
+    state_reason_code     TEXT NOT NULL,
+    lane_root             TEXT,
+    registered_worktree   TEXT,
+    registered_handoff    TEXT,
+    claim_acquired_at     INTEGER NOT NULL,
+    lease_expires_at      INTEGER NOT NULL,
+    cleanup_at            INTEGER,
+    cleanup_evidence_digest TEXT,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_lane_placements_lane
+    ON job_lane_placements(lane_id, updated_at DESC, id DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_job_lane_placements_active_lane
+    ON job_lane_placements(lane_id)
+    WHERE state IN ('ASSIGNED', 'BUILDING', 'VERIFYING');
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_job_lane_placements_active_job
+    ON job_lane_placements(job_id)
+    WHERE state IN ('ASSIGNED', 'BUILDING', 'VERIFYING');
 
 -- Durable monotonic number allocator. A single row (id = 1) holds the highest
 -- job number ever issued, independent of the jobs table so deleting a Job row
@@ -3711,6 +3779,30 @@ def record_transition(
             and attempt_row["status"] != "running"
         ):
             raise GraphConflict("terminal graph edge requires a running attempt")
+        placement = conn.execute(
+            "SELECT * FROM job_lane_placements WHERE attempt_id = ? "
+            "ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (request.attempt_id,),
+        ).fetchone()
+        if (
+            request.target_state == "COMPLETED"
+            and placement is not None
+            and placement["state"] != "IDLE"
+        ):
+            raise GraphConflict(
+                "COMPLETED requires verified lane cleanup and IDLE placement"
+            )
+        if (
+            request.target_state in {"FAILED", "BLOCKED", "CANCELLED"}
+            and placement is not None
+            and placement["state"] in _LANE_ACTIVE_STATES
+        ):
+            _fail_active_lane_placement_locked(
+                conn,
+                job_id=request.job_id,
+                reason_code=f"GRAPH_{request.target_state}",
+                now=request.created_at,
+            )
         _insert_reliability_receipt_locked(
             conn,
             receipt_id=request.receipt_id,
@@ -4030,6 +4122,736 @@ def projection(
 
 
 # ---------------------------------------------------------------------------
+# Builder-lane observations and capacity-safe placement
+# ---------------------------------------------------------------------------
+
+
+_LANE_ACTIVE_STATES = frozenset({"ASSIGNED", "BUILDING", "VERIFYING"})
+_LANE_STATE_TRANSITIONS = {
+    "ASSIGNED": frozenset({"BUILDING", "FAILED"}),
+    "BUILDING": frozenset({"VERIFYING", "FAILED"}),
+    "VERIFYING": frozenset({"IDLE", "FAILED"}),
+    "IDLE": frozenset(),
+    "FAILED": frozenset(),
+}
+_LANE_REASON_CODE = re.compile(r"\A[A-Z][A-Z0-9_]{0,63}\Z")
+_LANE_SECRET_KEY = re.compile(
+    r"token|secret|password|credential|cookie|authorization|private[_ -]?key",
+    re.IGNORECASE,
+)
+_LANE_SECRET_TEXT = (
+    "authorization:",
+    "bearer ",
+    "token=",
+    "api_key",
+    "private key",
+    "sk-",
+)
+
+
+@dataclass(frozen=True)
+class PlacedClaim:
+    """Result of binding one passing preflight to one lane capacity seat.
+
+    A capacity or health race is a normal poll result, not an exception. In
+    that case ``claimed`` is false and no Job, claim capability, or placement
+    was written. The capability is deliberately hidden from repr/str.
+    """
+
+    claimed: bool
+    reason_code: str
+    lane_id: Optional[str]
+    placement_id: Optional[str]
+    job: Optional[Job]
+    claim_token: Optional[str] = field(default=None, repr=False)
+    lease_expires_at: Optional[int] = None
+
+    @property
+    def worker_id(self) -> Optional[str]:
+        return self.lane_id
+
+
+def _lane_clean_scalar(value: object, *, limit: int) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("lane health text fields must be strings")
+    cleaned = "".join(character for character in value if character.isprintable())
+    if not cleaned or len(cleaned) > limit:
+        raise ValueError("lane health text field is empty or too long")
+    if any(marker in cleaned.lower() for marker in _LANE_SECRET_TEXT):
+        raise ValueError("lane health text may contain authentication material")
+    return cleaned
+
+
+def _lane_safe_value(value: object, *, depth: int = 0) -> object:
+    """Return bounded JSON-safe lane detail, dropping secret-shaped values."""
+
+    if depth > 4:
+        return None
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return None
+    if isinstance(value, str):
+        cleaned = "".join(character for character in value if character.isprintable())
+        if any(marker in cleaned.lower() for marker in _LANE_SECRET_TEXT):
+            return None
+        return cleaned[:256]
+    if isinstance(value, (list, tuple)):
+        return [
+            safe
+            for item in value[:32]
+            if (safe := _lane_safe_value(item, depth=depth + 1)) is not None
+        ]
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key, item in list(value.items())[:32]:
+            if not isinstance(key, str) or _LANE_SECRET_KEY.search(key):
+                continue
+            safe = _lane_safe_value(item, depth=depth + 1)
+            if safe is not None:
+                result[key[:64]] = safe
+        return result
+    return None
+
+
+def _lane_health_material(row: sqlite3.Row) -> tuple:
+    return tuple(
+        row[name]
+        for name in (
+            "lane_id",
+            "policy_version",
+            "policy_digest",
+            "state",
+            "status",
+            "failure_class",
+            "reason_code",
+            "observed_at",
+            "expires_at",
+            "executor_version",
+            "available_capacity",
+            "safe_detail_json",
+            "created_at",
+        )
+    )
+
+
+def record_lane_health(conn: sqlite3.Connection, health) -> str:
+    """Append one sanitized observation under the current registry policy."""
+
+    from hermes_cli import jobs_lanes
+
+    if not isinstance(health, jobs_lanes.LaneHealth):
+        raise TypeError("health must be a LaneHealth")
+    registry = jobs_lanes.load_lane_registry()
+    if health.lane_id not in {lane.id for lane in registry.lanes}:
+        raise ValueError(f"health references unknown lane: {health.lane_id}")
+    if (
+        isinstance(health.observed_at, bool)
+        or not isinstance(health.observed_at, int)
+        or isinstance(health.expires_at, bool)
+        or not isinstance(health.expires_at, int)
+        or health.expires_at <= health.observed_at
+    ):
+        raise ValueError("lane health expiry must be after its integer observation")
+    if health.status not in {"PASS", "BLOCKED"}:
+        raise ValueError("lane health status must be PASS or BLOCKED")
+    if health.state not in {
+        "UNPROVISIONED",
+        "AUTH_REQUIRED",
+        "BLOCKED",
+        "IDLE",
+        "ASSIGNED",
+        "BUILDING",
+        "VERIFYING",
+        "FAILED",
+    }:
+        raise ValueError("lane health state is invalid")
+    expected_capacity = int(health.status == "PASS" and health.state == "IDLE")
+    if health.available_capacity != expected_capacity:
+        raise ValueError("lane health capacity contradicts state/status")
+    reason_code = _lane_clean_scalar(health.reason_code, limit=64)
+    if reason_code is None or _LANE_REASON_CODE.fullmatch(reason_code) is None:
+        raise ValueError("lane health reason code is invalid")
+    failure_class = _lane_clean_scalar(health.failure_class, limit=64)
+    executor_version = _lane_clean_scalar(health.executor_version, limit=128)
+    safe_detail = _lane_safe_value(health.safe_detail)
+    if not isinstance(safe_detail, dict):
+        safe_detail = {}
+    safe_detail_json = _reliability_json(safe_detail)
+    if len(safe_detail_json.encode("utf-8")) > 16_384:
+        raise ValueError("lane health safe detail is too large")
+    policy_digest = jobs_lanes.registry_digest(registry)
+    material = (
+        health.lane_id,
+        registry.policy_version,
+        policy_digest,
+        health.state,
+        health.status,
+        failure_class,
+        reason_code,
+        health.observed_at,
+        health.expires_at,
+        executor_version,
+        health.available_capacity,
+        safe_detail_json,
+        health.observed_at,
+    )
+    identity = hashlib.sha256(
+        _reliability_json(list(material)).encode("utf-8")
+    ).hexdigest()
+    health_id = "lh_" + identity[:24]
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT * FROM job_lane_health WHERE id = ?", (health_id,)
+        ).fetchone()
+        if existing is not None:
+            if existing["id"] == health_id and _lane_health_material(existing) == material:
+                return health_id
+            raise GraphConflict("lane health observation id stores different facts")
+        conn.execute(
+            "INSERT INTO job_lane_health "
+            "(id, lane_id, policy_version, policy_digest, state, status, "
+            "failure_class, reason_code, observed_at, expires_at, executor_version, "
+            "available_capacity, safe_detail_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (health_id, *material),
+        )
+    return health_id
+
+
+def _lane_health_from_row(row: sqlite3.Row):
+    from hermes_cli import jobs_lanes
+
+    return jobs_lanes.LaneHealth(
+        lane_id=row["lane_id"],
+        state=row["state"],
+        status=row["status"],
+        failure_class=row["failure_class"],
+        reason_code=row["reason_code"],
+        observed_at=row["observed_at"],
+        expires_at=row["expires_at"],
+        executor_version=row["executor_version"],
+        available_capacity=row["available_capacity"],
+        safe_detail=json.loads(row["safe_detail_json"]),
+    )
+
+
+def active_lane_load(conn: sqlite3.Connection) -> dict[str, int]:
+    """Return database-backed active seat counts (zero rows are omitted)."""
+
+    rows = conn.execute(
+        "SELECT lane_id, COUNT(*) AS active FROM job_lane_placements "
+        "WHERE state IN ('ASSIGNED', 'BUILDING', 'VERIFYING') GROUP BY lane_id"
+    ).fetchall()
+    return {row["lane_id"]: int(row["active"]) for row in rows}
+
+
+def lane_routing_snapshot(
+    conn: sqlite3.Connection, *, registry, now: int
+) -> tuple[list[object], dict[str, int]]:
+    """Read current policy health plus durable placement occupancy.
+
+    A placement state never edits the append-only probe observation. Instead it
+    is overlaid here. A failed cleanup remains failed until a newer real health
+    observation proves recovery; an active placement always removes capacity.
+    """
+
+    from dataclasses import replace
+    from hermes_cli import jobs_lanes
+
+    if not isinstance(registry, jobs_lanes.LaneRegistry):
+        raise TypeError("registry must be a LaneRegistry")
+    if isinstance(now, bool) or not isinstance(now, int):
+        raise TypeError("now must be an integer Unix timestamp")
+    digest = jobs_lanes.registry_digest(registry)
+    active = active_lane_load(conn)
+    health: list[object] = []
+    for lane in registry.lanes:
+        row = conn.execute(
+            "SELECT * FROM job_lane_health WHERE lane_id = ? "
+            "AND policy_digest = ? ORDER BY observed_at DESC, rowid DESC LIMIT 1",
+            (lane.id, digest),
+        ).fetchone()
+        if row is None:
+            continue
+        item = _lane_health_from_row(row)
+        placement = conn.execute(
+            "SELECT state, state_reason_code, updated_at FROM job_lane_placements "
+            "WHERE lane_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (lane.id,),
+        ).fetchone()
+        if active.get(lane.id, 0):
+            state = placement["state"] if placement is not None else "ASSIGNED"
+            reason = (
+                placement["state_reason_code"]
+                if placement is not None
+                else "ACTIVE_LEASE"
+            )
+            item = replace(
+                item,
+                state=state,
+                status="PASS",
+                failure_class=None,
+                reason_code=reason,
+                available_capacity=0,
+            )
+        elif (
+            placement is not None
+            and placement["state"] == "FAILED"
+            and placement["updated_at"] >= item.observed_at
+        ):
+            item = replace(
+                item,
+                state="FAILED",
+                status="BLOCKED",
+                failure_class="INFRA_FAILURE",
+                reason_code=placement["state_reason_code"],
+                available_capacity=0,
+            )
+        health.append(item)
+    return health, active
+
+
+def _placed_refusal(lane_id: Optional[str], reason_code: str) -> PlacedClaim:
+    return PlacedClaim(
+        claimed=False,
+        reason_code=reason_code,
+        lane_id=lane_id,
+        placement_id=None,
+        job=None,
+    )
+
+
+def claim_selected_lane(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    decision,
+    preflight_id: str,
+    expected_revision: int,
+    lease_seconds: int,
+    now: int,
+) -> PlacedClaim:
+    """Atomically bind fresh PASS/IDLE health, Job custody, and one lane seat."""
+
+    from fnmatch import fnmatchcase
+    from hermes_cli import jobs_lanes
+
+    if not isinstance(decision, jobs_lanes.LaneDecision):
+        raise TypeError("decision must be a LaneDecision")
+    lane_id = decision.lane_id
+    if decision.status != "SELECTED" or lane_id is None:
+        return _placed_refusal(lane_id, "DECISION_NOT_SELECTED")
+    if isinstance(now, bool) or not isinstance(now, int):
+        raise TypeError("now must be an integer Unix timestamp")
+    _validate_lease(lease_seconds)
+    if not isinstance(expected_revision, int) or isinstance(expected_revision, bool):
+        raise TypeError("expected_revision must be an integer")
+    if not isinstance(preflight_id, str) or not preflight_id:
+        raise ValueError("preflight_id must not be empty")
+
+    registry = jobs_lanes.load_lane_registry()
+    policy_digest = jobs_lanes.registry_digest(registry)
+    lane = next((item for item in registry.lanes if item.id == lane_id), None)
+    if (
+        lane is None
+        or decision.policy_version != registry.policy_version
+        or decision.policy_digest != policy_digest
+        or decision.host_id != lane.host_id
+        or decision.executor != lane.executor
+        or not any(fnmatchcase(decision.model, pattern) for pattern in lane.model_patterns)
+    ):
+        return _placed_refusal(lane_id, "POLICY_RACE")
+
+    token = _new_claim_token()
+    placement_id = "lp_" + secrets.token_hex(12)
+    expires = now + lease_seconds
+    with write_txn(conn):
+        row = _require_job_revision_locked(conn, job_id, expected_revision)
+        if (
+            row["status"] != "working"
+            or row["step"] not in EXECUTABLE_STEPS
+            or row["claim_token"] is not None
+        ):
+            return _placed_refusal(lane_id, "NOTHING_ELIGIBLE")
+        preflight = conn.execute(
+            "SELECT * FROM job_preflights WHERE id = ?", (preflight_id,)
+        ).fetchone()
+        if (
+            preflight is None
+            or preflight["job_id"] != job_id
+            or preflight["attempt_id"] is not None
+            or preflight["status"] != "PASS"
+            or preflight["expected_job_revision"] != expected_revision
+        ):
+            return _placed_refusal(lane_id, "PREFLIGHT_RACE")
+        health = conn.execute(
+            "SELECT * FROM job_lane_health WHERE lane_id = ? "
+            "ORDER BY observed_at DESC, rowid DESC LIMIT 1",
+            (lane_id,),
+        ).fetchone()
+        if (
+            health is None
+            or health["policy_version"] != decision.policy_version
+            or health["policy_digest"] != decision.policy_digest
+            or health["status"] != "PASS"
+            or health["state"] != "IDLE"
+            or health["available_capacity"] != 1
+            or health["observed_at"] > now
+            or health["expires_at"] < now
+        ):
+            return _placed_refusal(lane_id, "HEALTH_RACE")
+        latest_placement = conn.execute(
+            "SELECT state, updated_at FROM job_lane_placements WHERE lane_id = ? "
+            "ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (lane_id,),
+        ).fetchone()
+        if (
+            latest_placement is not None
+            and latest_placement["state"] == "FAILED"
+            and latest_placement["updated_at"] >= health["observed_at"]
+        ):
+            return _placed_refusal(lane_id, "LANE_FAILED")
+        occupied = conn.execute(
+            "SELECT 1 FROM job_lane_placements WHERE lane_id = ? "
+            "AND state IN ('ASSIGNED', 'BUILDING', 'VERIFYING') LIMIT 1",
+            (lane_id,),
+        ).fetchone()
+        if occupied is not None:
+            return _placed_refusal(lane_id, "CAPACITY_RACE")
+        current_health, current_load = lane_routing_snapshot(
+            conn, registry=registry, now=now
+        )
+        current_decision = jobs_lanes.select_lane(
+            registry,
+            current_health,
+            jobs_lanes.RoutingRequest(
+                job_id=job_id,
+                executor=decision.executor,
+                model=decision.model,
+            ),
+            active_load=current_load,
+            now=now,
+        )
+        if current_decision != decision:
+            return _placed_refusal(lane_id, "ROUTE_RACE")
+
+        conn.execute(
+            "UPDATE jobs SET claimed_by = ?, claim_token = ?, "
+            "claim_acquired_at = ?, lease_expires_at = ?, last_heartbeat_at = ?, "
+            "updated_at = ?, revision = revision + 1 WHERE id = ?",
+            (lane_id, token, now, expires, now, now, job_id),
+        )
+        conn.execute(
+            "INSERT INTO job_lane_placements "
+            "(id, job_id, attempt_id, lane_id, preflight_id, health_id, "
+            "policy_version, policy_digest, executor, model, fallback_applied, "
+            "route_reason_code, state, state_reason_code, lane_root, "
+            "registered_worktree, registered_handoff, claim_acquired_at, "
+            "lease_expires_at, cleanup_at, created_at, updated_at) "
+            "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ASSIGNED', "
+            "'LANE_ASSIGNED', NULL, NULL, NULL, ?, ?, NULL, ?, ?)",
+            (
+                placement_id,
+                job_id,
+                lane_id,
+                preflight_id,
+                health["id"],
+                decision.policy_version,
+                decision.policy_digest,
+                decision.executor,
+                decision.model,
+                int(decision.fallback_applied),
+                decision.reason_code,
+                now,
+                expires,
+                now,
+                now,
+            ),
+        )
+        _append_event_locked(
+            conn,
+            job_id,
+            "claim_acquired",
+            data={"worker": lane_id, "lease_expires_at": expires},
+            now=now,
+        )
+        _append_event_locked(
+            conn,
+            job_id,
+            "lane_assigned",
+            data={
+                "placement_id": placement_id,
+                "lane_id": lane_id,
+                "preflight_id": preflight_id,
+                "health_id": health["id"],
+                "policy_digest": decision.policy_digest,
+                "fallback_applied": decision.fallback_applied,
+                "reason_code": decision.reason_code,
+            },
+            now=now,
+        )
+        claimed_job = get_job(conn, job_id)
+    return PlacedClaim(
+        claimed=True,
+        reason_code="CLAIMED",
+        lane_id=lane_id,
+        placement_id=placement_id,
+        job=claimed_job,
+        claim_token=token,
+        lease_expires_at=expires,
+    )
+
+
+def _lane_placement_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        key: row[key]
+        for key in (
+            "id",
+            "job_id",
+            "attempt_id",
+            "lane_id",
+            "preflight_id",
+            "health_id",
+            "policy_version",
+            "policy_digest",
+            "executor",
+            "model",
+            "fallback_applied",
+            "route_reason_code",
+            "state",
+            "state_reason_code",
+            "lane_root",
+            "registered_worktree",
+            "registered_handoff",
+            "claim_acquired_at",
+            "lease_expires_at",
+            "cleanup_at",
+            "cleanup_evidence_digest",
+            "created_at",
+            "updated_at",
+        )
+    }
+
+
+def get_lane_placement(
+    conn: sqlite3.Connection, placement_id: str
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM job_lane_placements WHERE id = ?", (placement_id,)
+    ).fetchone()
+    return None if row is None else _lane_placement_to_dict(row)
+
+
+def latest_lane_placement_for_attempt(
+    conn: sqlite3.Connection, attempt_id: str
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM job_lane_placements WHERE attempt_id = ? "
+        "ORDER BY updated_at DESC, id DESC LIMIT 1",
+        (attempt_id,),
+    ).fetchone()
+    return None if row is None else _lane_placement_to_dict(row)
+
+
+def _resolved_lane_child(root: Path, category: str, value: Path) -> str:
+    root_resolved = root.resolve(strict=True)
+    category_path = root_resolved / category
+    if category_path.is_symlink() or value.is_symlink():
+        raise ValueError("registered lane paths must not be symlinks")
+    category_root = category_path.resolve(strict=True)
+    candidate = value.resolve(strict=False)
+    if root.is_symlink():
+        raise ValueError("lane cleanup roots must not be symlinks")
+    try:
+        candidate.relative_to(category_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"registered lane path must be beneath {category}/"
+        ) from exc
+    if candidate == category_root or "auth" in candidate.parts[len(root_resolved.parts):]:
+        raise ValueError("registered lane path must be an attempt-scoped non-auth path")
+    return str(candidate)
+
+
+def bind_lane_attempt(
+    conn: sqlite3.Connection,
+    *,
+    placement_id: str,
+    attempt_id: str,
+    lane_root: Path,
+    worktree: Path,
+    handoff: Path,
+    now: int,
+) -> dict:
+    """Bind exact cleanup targets to a claimed placement exactly once."""
+
+    if isinstance(now, bool) or not isinstance(now, int):
+        raise TypeError("now must be an integer Unix timestamp")
+    root = Path(lane_root)
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("lane root must be an existing non-symlink directory")
+    worktree_value = _resolved_lane_child(root, "worktrees", Path(worktree))
+    handoff_value = _resolved_lane_child(root, "handoffs", Path(handoff))
+    root_value = str(root.resolve(strict=True))
+    with write_txn(conn):
+        placement = conn.execute(
+            "SELECT * FROM job_lane_placements WHERE id = ?", (placement_id,)
+        ).fetchone()
+        if placement is None:
+            raise ValueError(f"no such lane placement: {placement_id!r}")
+        attempt = conn.execute(
+            "SELECT job_id FROM job_attempts WHERE id = ?", (attempt_id,)
+        ).fetchone()
+        if attempt is None or attempt["job_id"] != placement["job_id"]:
+            raise ValueError("lane placement attempt belongs to a different job")
+        expected = (attempt_id, root_value, worktree_value, handoff_value)
+        stored = (
+            placement["attempt_id"],
+            placement["lane_root"],
+            placement["registered_worktree"],
+            placement["registered_handoff"],
+        )
+        if placement["attempt_id"] is not None:
+            if stored == expected:
+                return _lane_placement_to_dict(placement)
+            raise GraphConflict("lane placement already binds different attempt paths")
+        if placement["state"] != "ASSIGNED":
+            raise InvalidTransition("only an ASSIGNED placement can bind an attempt")
+        conn.execute(
+            "UPDATE job_lane_placements SET attempt_id = ?, lane_root = ?, "
+            "registered_worktree = ?, registered_handoff = ?, updated_at = ? "
+            "WHERE id = ?",
+            (*expected, now, placement_id),
+        )
+        _append_event_locked(
+            conn,
+            placement["job_id"],
+            "lane_attempt_bound",
+            data={
+                "placement_id": placement_id,
+                "attempt_id": attempt_id,
+                "lane_id": placement["lane_id"],
+                "worktree": worktree_value,
+                "handoff": handoff_value,
+            },
+            now=now,
+        )
+        updated = conn.execute(
+            "SELECT * FROM job_lane_placements WHERE id = ?", (placement_id,)
+        ).fetchone()
+    return _lane_placement_to_dict(updated)
+
+
+def transition_lane_placement(
+    conn: sqlite3.Connection,
+    *,
+    placement_id: str,
+    target_state: Literal["ASSIGNED", "BUILDING", "VERIFYING", "IDLE", "FAILED"],
+    reason_code: str,
+    now: int,
+    evidence_digest: Optional[str] = None,
+) -> dict:
+    """Advance cleanup-gated lane custody; terminal states cannot reopen."""
+
+    if _LANE_REASON_CODE.fullmatch(str(reason_code)) is None:
+        raise ValueError("lane placement reason code is invalid")
+    if isinstance(now, bool) or not isinstance(now, int):
+        raise TypeError("now must be an integer Unix timestamp")
+    if evidence_digest is not None and re.fullmatch(
+        r"sha256:[0-9a-f]{64}", evidence_digest
+    ) is None:
+        raise ValueError("lane cleanup evidence digest is invalid")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM job_lane_placements WHERE id = ?", (placement_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"no such lane placement: {placement_id!r}")
+        source = row["state"]
+        if source == target_state and row["state_reason_code"] == reason_code:
+            return _lane_placement_to_dict(row)
+        if target_state not in _LANE_STATE_TRANSITIONS[source]:
+            raise InvalidTransition(
+                f"illegal lane placement transition {source!r} -> {target_state!r}"
+            )
+        cleanup_at = now if target_state in {"IDLE", "FAILED"} else None
+        conn.execute(
+            "UPDATE job_lane_placements SET state = ?, state_reason_code = ?, "
+            "cleanup_at = ?, cleanup_evidence_digest = COALESCE(?, "
+            "cleanup_evidence_digest), updated_at = ? WHERE id = ?",
+            (
+                target_state,
+                reason_code,
+                cleanup_at,
+                evidence_digest,
+                now,
+                placement_id,
+            ),
+        )
+        _append_event_locked(
+            conn,
+            row["job_id"],
+            "lane_placement_transition",
+            data={
+                "placement_id": placement_id,
+                "lane_id": row["lane_id"],
+                "from": source,
+                "to": target_state,
+                "reason_code": reason_code,
+                "cleanup_evidence_digest": evidence_digest,
+            },
+            now=now,
+        )
+        updated = conn.execute(
+            "SELECT * FROM job_lane_placements WHERE id = ?", (placement_id,)
+        ).fetchone()
+    return _lane_placement_to_dict(updated)
+
+
+def _fail_active_lane_placement_locked(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    reason_code: str,
+    now: int,
+    evidence_digest: Optional[str] = None,
+) -> Optional[str]:
+    """Fail a Job's still-active lane placement inside the caller's txn."""
+
+    row = conn.execute(
+        "SELECT * FROM job_lane_placements WHERE job_id = ? "
+        "AND state IN ('ASSIGNED', 'BUILDING', 'VERIFYING') LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    conn.execute(
+        "UPDATE job_lane_placements SET state = 'FAILED', state_reason_code = ?, "
+        "cleanup_at = ?, cleanup_evidence_digest = COALESCE(?, "
+        "cleanup_evidence_digest), updated_at = ? WHERE id = ?",
+        (reason_code, now, evidence_digest, now, row["id"]),
+    )
+    _append_event_locked(
+        conn,
+        job_id,
+        "lane_placement_transition",
+        data={
+            "placement_id": row["id"],
+            "lane_id": row["lane_id"],
+            "from": row["state"],
+            "to": "FAILED",
+            "reason_code": reason_code,
+            "cleanup_evidence_digest": evidence_digest,
+        },
+        now=now,
+    )
+    return row["id"]
+
+
+# ---------------------------------------------------------------------------
 # Execution custody — claims and leases
 # ---------------------------------------------------------------------------
 
@@ -4175,6 +4997,11 @@ def claim_heartbeat(
             "updated_at = ?, revision = revision + 1 WHERE id = ?",
             (expires, now, now, job.id),
         )
+        conn.execute(
+            "UPDATE job_lane_placements SET lease_expires_at = ?, updated_at = ? "
+            "WHERE job_id = ? AND state IN ('ASSIGNED', 'BUILDING', 'VERIFYING')",
+            (expires, now, job.id),
+        )
         _append_event_locked(
             conn,
             job.id,
@@ -4225,6 +5052,12 @@ def release_claim(
                 now=now,
             )
             cancelled_id = running["id"]
+        failed_placement_id = _fail_active_lane_placement_locked(
+            conn,
+            job_id=job.id,
+            reason_code="CLAIM_RELEASED_UNCLEAN",
+            now=now,
+        )
         conn.execute(
             "UPDATE jobs SET status = 'working', updated_at = ?, "
             "revision = revision + 1, claimed_by = NULL, claim_token = NULL, "
@@ -4236,7 +5069,11 @@ def release_claim(
             conn,
             job.id,
             "claim_released",
-            data={"worker": job.claimed_by, "cancelled_attempt_id": cancelled_id},
+            data={
+                "worker": job.claimed_by,
+                "cancelled_attempt_id": cancelled_id,
+                "failed_lane_placement_id": failed_placement_id,
+            },
             now=now,
         )
     return get_job(conn, job.id)
@@ -4353,6 +5190,12 @@ def recover_expired_claims(
             new_step = (
                 row["step"] if row["step"] in _RECOVER_PRESERVE_STEPS else "routing"
             )
+            failed_placement_id = _fail_active_lane_placement_locked(
+                conn,
+                job_id=jid,
+                reason_code="LEASE_RECOVERED_UNCLEAN",
+                now=now,
+            )
             conn.execute(
                 "UPDATE jobs SET status = 'working', step = ?, updated_at = ?, "
                 "revision = revision + 1, claimed_by = NULL, claim_token = NULL, "
@@ -4367,6 +5210,7 @@ def recover_expired_claims(
                 data={
                     "previous_worker": row["claimed_by"],
                     "interrupted_attempt_id": interrupted_id,
+                    "failed_lane_placement_id": failed_placement_id,
                     "step": new_step,
                 },
                 now=now,

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shutil
+import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,7 @@ from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_graph as graph
 from hermes_cli import jobs_harness as harness
 from hermes_cli import jobs_loop
+from hermes_cli import jobs_lanes
 from hermes_cli import jobs_receipts
 from hermes_cli import jobs_run
 
@@ -210,6 +213,7 @@ class DispatchSpec:
     executor: str
     model: str
     worktree_parent: Optional[Path] = None
+    lane_root: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -253,6 +257,13 @@ class DispatchResult:
     journal_error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class LaneCleanupResult:
+    status: str
+    reason_code: str
+    evidence_digest: str
+
+
 Executor = Callable[[DispatchContext], adapter.ReliabilityExecution]
 Gate = Callable[
     [DispatchContext, adapter.ReliabilityExecution], jobs_run.GateEvidence
@@ -284,6 +295,7 @@ def _execution_spec_digest(spec: DispatchSpec) -> str:
                 if spec.worktree_parent is None
                 else str(spec.worktree_parent)
             ),
+            "lane_root": None if spec.lane_root is None else str(spec.lane_root),
         }
     )
 
@@ -302,6 +314,123 @@ def _preflight_reason(decision: harness.PreflightDecision) -> str:
     return "PREFLIGHT_BLOCKED"
 
 
+def _registered_lane_child(root: Path, category: str, raw: str) -> Path:
+    root_resolved = root.resolve(strict=True)
+    category_path = root_resolved / category
+    raw_path = Path(raw)
+    if category_path.is_symlink() or raw_path.is_symlink():
+        raise ValueError("lane cleanup category is a symlink")
+    category_root = category_path.resolve(strict=True)
+    candidate = raw_path.resolve(strict=False)
+    if candidate == category_root:
+        raise ValueError("lane cleanup target must be attempt-scoped")
+    candidate.relative_to(category_root)
+    return candidate
+
+
+def cleanup_lane_attempt(
+    *,
+    conn,
+    placement_id: str,
+    repository: Path,
+    now: int,
+) -> LaneCleanupResult:
+    """Remove only registered attempt paths, then release capacity on readback."""
+
+    placement = jdb.get_lane_placement(conn, placement_id)
+    if placement is None:
+        raise ValueError(f"no such lane placement: {placement_id!r}")
+    if placement["state"] != "VERIFYING":
+        raise jdb.InvalidTransition("lane cleanup requires VERIFYING placement")
+    if not all(
+        placement[name]
+        for name in (
+            "attempt_id",
+            "lane_root",
+            "registered_worktree",
+            "registered_handoff",
+        )
+    ):
+        raise ValueError("lane cleanup requires registered attempt paths")
+
+    root = Path(placement["lane_root"])
+    auth_path = root / "auth"
+    auth_existed = auth_path.is_dir() and not auth_path.is_symlink()
+    try:
+        if root.is_symlink():
+            raise ValueError("lane root is a symlink")
+        if not auth_existed:
+            raise ValueError("lane auth boundary is absent or unsafe")
+        worktree = _registered_lane_child(
+            root, "worktrees", placement["registered_worktree"]
+        )
+        handoff = _registered_lane_child(
+            root, "handoffs", placement["registered_handoff"]
+        )
+        if worktree.exists() or worktree.is_symlink():
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(Path(repository).resolve(strict=True)),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(worktree),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        if handoff.is_symlink():
+            handoff.unlink()
+        elif handoff.is_dir():
+            shutil.rmtree(handoff)
+        elif handoff.exists():
+            handoff.unlink()
+        if worktree.exists() or worktree.is_symlink() or handoff.exists():
+            raise OSError("registered cleanup target remains after removal")
+        if auth_existed and (not auth_path.is_dir() or auth_path.is_symlink()):
+            raise OSError("lane auth boundary changed during cleanup")
+        evidence = _digest(
+            {
+                "placement_id": placement_id,
+                "attempt_id": placement["attempt_id"],
+                "worktree_absent": True,
+                "handoff_absent": True,
+                "auth_boundary_unchanged": auth_existed,
+            }
+        )
+        jdb.transition_lane_placement(
+            conn,
+            placement_id=placement_id,
+            target_state="IDLE",
+            reason_code="CLEANUP_VERIFIED",
+            evidence_digest=evidence,
+            now=now,
+        )
+        return LaneCleanupResult("PASS", "CLEANUP_VERIFIED", evidence)
+    except Exception as exc:  # noqa: BLE001 - fail closed and persist no secrets
+        evidence = _digest(
+            {
+                "placement_id": placement_id,
+                "attempt_id": placement["attempt_id"],
+                "error_type": type(exc).__name__,
+            }
+        )
+        current = jdb.get_lane_placement(conn, placement_id)
+        if current is not None and current["state"] == "VERIFYING":
+            jdb.transition_lane_placement(
+                conn,
+                placement_id=placement_id,
+                target_state="FAILED",
+                reason_code="CLEANUP_FAILED",
+                evidence_digest=evidence,
+                now=now,
+            )
+        return LaneCleanupResult("BLOCKED", "CLEANUP_FAILED", evidence)
+
+
 def dispatch_once(
     *,
     conn,
@@ -318,6 +447,7 @@ def dispatch_once(
     now: int,
     lease_seconds: int = 1800,
     failure_journal_path: Optional[Path] = None,
+    lane_decision: Optional[jobs_lanes.LaneDecision] = None,
 ) -> DispatchResult:
     """Run one evidence-authorized dispatch without provider assumptions.
 
@@ -331,6 +461,25 @@ def dispatch_once(
         raise ValueError(f"no such job: {job_id!r}")
     if _SHA_RE.fullmatch(spec.base_commit) is None:
         raise ValueError("dispatch base_commit must be a full lowercase SHA")
+    if lane_decision is not None:
+        if not isinstance(lane_decision, jobs_lanes.LaneDecision):
+            raise TypeError("lane_decision must be a LaneDecision")
+        if (
+            lane_decision.status != "SELECTED"
+            or lane_decision.lane_id != spec.lane_id
+            or lane_decision.executor != spec.executor
+            or lane_decision.model != spec.model
+        ):
+            raise ValueError("lane decision contradicts the dispatch spec")
+        if spec.lane_root is None:
+            raise ValueError("lane-aware dispatch requires lane_root")
+        lane_root = Path(spec.lane_root)
+        if lane_root.is_symlink() or not lane_root.is_dir():
+            raise ValueError("lane_root must be an existing non-symlink directory")
+        if Path(spec.worktree_parent or "").resolve(strict=False) != (
+            lane_root / "worktrees"
+        ).resolve(strict=True):
+            raise ValueError("lane worktree_parent must be lane_root/worktrees")
 
     snapshot = harness.PreflightSnapshot(
         job_id=job.id,
@@ -359,24 +508,47 @@ def dispatch_once(
             failure_class=preflight.failure_class,
         )
 
-    claim = jdb.claim_job(
-        conn,
-        worker=worker_id,
-        specialist=job.specialist,
-        job=job.id,
-        lease_seconds=lease_seconds,
-        now=now,
-    )
-    if claim is None:
-        return DispatchResult(
-            claimed=False,
-            reason="NOTHING_ELIGIBLE",
-            job_id=job.id,
-            attempt_id=None,
-            state=None,
+    placement_id: Optional[str] = None
+    if lane_decision is None:
+        claim = jdb.claim_job(
+            conn,
+            worker=worker_id,
+            specialist=job.specialist,
+            job=job.id,
+            lease_seconds=lease_seconds,
+            now=now,
         )
-
-    claim_token = claim.claim_token
+        if claim is None:
+            return DispatchResult(
+                claimed=False,
+                reason="NOTHING_ELIGIBLE",
+                job_id=job.id,
+                attempt_id=None,
+                state=None,
+            )
+        claim_token = claim.claim_token
+    else:
+        placed = jdb.claim_selected_lane(
+            conn,
+            job_id=job.id,
+            decision=lane_decision,
+            preflight_id=preflight.preflight_id,
+            expected_revision=job.revision,
+            lease_seconds=lease_seconds,
+            now=now,
+        )
+        if not placed.claimed:
+            return DispatchResult(
+                claimed=False,
+                reason=placed.reason_code,
+                job_id=job.id,
+                attempt_id=None,
+                state=None,
+            )
+        claim_token = placed.claim_token
+        placement_id = placed.placement_id
+        if claim_token is None or placement_id is None:
+            raise jdb.GraphConflict("claimed lane placement lacks custody identity")
     ordinal = len(jdb.get_attempts(conn, job.id)) + 1
     worktree_parent = (
         Path(spec.worktree_parent)
@@ -400,7 +572,28 @@ def dispatch_once(
             worktree=str(planned_worktree),
             now=now,
         )
+        if placement_id is not None:
+            lane_root = Path(spec.lane_root)
+            jdb.bind_lane_attempt(
+                conn,
+                placement_id=placement_id,
+                attempt_id=attempt_id,
+                lane_root=lane_root,
+                worktree=planned_worktree,
+                handoff=lane_root / "handoffs" / attempt_id,
+                now=now,
+            )
     except Exception:
+        if placement_id is not None:
+            placement = jdb.get_lane_placement(conn, placement_id)
+            if placement is not None and placement["state"] == "ASSIGNED":
+                jdb.transition_lane_placement(
+                    conn,
+                    placement_id=placement_id,
+                    target_state="FAILED",
+                    reason_code="ATTEMPT_START_FAILED",
+                    now=now,
+                )
         jdb.release_claim(
             conn, job.id, claim_token=claim_token, now=now
         )
@@ -531,6 +724,21 @@ def dispatch_once(
             recovery = retry_action
             blocker_code = decision.reason_code
 
+        if placement_id is not None:
+            placement = jdb.get_lane_placement(conn, placement_id)
+            if placement is not None and placement["state"] in {
+                "ASSIGNED",
+                "BUILDING",
+                "VERIFYING",
+            }:
+                jdb.transition_lane_placement(
+                    conn,
+                    placement_id=placement_id,
+                    target_state="FAILED",
+                    reason_code=decision.reason_code,
+                    evidence_digest=evidence_digest,
+                    now=int(now) + sequence,
+                )
         advance(
             target,
             {"failure": evidence_digest},
@@ -594,10 +802,20 @@ def dispatch_once(
                     "lane_id": spec.lane_id,
                     "executor": spec.executor,
                     "model": spec.model,
+                    "placement_id": placement_id,
                 }
             ),
             "lane_health": _digest(
-                [check.evidence_digest for check in preflight.checks]
+                (
+                    {
+                        "health_id": jdb.get_lane_placement(
+                            conn, placement_id
+                        )["health_id"],
+                        "placement_id": placement_id,
+                    }
+                    if placement_id is not None
+                    else [check.evidence_digest for check in preflight.checks]
+                )
             ),
         },
         commit=spec.base_commit,
@@ -617,6 +835,14 @@ def dispatch_once(
         },
         commit=spec.base_commit,
     )
+    if placement_id is not None:
+        jdb.transition_lane_placement(
+            conn,
+            placement_id=placement_id,
+            target_state="BUILDING",
+            reason_code="EXECUTOR_STARTED",
+            now=int(now) + sequence + 1,
+        )
 
     try:
         execution = executor(context)
@@ -823,6 +1049,40 @@ def dispatch_once(
         commit=candidate,
     )
 
+    if placement_id is not None:
+        sequence += 1
+        jdb.transition_lane_placement(
+            conn,
+            placement_id=placement_id,
+            target_state="VERIFYING",
+            reason_code="EVIDENCE_VERIFIED",
+            now=int(now) + sequence,
+        )
+        sequence += 1
+        cleanup = cleanup_lane_attempt(
+            conn=conn,
+            placement_id=placement_id,
+            repository=spec.repository,
+            now=int(now) + sequence,
+        )
+        if cleanup.status != "PASS":
+            advance(
+                "FAILED",
+                {"failure": cleanup.evidence_digest},
+                commit=candidate,
+                failure_class="INFRA_FAILURE",
+            )
+            return DispatchResult(
+                claimed=True,
+                reason=cleanup.reason_code,
+                job_id=job.id,
+                attempt_id=attempt_id,
+                state="FAILED",
+                failure_class="INFRA_FAILURE",
+                retry_action="HUMAN_ACTION",
+                commit=candidate,
+            )
+
     activation = activation_gate(context, gate_evidence)
     if not isinstance(activation, ActivationDecision):
         return fail(
@@ -866,8 +1126,10 @@ __all__ = [
     "DispatchContext",
     "DispatchResult",
     "DispatchSpec",
+    "LaneCleanupResult",
     "LegacyExecutionHeader",
     "LegacyMetadataError",
     "dispatch_once",
+    "cleanup_lane_attempt",
     "parse_legacy_execution_header",
 ]

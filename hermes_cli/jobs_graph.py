@@ -328,6 +328,9 @@ def compute_work_control(conn, *, now: int) -> dict[str, object]:
             attempt_transitions = [
                 row for row in transitions if row["attempt_id"] == attempt["id"]
             ]
+            placement = jobs_db.latest_lane_placement_for_attempt(
+                conn, attempt["id"]
+            )
             projected_attempts.append(
                 {
                     "attempt_id": attempt["id"],
@@ -341,6 +344,26 @@ def compute_work_control(conn, *, now: int) -> dict[str, object]:
                     "transitions": [
                         _projection_transition(row) for row in attempt_transitions
                     ],
+                    "placement": (
+                        None
+                        if placement is None
+                        else {
+                            "placement_id": placement["id"],
+                            "lane_id": placement["lane_id"],
+                            "executor": placement["executor"],
+                            "model": placement["model"],
+                            "state": placement["state"],
+                            "reason_code": placement["state_reason_code"],
+                            "policy_version": placement["policy_version"],
+                            "policy_digest": placement["policy_digest"],
+                            "fallback_applied": bool(
+                                placement["fallback_applied"]
+                            ),
+                            "cleanup_evidence_digest": placement[
+                                "cleanup_evidence_digest"
+                            ],
+                        }
+                    ),
                 }
             )
         state = projected_attempts[-1]["state"] if projected_attempts else "QUEUED"

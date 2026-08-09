@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_dispatch as dispatch
 from hermes_cli import jobs_graph as graph
 from hermes_cli import jobs_harness as harness
+from hermes_cli import jobs_lanes
 from hermes_cli import jobs_receipts as receipts
 from hermes_cli import jobs_run
 
@@ -118,6 +120,9 @@ class ReliabilityRig:
         activation_callback=None,
     ):
         self.clock += 100
+        lane_kwargs = {}
+        if hasattr(self, "lane_decision"):
+            lane_kwargs["lane_decision"] = self.lane_decision
         return dispatch.dispatch_once(
             conn=self.conn,
             job_id=self.job_id,
@@ -141,6 +146,7 @@ class ReliabilityRig:
             now=self.clock,
             lease_seconds=60,
             failure_journal_path=self.home / "logs" / "failure.jsonl",
+            **lane_kwargs,
         )
 
 
@@ -310,6 +316,75 @@ def test_provider_free_happy_path_reaches_exact_completed_graph(reliability_rig)
         result.commit,
     )
     assert jdb.get_job(reliability_rig.conn, reliability_rig.job_id).claimed_by is None
+
+
+def test_lane_aware_happy_path_cleans_registered_worktree_before_idle(
+    reliability_rig,
+):
+    registry = jobs_lanes.load_lane_registry()
+    lane = next(item for item in registry.lanes if item.id == "claude-mac-1")
+    lane_root = reliability_rig.root / "lanes" / lane.id
+    for name in ("auth", "worktrees", "handoffs", "receipts", "health"):
+        (lane_root / name).mkdir(parents=True, exist_ok=True)
+    auth_sentinel = lane_root / "auth" / "operator-auth-state"
+    auth_sentinel.write_text("do not remove", encoding="utf-8")
+    jdb.record_lane_health(
+        reliability_rig.conn,
+        jobs_lanes.LaneHealth(
+            lane_id=lane.id,
+            state="IDLE",
+            status="PASS",
+            failure_class=None,
+            reason_code="OK",
+            observed_at=reliability_rig.clock,
+            expires_at=reliability_rig.clock + 1_000,
+            executor_version="test-1.0",
+            available_capacity=1,
+            safe_detail={},
+        ),
+    )
+    health, active_load = jdb.lane_routing_snapshot(
+        reliability_rig.conn,
+        registry=registry,
+        now=reliability_rig.clock,
+    )
+    reliability_rig.lane_decision = jobs_lanes.select_lane(
+        registry,
+        health,
+        jobs_lanes.RoutingRequest(
+            job_id=reliability_rig.job_id,
+            executor="claude",
+            model="claude-opus-5",
+        ),
+        active_load=active_load,
+        now=reliability_rig.clock,
+    )
+    reliability_rig.spec = replace(
+        reliability_rig.spec,
+        lane_id=lane.id,
+        executor="claude",
+        model="claude-opus-5",
+        worktree_parent=lane_root / "worktrees",
+        lane_root=lane_root,
+    )
+
+    result = reliability_rig.run(
+        _passing_executor(reliability_rig),
+        gate_callback=_authoritative_gate(reliability_rig),
+        activation_callback=_passing_activation,
+    )
+    placement = jdb.latest_lane_placement_for_attempt(
+        reliability_rig.conn, result.attempt_id
+    )
+
+    assert result.state == "COMPLETED"
+    assert (placement["state"], placement["state_reason_code"]) == (
+        "IDLE",
+        "CLEANUP_VERIFIED",
+    )
+    assert not Path(placement["registered_worktree"]).exists()
+    assert auth_sentinel.read_text(encoding="utf-8") == "do not remove"
+    assert jdb.active_lane_load(reliability_rig.conn) == {}
 
 
 def test_ssh_preflight_block_has_no_claim_or_attempt(reliability_rig):

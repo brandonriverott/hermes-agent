@@ -9,6 +9,7 @@ from dataclasses import replace
 
 import pytest
 
+from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_lanes
 
 
@@ -599,3 +600,238 @@ def test_duplicate_health_observation_fails_closed():
             active_load={},
             now=ROUTING_NOW,
         )
+
+
+def _record_passing_preflight(conn, job_id, *, revision, suffix):
+    preflight_id = f"p_lane_{suffix}"
+    receipt_id = f"r_lane_{suffix}"
+    jdb.record_preflight(
+        conn,
+        jdb.PreflightRecord(
+            id=preflight_id,
+            job_id=job_id,
+            attempt_id=None,
+            execution_spec_digest="sha256:" + "a" * 64,
+            expected_job_revision=revision,
+            status="PASS",
+            failure_class=None,
+            checks=(),
+            receipt_id=receipt_id,
+            idempotency_key=f"preflight:{preflight_id}",
+            created_at=ROUTING_NOW,
+        ),
+        {"receipt_id": receipt_id, "payload": {}},
+    )
+    return preflight_id
+
+
+def _record_idle_registry_health(conn, registry):
+    return {
+        item.lane_id: jdb.record_lane_health(conn, item)
+        for item in _routing_health(registry)
+    }
+
+
+def _route_from_store(conn, registry, job_id, *, executor, model):
+    health, active_load = jdb.lane_routing_snapshot(
+        conn, registry=registry, now=ROUTING_NOW
+    )
+    return jobs_lanes.select_lane(
+        registry,
+        health,
+        jobs_lanes.RoutingRequest(
+            job_id=job_id,
+            executor=executor,
+            model=model,
+        ),
+        active_load=active_load,
+        now=ROUTING_NOW,
+    )
+
+
+def test_atomic_lane_claim_rechecks_capacity_and_never_overbooks(tmp_path):
+    conn = jdb.connect(tmp_path / "jobs.db")
+    registry = jobs_lanes.load_lane_registry()
+    try:
+        _record_idle_registry_health(conn, registry)
+        first_job = jdb.create_job(conn, name="first", goal="first")
+        second_job = jdb.create_job(conn, name="second", goal="second")
+        first_revision = jdb.get_job(conn, first_job).revision
+        second_revision = jdb.get_job(conn, second_job).revision
+        first_preflight = _record_passing_preflight(
+            conn, first_job, revision=first_revision, suffix="first"
+        )
+        second_preflight = _record_passing_preflight(
+            conn, second_job, revision=second_revision, suffix="second"
+        )
+        stale_decision = _route_from_store(
+            conn,
+            registry,
+            first_job,
+            executor="claude",
+            model="claude-opus-5",
+        )
+
+        first = jdb.claim_selected_lane(
+            conn,
+            job_id=first_job,
+            decision=stale_decision,
+            preflight_id=first_preflight,
+            expected_revision=first_revision,
+            lease_seconds=60,
+            now=ROUTING_NOW,
+        )
+        raced = jdb.claim_selected_lane(
+            conn,
+            job_id=second_job,
+            decision=stale_decision,
+            preflight_id=second_preflight,
+            expected_revision=second_revision,
+            lease_seconds=60,
+            now=ROUTING_NOW,
+        )
+
+        assert first.claimed is True
+        assert first.worker_id == "claude-pc-1"
+        assert (raced.claimed, raced.reason_code) == (False, "CAPACITY_RACE")
+        assert jdb.active_lane_load(conn) == {"claude-pc-1": 1}
+        assert jdb.get_job(conn, second_job).claimed_by is None
+    finally:
+        conn.close()
+
+
+def test_three_claims_fill_pc_pool_then_fallback_preserves_executor_and_model(
+    tmp_path,
+):
+    conn = jdb.connect(tmp_path / "jobs.db")
+    registry = jobs_lanes.load_lane_registry()
+    try:
+        _record_idle_registry_health(conn, registry)
+        claimed = []
+        for index in range(3):
+            job_id = jdb.create_job(
+                conn, name=f"job {index}", goal=f"goal {index}"
+            )
+            revision = jdb.get_job(conn, job_id).revision
+            preflight_id = _record_passing_preflight(
+                conn, job_id, revision=revision, suffix=f"pool_{index}"
+            )
+            decision = _route_from_store(
+                conn,
+                registry,
+                job_id,
+                executor="claude",
+                model="claude-opus-5",
+            )
+            claimed.append(
+                jdb.claim_selected_lane(
+                    conn,
+                    job_id=job_id,
+                    decision=decision,
+                    preflight_id=preflight_id,
+                    expected_revision=revision,
+                    lease_seconds=60,
+                    now=ROUTING_NOW,
+                )
+            )
+
+        fourth_job = jdb.create_job(conn, name="fourth", goal="fourth")
+        fallback = _route_from_store(
+            conn,
+            registry,
+            fourth_job,
+            executor="claude",
+            model="claude-opus-5",
+        )
+
+        assert {item.worker_id for item in claimed} == {
+            "claude-pc-1",
+            "claude-pc-2",
+            "claude-pc-3",
+        }
+        assert (
+            fallback.status,
+            fallback.lane_id,
+            fallback.executor,
+            fallback.model,
+        ) == (
+            "SELECTED",
+            "claude-mac-1",
+            "claude",
+            "claude-opus-5",
+        )
+    finally:
+        conn.close()
+
+
+def test_lane_is_not_idle_until_verification_and_cleanup_finish(tmp_path):
+    conn = jdb.connect(tmp_path / "jobs.db")
+    registry = jobs_lanes.load_lane_registry()
+    try:
+        _record_idle_registry_health(conn, registry)
+        job_id = jdb.create_job(conn, name="cleanup", goal="cleanup")
+        revision = jdb.get_job(conn, job_id).revision
+        preflight_id = _record_passing_preflight(
+            conn, job_id, revision=revision, suffix="cleanup"
+        )
+        decision = _route_from_store(
+            conn,
+            registry,
+            job_id,
+            executor="codex",
+            model="gpt-5.6-sol",
+        )
+        claim = jdb.claim_selected_lane(
+            conn,
+            job_id=job_id,
+            decision=decision,
+            preflight_id=preflight_id,
+            expected_revision=revision,
+            lease_seconds=60,
+            now=ROUTING_NOW,
+        )
+
+        jdb.transition_lane_placement(
+            conn,
+            placement_id=claim.placement_id,
+            target_state="BUILDING",
+            reason_code="EXECUTOR_STARTED",
+            now=ROUTING_NOW + 1,
+        )
+        jdb.transition_lane_placement(
+            conn,
+            placement_id=claim.placement_id,
+            target_state="VERIFYING",
+            reason_code="EVIDENCE_VERIFYING",
+            now=ROUTING_NOW + 2,
+        )
+        verifying, active = jdb.lane_routing_snapshot(
+            conn, registry=registry, now=ROUTING_NOW + 2
+        )
+
+        assert next(
+            item for item in verifying if item.lane_id == claim.worker_id
+        ).state == "VERIFYING"
+        assert active[claim.worker_id] == 1
+
+        jdb.transition_lane_placement(
+            conn,
+            placement_id=claim.placement_id,
+            target_state="FAILED",
+            reason_code="CLEANUP_FAILED",
+            now=ROUTING_NOW + 3,
+        )
+        failed, active = jdb.lane_routing_snapshot(
+            conn, registry=registry, now=ROUTING_NOW + 3
+        )
+        failed_health = next(
+            item for item in failed if item.lane_id == claim.worker_id
+        )
+
+        assert (failed_health.state, failed_health.reason_code) == (
+            "FAILED",
+            "CLEANUP_FAILED",
+        )
+        assert active.get(claim.worker_id, 0) == 0
+    finally:
+        conn.close()
