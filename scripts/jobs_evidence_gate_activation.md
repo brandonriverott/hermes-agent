@@ -1,9 +1,11 @@
 # Activating the Jobs evidence gate
 
-**Status: not active.** This commit adds the gate, its tests, and the runner
-patch. Nothing in the live Jobs pipeline calls it yet. Until the two deploy
-steps below are performed and verified, `pc-jobs-worker.sh` still settles jobs
-with its own inline truth table and no identity-bound evidence.
+**Status: activation requires three synchronized targets.** This commit adds
+the gate, runner patch, bridge patch, and their tests. The evidence gate is not
+live until the gate and runner are installed together on every worker host and
+the Mac terminal bridge is installed from its mapped patch. A runner-only
+activation is insufficient: an unpatched bridge still trusts builder-writable
+`done.json` as a terminal success signal.
 
 ## What the gate is
 
@@ -52,7 +54,7 @@ Bash, so either can commit; evidence gathered at a commit that is not the
 candidate now fails the gate instead of certifying it. Any `_gate` the model
 emitted in its own output is overwritten at stamp time.
 
-## Deploy steps (both, or neither)
+## Deploy steps (all targets, or roll back all changed targets)
 
 `pc-jobs-worker.sh` is a release gate: the Mac and the PC must run
 byte-identical bytes. They drifted 84 lines apart once, and the drift was
@@ -80,15 +82,30 @@ rule — a stamped receipt from one machine must mean the same thing on the othe
    shasum -a 256 pc-jobs-worker.sh jobs_evidence_gate.py   # must match on both
    ```
 
-3. **Verify with a canary job** before trusting it on real work: one job whose
+3. **Patch the Mac terminal bridge:**
+
+   `scripts/jobs_evidence_gate.bridge.patch` is mapped to the installed
+   `/Users/brandon/.hermes/scripts/jobs-pc-bridge.sh`. Apply it to a scratch
+   copy first, run `bash -n`, then atomically replace the installed bridge. The
+   bridge invokes the gate at the absolute installed Mac path because the Jobs
+   adapter deliberately runs it under a private `HOME`.
+
+4. **Verify with bridge canaries** before trusting it on real work: one job whose
    tester returns a green receipt should settle `succeeded`; one whose evidence
    is removed before settlement should settle `needs_attention` with
-   `EVIDENCE_MISSING`.
+   `EVIDENCE_MISSING`. Also exercise a mismatched identity and a failed required
+   check paired with reviewer `PASS`; both must produce failed action results
+   with their blocking reason.
 
-The patch is verified by `tests/scripts/test_jobs_evidence_gate_runner.py`,
-which copies the installed runner into a scratch directory, applies this patch,
-and drives a real build with a stubbed `claude`. Those tests skip when the
-runner is not installed — that skip is the activation boundary.
+The runner patch is verified by
+`tests/scripts/test_jobs_evidence_gate_runner.py`, which copies the installed
+runner into a scratch directory, applies this patch, and drives a real build
+with a stubbed `claude`. The bridge patch is verified by
+`tests/scripts/test_jobs_evidence_gate_bridge.py`, which copies the installed
+bridge, applies or recognizes the mapped patch, and drives its real local
+fallback/action-result seam with synthetic evidence. These tests skip when the
+corresponding live source is unavailable; such a skip is an unproven activation
+boundary, not a green result.
 
 ## What the patch changes
 
@@ -101,13 +118,19 @@ runner is not installed — that skip is the activation boundary.
 | `supervise` | the "did it settle?" guard reads `gate.json`, not `done.json` |
 | `inner`, soul-seal failure | settles through the gate with `--souls-ok 0` |
 | `inner`, tail | the inline truth table and `printf … done.json` become one gate call |
+| Mac bridge, local fallback | validates `gate.json`, `done.json`, and the bound receipts before action output |
+| Mac bridge, remote poll | waits for the supervisor boundary and `gate.json`; `done.json` alone is ungated |
+| Mac bridge, remote readback | copies the complete settlement evidence and validates it locally before fetch/merge |
 
 ## Compatibility
 
 `done.json` keeps exactly the key set it has today — `outcome`, `claude_exit`,
 `commit`, `branch`, `review_verdict`, `review_rounds`, `findings`, `effort` —
-so the Mac bridge needs no change. Existing verdict strings are reused where
-they already fit (`PASS`, `NEEDS_CHANGES`, `REVIEW_ERROR`, `NOT_REVIEWED`,
+for display and compatibility. It is not settlement authority. The patched Mac
+bridge requires identity-bound `gate.json` and independently re-evaluates every
+claimed success from the stamped receipts before it can emit `succeeded`.
+Existing verdict strings are reused where they already fit (`PASS`,
+`NEEDS_CHANGES`, `REVIEW_ERROR`, `NOT_REVIEWED`,
 `PASS_WITH_FAILING_TESTS`, `PASS_WITHOUT_TEST_EVIDENCE`,
 `TESTER_PROCESS_FAILED`, `REVIEWER_PROCESS_FAILED`,
 `CORRECTION_PROCESS_FAILED`, `REVIEWER_PROMPTS_MISSING`, `KAT_ENDPOINT_DOWN`).
@@ -138,5 +161,8 @@ Historical job records are not touched, read, or rewritten by any of this.
   layer, exactly as it can defeat the soul seal today.
 - **The deployed gate is not hash-pinned** the way the souls are. The runner
   itself has never been either.
+- **Bridge verification is read-only.** It does not mint or repair evidence;
+  missing or malformed gate output becomes a failed action result with a
+  blocking reason. Historical job directories are left untouched.
 - **Nothing here verifies merge, deploy, or live behaviour.** The packet says
   so on its own line, every time.

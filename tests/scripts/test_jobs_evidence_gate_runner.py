@@ -54,14 +54,41 @@ def _git(*args, cwd):
     )
 
 
+def _ensure_runner_is_patched(runner: Path, cwd: Path) -> None:
+    """Apply the canonical patch, or accept an installed already-patched source."""
+    forward = subprocess.run(
+        ["git", "apply", "--check", "-p1", str(PATCH)],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if forward.returncode == 0:
+        subprocess.run(
+            ["git", "apply", "-p1", str(PATCH)],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return
+    reverse = subprocess.run(
+        ["git", "apply", "--reverse", "--check", "-p1", str(PATCH)],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    assert reverse.returncode == 0, (
+        f"{PATCH.name} maps to neither the pre-patch nor patched runner {RUNNER}.\n"
+        f"forward={forward.stderr}\nreverse={reverse.stderr}"
+    )
+
+
 @pytest.fixture
 def rig(tmp_path):
     """A patched runner, an empty repo, a job dir and a scriptable claude stub."""
     runner = tmp_path / "pc-jobs-worker.sh"
     shutil.copy2(RUNNER, runner)
-    subprocess.run(
-        ["git", "apply", "-p1", str(PATCH)], cwd=tmp_path, check=True, capture_output=True, text=True
-    )
+    _ensure_runner_is_patched(runner, tmp_path)
     runner.chmod(0o755)
 
     repo = tmp_path / "repo"
@@ -221,14 +248,7 @@ def test_a_builder_planted_done_json_does_not_survive_settlement(rig):
 
 
 def test_the_patch_still_applies_to_the_installed_runner(tmp_path):
-    """Drift detector: the runner changed under the activation patch."""
-    shutil.copy2(RUNNER, tmp_path / "pc-jobs-worker.sh")
-    proc = subprocess.run(
-        ["git", "apply", "--check", "-p1", str(PATCH)],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, (
-        f"{PATCH.name} no longer applies to {RUNNER}; re-cut it before activating.\n{proc.stderr}"
-    )
+    """Drift detector: installed source is exactly pre-patch or patched."""
+    runner = tmp_path / "pc-jobs-worker.sh"
+    shutil.copy2(RUNNER, runner)
+    _ensure_runner_is_patched(runner, tmp_path)

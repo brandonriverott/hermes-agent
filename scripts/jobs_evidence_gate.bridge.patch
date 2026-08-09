@@ -1,0 +1,146 @@
+--- a/jobs-pc-bridge.sh
++++ b/jobs-pc-bridge.sh
+@@ -32,6 +32,10 @@
+ SSH_OPTS=(-o ConnectTimeout=15 -o BatchMode=yes)
+ LOCAL_JOBS_ROOT="$HOME/.hermes/jobs-local"
+ WORKER_LOCAL="$HOME/.hermes/scripts/pc-jobs-worker.sh"
++# The bridge runs under the adapter's private HOME, so its gate path must be
++# absolute. Tests may point at the candidate source; live activation installs
++# the same bytes here before this bridge is replaced.
++GATE_LOCAL="${JOBS_BRIDGE_GATE:-/Users/brandon/.local/bin/jobs_evidence_gate.py}"
+ # Absolute, not $HOME-relative: the Jobs adapter runs this bridge under a
+ # sandboxed fake HOME (root cause, job #29 2026-08-06 — souls never staged, so
+ # VULCAN improvised its output schema and its evidence was discarded).
+@@ -125,23 +129,33 @@
+ esac
+ EXEC_HOST="$PC_HOST"
+ 
+-emit_result() { # <outcome> <verdict> <rounds> <tests_json_path_or_empty>
+-  local outcome="$1" verdict="$2" rounds="$3" tests_path="$4"
+-  [ "$outcome" = "needs_attention" ] && outcome="failed"  # never masquerades as clean
++emit_result() { # <action-outcome> <verdict> <rounds> <tests-json-or-empty> <reason>
++  local outcome="$1" verdict="$2" rounds="$3" tests_path="$4" reason="${5:-}"
+-  local changes summary tests_run="[]"
++  local changes summary summary_json verdict_json tests_run="[]"
+   changes="$(git -C "$WORKTREE" diff --name-only "$BASE_COMMIT"..HEAD 2>/dev/null | /usr/bin/python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')"
+   [ -n "$tests_path" ] && [ -f "$tests_path" ] && tests_run="$(/usr/bin/python3 -c "import json,sys
+ try: d=json.load(open(sys.argv[1]))
+ except Exception: d={}
+ print(json.dumps([t.get('cmd','?')+' -> '+t.get('result','?') for t in d.get('tests',[])]))" "$tests_path" 2>/dev/null)"
+   summary="built on $EXEC_HOST (job $KEY) — review: $verdict after $rounds round(s)"
+-  printf '{"outcome": "%s", "summary": "%s", "changes": %s, "tests_run": %s, "review_verdict": "%s", "review_rounds": %s}\n' \
+-    "$outcome" "$summary" "${changes:-[]}" "${tests_run:-[]}" \
++  [ "$outcome" = "failed" ] && summary="$summary — blocked: ${reason:-no gate reason recorded}"
++  summary_json="$(/usr/bin/python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$summary")"
++  verdict_json="$(/usr/bin/python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$verdict")"
++  printf '{"outcome": "%s", "summary": %s, "changes": %s, "tests_run": %s, "review_verdict": %s, "review_rounds": %s}\n' \
++    "$outcome" "$summary_json" "${changes:-[]}" "${tests_run:-[]}" \
+-    "$verdict" "$rounds" > "$RESULT_FILE"
++    "$verdict_json" "$rounds" > "$RESULT_FILE"
+   write_graph_record "$outcome" "$summary" "$verdict" "$rounds"
+   exit 0
+ }
+ 
++# Read-only. The gate checks gate/done identity and re-evaluates every claimed
++# success from the stamped tests/review receipts. done.json remains a display
++# compatibility file; no field read directly from it can authorize success.
++verify_gate_dir() { # <job-dir>
++  /usr/bin/python3 "$GATE_LOCAL" bridge-verify \
++    --job-dir "$1" --job "$KEY" --base "$BASE_COMMIT"
++}
++
+ parse_done() { # <done_json> <field> <default>
+   echo "$1" | /usr/bin/python3 -c "import json,sys
+ try: print(json.load(sys.stdin).get('$2','$3'))
+@@ -192,18 +206,19 @@
+     RAN_SYNC|ALREADY_DONE) : ;;
+     *) fail_json "pc-bridge(local): worker failed: $SPAWN" ;;
+   esac
+-  DONE_JSON="$(cat "$job_dir/done.json" 2>/dev/null)"
+-  [ -n "$DONE_JSON" ] || fail_json "pc-bridge(local): no done.json after synchronous run"
+-  OUTCOME="$(parse_done "$DONE_JSON" outcome failed)"
+-  COMMIT="$(parse_done "$DONE_JSON" commit "")"
+-  VERDICT="$(parse_done "$DONE_JSON" review_verdict NOT_REVIEWED)"
+-  ROUNDS="$(parse_done "$DONE_JSON" review_rounds 0)"
++  SETTLEMENT="$(verify_gate_dir "$job_dir" 2>&1)" \
++    || fail_json "pc-bridge(local): evidence gate blocked: $SETTLEMENT"
++  OUTCOME="$(parse_done "$SETTLEMENT" action_outcome failed)"
++  COMMIT="$(parse_done "$SETTLEMENT" commit "")"
++  VERDICT="$(parse_done "$SETTLEMENT" review_verdict EVIDENCE_MALFORMED)"
++  ROUNDS="$(parse_done "$SETTLEMENT" review_rounds 0)"
++  REASON="$(parse_done "$SETTLEMENT" reason "gate did not record a reason")"
+   if [ -n "$COMMIT" ]; then
+     git -C "$WORKTREE" merge --ff-only --quiet "jobs/$KEY" \
+       || fail_json "pc-bridge(local): built but fast-forward of jobs/$KEY failed"
+   fi
+   git -C "$REPO_LOCAL" worktree remove --force "$job_dir/wt" 2>/dev/null || true
+-  emit_result "$OUTCOME" "$VERDICT" "$ROUNDS" "$job_dir/tests.json"
++  emit_result "$OUTCOME" "$VERDICT" "$ROUNDS" "$job_dir/tests.json" "$REASON"
+ fi
+ 
+ # ── REMOTE PATH (normal): map this repo to its PC clone, fail closed ────────
+@@ -273,25 +288,43 @@
+ 
+ elapsed=0
+ while :; do
+-  STATUS="$(ssh "${SSH_OPTS[@]}" "$PC_HOST" "~/.local/bin/pc-jobs-worker.sh status '$KEY'" 2>/dev/null | tail -1)"
+-  [ "$STATUS" = "DONE" ] && break
+-  # Neither running nor finished: the remote supervisor died without writing a
+-  # result. Polling on for another hour cannot change that, and the old loop
+-  # did exactly that until its deadline.
+-  if [ "$STATUS" = "ABSENT" ] && [ "$elapsed" -gt "$POLL_SECONDS" ]; then
+-    fail_json "pc-bridge: remote supervisor for $KEY disappeared on $PC_HOST without writing a result"
+-  fi
++  # Check the tmux supervisor before any artifact. The worker status command
++  # says DONE when done.json exists, and the builder can write that file while
++  # its real pipeline is still running. A terminal bridge state therefore
++  # means: supervisor exited, then gate.json exists. done.json alone is UNGATED.
++  STATUS="$(ssh "${SSH_OPTS[@]}" "$PC_HOST" "
++    if tmux has-session -t 'jobs-$KEY' 2>/dev/null; then echo RUNNING
++    elif [ -f ~/jobs/$KEY/gate.json ]; then echo GATED
++    elif [ -f ~/jobs/$KEY/done.json ]; then echo UNGATED
++    else echo ABSENT; fi" 2>/dev/null | tail -1)"
++  [ "$STATUS" = "GATED" ] && break
++  if [ "$STATUS" != "RUNNING" ] && [ "$elapsed" -gt "$POLL_SECONDS" ]; then
++    fail_json "pc-bridge: EVIDENCE_MISSING: remote supervisor for $KEY exited on $PC_HOST without gate.json; done.json cannot settle a Job"
++  fi
+   if [ "$elapsed" -ge "$DEADLINE_SECONDS" ]; then
+     fail_json "pc-bridge: deadline ${DEADLINE_SECONDS}s hit after the PC's own ${PC_INNER_SECONDS}s deadline should have settled the build; the remote pipeline never reported"
+   fi
+   sleep "$POLL_SECONDS"; elapsed=$((elapsed + POLL_SECONDS))
+ done
+ 
+-DONE_JSON="$(ssh "${SSH_OPTS[@]}" "$PC_HOST" "cat ~/jobs/$KEY/done.json" 2>/dev/null)"
+-OUTCOME="$(parse_done "$DONE_JSON" outcome failed)"
+-COMMIT="$(parse_done "$DONE_JSON" commit "")"
+-VERDICT="$(parse_done "$DONE_JSON" review_verdict NOT_REVIEWED)"
+-ROUNDS="$(parse_done "$DONE_JSON" review_rounds 0)"
++SETTLEMENT_LOCAL="$(mktemp -d "${TMPDIR:-/tmp}/jobs-settlement.XXXXXX")" \
++  || fail_json "pc-bridge: cannot create a private settlement readback directory"
++cleanup_settlement() {
++  case "${SETTLEMENT_LOCAL:-}" in
++    */jobs-settlement.*) rm -rf -- "$SETTLEMENT_LOCAL" ;;
++  esac
++}
++trap cleanup_settlement EXIT
++for name in gate.json done.json tests.json review-0.json review-1.json; do
++  scp -q "${SSH_OPTS[@]}" "$PC_HOST:jobs/$KEY/$name" "$SETTLEMENT_LOCAL/$name" 2>/dev/null || true
++done
++SETTLEMENT="$(verify_gate_dir "$SETTLEMENT_LOCAL" 2>&1)" \
++  || fail_json "pc-bridge: evidence gate blocked: $SETTLEMENT"
++OUTCOME="$(parse_done "$SETTLEMENT" action_outcome failed)"
++COMMIT="$(parse_done "$SETTLEMENT" commit "")"
++VERDICT="$(parse_done "$SETTLEMENT" review_verdict EVIDENCE_MALFORMED)"
++ROUNDS="$(parse_done "$SETTLEMENT" review_rounds 0)"
++REASON="$(parse_done "$SETTLEMENT" reason "gate did not record a reason")"
+ 
+ if [ -n "$COMMIT" ]; then
+   git -C "$WORKTREE" fetch --quiet "$PC_HOST:$PC_REPO" "jobs/$KEY" \
+@@ -306,6 +339,4 @@
+     || fail_json "pc-bridge: custody mismatch — worker reported $COMMIT but worktree is at ${GOT:-unknown} after merge"
+ fi
+ 
+-TESTS_LOCAL="$(mktemp "${TMPDIR:-/tmp}/jobs-tests.XXXXXX")"
+-scp -q "${SSH_OPTS[@]}" "$PC_HOST:jobs/$KEY/tests.json" "$TESTS_LOCAL" 2>/dev/null || true
+-emit_result "$OUTCOME" "$VERDICT" "$ROUNDS" "$TESTS_LOCAL"
++emit_result "$OUTCOME" "$VERDICT" "$ROUNDS" "$SETTLEMENT_LOCAL/tests.json" "$REASON"

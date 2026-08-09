@@ -33,10 +33,13 @@ At settlement the gate requires that envelope to name *this* job, *this*
 attempt and *this* candidate commit. Any model-authored ``_gate`` in the raw
 output is overwritten at stamp time, so a forged envelope cannot survive.
 
-This file performs no network, subprocess, or VCS action. It reads a job
-directory and writes three files into it: ``done.json`` (unchanged key set, for
-the Mac bridge), ``gate.json`` (the full decision), and ``action-packet.md``
-(what a human reads). It never merges, pushes, deploys, or sends.
+This file performs no network, subprocess, or VCS action. Settlement reads a
+job directory and writes three files into it: ``done.json`` (unchanged key set,
+for compatibility), ``gate.json`` (the full decision), and
+``action-packet.md`` (what a human reads). ``bridge-verify`` is read-only: it
+validates those files and independently re-evaluates every claimed success from
+the stamped tester/reviewer receipts before the Mac bridge emits an action. It
+never merges, pushes, deploys, or sends.
 
 Activation is a separate, explicit step — see
 ``scripts/jobs_evidence_gate_activation.md``. Nothing here is wired into the
@@ -181,6 +184,16 @@ def load_receipt(path, *, kind: str, job: str, attempt: int, commit: str) -> dic
 def _short(sha) -> str:
     text = str(sha or "")
     return text[:12] if text else "(none)"
+
+
+def _require_nonempty_string(doc: dict, field: str, filename: str) -> str:
+    value = doc.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise EvidenceError(
+            f"{filename} is missing a non-empty {field}.",
+            "EVIDENCE_MALFORMED",
+        )
+    return value
 
 
 # ── the test receipt's own truth table ─────────────────────────────────
@@ -481,6 +494,166 @@ def settle(job_dir, *, effort: str = "medium", **kwargs) -> GateResult:
     return result
 
 
+def verify_bridge_settlement(job_dir, *, job: str, base: str) -> dict:
+    """Return normalized action data only when gate output is authoritative.
+
+    ``done.json`` remains the compatibility document, but it cannot authorize a
+    successful action.  Identity and outcome come from ``gate.json``; every
+    claimed success is then recomputed from the exact stamped receipts.  This
+    closes the bridge bypass where a builder wrote a green-looking ``done.json``
+    before the runner reached its gate.
+
+    A valid *blocked* gate is returned as ``action_outcome=failed`` with its
+    first plain-English reason. Invalid or absent gate evidence raises
+    :class:`EvidenceError`, which the bridge renders as an infrastructure
+    failure instead of an action packet that could be mistaken for success.
+    """
+    job_dir = Path(job_dir)
+    gate_doc = _read_json(job_dir / "gate.json")
+    done = _read_json(job_dir / "done.json")
+
+    gate_job = _require_nonempty_string(gate_doc, "job", "gate.json")
+    if gate_job != job:
+        raise EvidenceError(
+            f"gate.json is evidence for job {gate_job!r}, but the bridge is handling job {job!r}.",
+            "EVIDENCE_WRONG_JOB",
+        )
+
+    gate_base = _require_nonempty_string(gate_doc, "base", "gate.json")
+    if gate_base != base:
+        raise EvidenceError(
+            f"gate.json was settled from base {_short(gate_base)}, but the bridge started from {_short(base)}.",
+            "EVIDENCE_STALE_COMMIT",
+        )
+
+    gate_commit = gate_doc.get("commit")
+    if not isinstance(gate_commit, str):
+        raise EvidenceError("gate.json commit is not a string.", "EVIDENCE_MALFORMED")
+    done_commit = done.get("commit")
+    if not isinstance(done_commit, str):
+        raise EvidenceError("done.json commit is not a string.", "EVIDENCE_MALFORMED")
+    if gate_commit != done_commit:
+        raise EvidenceError(
+            f"gate.json names commit {_short(gate_commit)}, but done.json names {_short(done_commit)}.",
+            "EVIDENCE_STALE_COMMIT",
+        )
+
+    attempt = gate_doc.get("attempt")
+    rounds = done.get("review_rounds")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        raise EvidenceError("gate.json attempt is not a non-negative integer.", "EVIDENCE_MALFORMED")
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 0:
+        raise EvidenceError("done.json review_rounds is not a non-negative integer.", "EVIDENCE_MALFORMED")
+    expected_attempt = max(0, rounds - 1)
+    if attempt != expected_attempt:
+        raise EvidenceError(
+            f"gate.json settles review attempt {attempt}, but done.json records {rounds} review round(s).",
+            "EVIDENCE_STALE_ATTEMPT",
+        )
+
+    gate_outcome = gate_doc.get("outcome")
+    done_outcome = done.get("outcome")
+    if gate_outcome not in ("succeeded", "needs_attention", "failed"):
+        raise EvidenceError(
+            f"gate.json outcome {gate_outcome!r} is not a settlement outcome.",
+            "EVIDENCE_MALFORMED",
+        )
+    if done_outcome != gate_outcome:
+        raise EvidenceError(
+            f"gate.json settles {gate_outcome!r}, but done.json reports {done_outcome!r}.",
+            "EVIDENCE_MALFORMED",
+        )
+
+    verdict = _require_nonempty_string(gate_doc, "verdict", "gate.json")
+    if done.get("review_verdict") != verdict:
+        raise EvidenceError(
+            f"gate.json verdict {verdict!r} does not match done.json verdict {done.get('review_verdict')!r}.",
+            "EVIDENCE_MALFORMED",
+        )
+    branch = _require_nonempty_string(done, "branch", "done.json")
+    if branch != f"jobs/{job}":
+        raise EvidenceError(
+            f"done.json names branch {branch!r}, but this settlement owns branch {'jobs/' + job!r}.",
+            "EVIDENCE_WRONG_JOB",
+        )
+    build_exit = done.get("claude_exit")
+    if isinstance(build_exit, bool) or not isinstance(build_exit, int):
+        raise EvidenceError("done.json claude_exit is not an integer.", "EVIDENCE_MALFORMED")
+
+    reasons = gate_doc.get("reasons")
+    if not isinstance(reasons, list) or not all(
+        isinstance(reason, str) and reason.strip() for reason in reasons
+    ):
+        raise EvidenceError(
+            "gate.json reasons must be a list of non-empty strings.",
+            "EVIDENCE_MALFORMED",
+        )
+    sections = gate_doc.get("sections")
+    required_sections = {key for key, _label in _SECTION_LABELS}
+    if (
+        not isinstance(sections, dict)
+        or set(sections) != required_sections
+        or not all(isinstance(value, str) and value.strip() for value in sections.values())
+    ):
+        raise EvidenceError(
+            "gate.json does not contain the complete stage-by-stage settlement record.",
+            "EVIDENCE_MALFORMED",
+        )
+    _require_nonempty_string(gate_doc, "settled_at", "gate.json")
+
+    # A claimed success has one more burden than a blocked result: prove it
+    # again from the current receipts. This is deliberately evaluate(), not
+    # settle(), so bridge verification cannot rewrite job artifacts.
+    if gate_outcome == "succeeded":
+        if not _HEX40.match(gate_commit) or gate_commit == base:
+            raise EvidenceError(
+                "gate.json claims success without a candidate commit past the approved base.",
+                "NO_CANDIDATE_COMMIT",
+            )
+        rechecked = evaluate(
+            job_dir,
+            job=job,
+            branch=branch,
+            base=base,
+            commit=gate_commit,
+            attempt=attempt,
+            rounds=rounds,
+            build_exit=build_exit,
+            correction_exit=0,
+            test_exit=0,
+            review_exit=0,
+            souls_ok=True,
+            review_required=True,
+        )
+        if not rechecked.succeeded:
+            reason = rechecked.reasons[0] if rechecked.reasons else "The success could not be reproduced from its receipts."
+            raise EvidenceError(reason, rechecked.verdict)
+        if verdict != rechecked.verdict:
+            raise EvidenceError(
+                f"gate.json verdict {verdict!r} does not match the receipt-derived verdict {rechecked.verdict!r}.",
+                "EVIDENCE_MALFORMED",
+            )
+        reason = "all required checks passed and review returned PASS"
+    else:
+        if not reasons:
+            raise EvidenceError(
+                "gate.json blocks settlement but records no plain-English reason.",
+                "EVIDENCE_MALFORMED",
+            )
+        reason = reasons[0]
+
+    return {
+        "action_outcome": "succeeded" if gate_outcome == "succeeded" else "failed",
+        "gate_outcome": gate_outcome,
+        "commit": gate_commit,
+        "branch": branch,
+        "review_verdict": verdict,
+        "review_rounds": rounds,
+        "reason": reason,
+        "stage_record": sections,
+    }
+
+
 # ── CLI (the seam the runner calls) ───────────────────────────────────
 
 
@@ -512,6 +685,14 @@ def main(argv=None) -> int:
     gate.add_argument("--souls-ok", type=int, default=1)
     gate.add_argument("--no-review-required", action="store_true")
 
+    bridge = sub.add_parser(
+        "bridge-verify",
+        help="verify gate output and emit normalized bridge action data",
+    )
+    bridge.add_argument("--job-dir", required=True)
+    bridge.add_argument("--job", required=True)
+    bridge.add_argument("--base", required=True)
+
     args = parser.parse_args(argv)
 
     if args.mode == "stamp":
@@ -527,6 +708,19 @@ def main(argv=None) -> int:
         except EvidenceError as exc:
             print(f"stamp refused: {exc.reason}", file=sys.stderr)
             return 1
+        return 0
+
+    if args.mode == "bridge-verify":
+        try:
+            decision = verify_bridge_settlement(
+                args.job_dir,
+                job=args.job,
+                base=args.base,
+            )
+        except EvidenceError as exc:
+            print(f"{exc.verdict}: {exc.reason}", file=sys.stderr)
+            return 2
+        sys.stdout.write(json.dumps(decision, separators=(",", ":")) + "\n")
         return 0
 
     result = settle(
