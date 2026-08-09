@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from importlib import resources
 from pathlib import Path, PureWindowsPath
-from typing import Literal, Mapping, TypeAlias
+from typing import Literal, Mapping, Sequence, TypeAlias
 
 
 HostId = Literal["pc", "mac"]
@@ -116,6 +118,27 @@ class LaneHealth:
     executor_version: str | None
     available_capacity: int
     safe_detail: Mapping[str, JsonValue]
+
+
+@dataclass(frozen=True)
+class RoutingRequest:
+    job_id: str
+    executor: Executor
+    model: str
+
+
+@dataclass(frozen=True)
+class LaneDecision:
+    status: Literal["SELECTED", "QUEUED", "BLOCKED"]
+    lane_id: str | None
+    host_id: str | None
+    executor: str
+    model: str
+    policy_version: str
+    policy_digest: str
+    fallback_applied: bool
+    reason_code: str
+    considered_lane_ids: tuple[str, ...]
 
 
 _TOP_LEVEL_KEYS = {
@@ -603,4 +626,195 @@ def evaluate_lane_health(
         failure_class=None,
         reason_code=lease.reason_code,
         lane_dir=lane_dir,
+    )
+
+
+def _model_matches(lane: LaneDefinition, model: str) -> bool:
+    return any(fnmatchcase(model, pattern) for pattern in lane.model_patterns)
+
+
+def _unavailable_reason(
+    health: LaneHealth | None, *, active_load: int, now: int
+) -> str:
+    if health is None:
+        return "HEALTH_FAILED"
+    if health.observed_at > now or now > health.expires_at:
+        return "HEALTH_FAILED"
+    if active_load > 0:
+        return "CAPACITY_FULL"
+    if health.status == "PASS" and health.state == "IDLE":
+        return "READY" if health.available_capacity > 0 else "CAPACITY_FULL"
+    if health.state in {"ASSIGNED", "BUILDING", "VERIFYING"}:
+        return "CAPACITY_FULL"
+    if health.state == "AUTH_REQUIRED":
+        return "AUTH_REQUIRED"
+    if health.reason_code in {
+        "HOST_UNREACHABLE",
+        "SSH_AUTH_FAILED",
+        "AUTH_REQUIRED",
+        "HEALTH_FAILED",
+        "CAPACITY_FULL",
+    }:
+        return health.reason_code
+    return "HEALTH_FAILED"
+
+
+def _decision(
+    registry: LaneRegistry,
+    request: RoutingRequest,
+    considered: tuple[str, ...],
+    *,
+    status: Literal["SELECTED", "QUEUED", "BLOCKED"],
+    reason_code: str,
+    lane: LaneDefinition | None = None,
+    fallback_applied: bool = False,
+) -> LaneDecision:
+    return LaneDecision(
+        status=status,
+        lane_id=lane.id if lane is not None else None,
+        host_id=lane.host_id if lane is not None else None,
+        executor=request.executor,
+        model=request.model,
+        policy_version=registry.policy_version,
+        policy_digest=registry_digest(registry),
+        fallback_applied=fallback_applied,
+        reason_code=reason_code,
+        considered_lane_ids=considered,
+    )
+
+
+def select_lane(
+    registry: LaneRegistry,
+    health: Sequence[LaneHealth],
+    request: RoutingRequest,
+    *,
+    active_load: Mapping[str, int],
+    now: int | None = None,
+) -> LaneDecision:
+    """Select one healthy seat with deterministic, policy-bound host fallback."""
+
+    if not isinstance(registry, LaneRegistry):
+        raise TypeError("registry must be a LaneRegistry")
+    if not isinstance(request, RoutingRequest):
+        raise TypeError("request must be a RoutingRequest")
+    if not request.job_id.strip():
+        raise ValueError("routing request job_id must be non-empty")
+    if request.executor not in _EXECUTORS:
+        raise ValueError("routing request executor is invalid")
+    if not request.model.strip():
+        raise ValueError("routing request model must be non-empty")
+    now_value = int(time.time()) if now is None else now
+    if isinstance(now_value, bool) or not isinstance(now_value, int):
+        raise TypeError("now must be an integer Unix timestamp")
+
+    lane_by_id = {lane.id: lane for lane in registry.lanes}
+    health_by_id: dict[str, LaneHealth] = {}
+    for item in health:
+        if item.lane_id not in lane_by_id:
+            raise ValueError(f"health references unknown lane: {item.lane_id}")
+        if item.lane_id in health_by_id:
+            raise ValueError(f"duplicate lane health: {item.lane_id}")
+        health_by_id[item.lane_id] = item
+    for lane_id, load in active_load.items():
+        if lane_id not in lane_by_id:
+            raise ValueError(f"active load references unknown lane: {lane_id}")
+        if isinstance(load, bool) or not isinstance(load, int) or load < 0:
+            raise ValueError(f"active load must be a non-negative integer: {lane_id}")
+
+    matching = [
+        lane
+        for lane in registry.lanes
+        if lane.executor == request.executor and _model_matches(lane, request.model)
+    ]
+    host_preference = {host.id: host.preference for host in registry.hosts}
+    matching.sort(key=lambda lane: (host_preference[lane.host_id], lane.id))
+    considered = tuple(lane.id for lane in matching)
+    if not matching:
+        return _decision(
+            registry,
+            request,
+            considered,
+            status="BLOCKED",
+            reason_code="NO_MATCHING_LANE",
+        )
+
+    def reason(lane: LaneDefinition) -> str:
+        return _unavailable_reason(
+            health_by_id.get(lane.id),
+            active_load=active_load.get(lane.id, 0),
+            now=now_value,
+        )
+
+    def ready(lanes: list[LaneDefinition]) -> list[LaneDefinition]:
+        candidates = [lane for lane in lanes if reason(lane) == "READY"]
+        candidates.sort(key=lambda lane: (active_load.get(lane.id, 0), lane.id))
+        return candidates
+
+    pc_lanes = [lane for lane in matching if lane.host_id == "pc"]
+    mac_lanes = [lane for lane in matching if lane.host_id == "mac"]
+    ready_pc = ready(pc_lanes)
+    if ready_pc:
+        return _decision(
+            registry,
+            request,
+            considered,
+            status="SELECTED",
+            reason_code="PC_LANE_SELECTED",
+            lane=ready_pc[0],
+        )
+
+    fallback = registry.fallback
+    pc_reasons = tuple(reason(lane) for lane in pc_lanes)
+    fallback_authorized = (
+        bool(pc_lanes)
+        and fallback.enabled
+        and fallback.preserve_executor
+        and fallback.preserve_model
+        and fallback.from_host == "pc"
+        and fallback.to_host == "mac"
+        and all(code in fallback.eligible_reason_codes for code in pc_reasons)
+    )
+    if not fallback_authorized:
+        return _decision(
+            registry,
+            request,
+            considered,
+            status="BLOCKED",
+            reason_code="PC_FALLBACK_NOT_AUTHORIZED",
+        )
+    if not mac_lanes:
+        return _decision(
+            registry,
+            request,
+            considered,
+            status="BLOCKED",
+            reason_code="NO_MATCHING_MAC_LANE",
+        )
+
+    ready_mac = ready(mac_lanes)
+    if ready_mac:
+        return _decision(
+            registry,
+            request,
+            considered,
+            status="SELECTED",
+            reason_code="MAC_FALLBACK_SELECTED",
+            lane=ready_mac[0],
+            fallback_applied=True,
+        )
+    mac_reasons = tuple(reason(lane) for lane in mac_lanes)
+    if "CAPACITY_FULL" in mac_reasons:
+        return _decision(
+            registry,
+            request,
+            considered,
+            status="QUEUED",
+            reason_code="CAPACITY_FULL",
+        )
+    return _decision(
+        registry,
+        request,
+        considered,
+        status="BLOCKED",
+        reason_code="NO_HEALTHY_MAC_LANE",
     )

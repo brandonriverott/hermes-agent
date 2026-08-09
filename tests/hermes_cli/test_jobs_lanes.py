@@ -384,3 +384,218 @@ def test_ssh_denial_wins_even_when_network_reachability_passes(tmp_path):
         "AUTH_INFRA",
         "SSH_AUTH_FAILED",
     )
+
+
+ROUTING_NOW = 2_000
+
+
+def _idle_health(lane):
+    return jobs_lanes.LaneHealth(
+        lane_id=lane.id,
+        state="IDLE",
+        status="PASS",
+        failure_class=None,
+        reason_code="OK",
+        observed_at=ROUTING_NOW,
+        expires_at=ROUTING_NOW + 120,
+        executor_version="test-1.0",
+        available_capacity=1,
+        safe_detail={},
+    )
+
+
+def _routing_health(registry):
+    return [_idle_health(lane) for lane in registry.lanes]
+
+
+def _block_host(health, registry, host_id, reason_code):
+    lane_by_id = {lane.id: lane for lane in registry.lanes}
+    failure_class = "AUTH_INFRA" if reason_code in {
+        "SSH_AUTH_FAILED",
+        "AUTH_REQUIRED",
+    } else "INFRA_FAILURE"
+    state = "AUTH_REQUIRED" if reason_code == "AUTH_REQUIRED" else "BLOCKED"
+    result = []
+    for item in health:
+        if lane_by_id[item.lane_id].host_id == host_id:
+            result.append(
+                replace(
+                    item,
+                    state=state,
+                    status="BLOCKED",
+                    failure_class=failure_class,
+                    reason_code=reason_code,
+                    available_capacity=0,
+                )
+            )
+        else:
+            result.append(item)
+    return result
+
+
+def _routing_request(executor="claude", model="claude-opus-5"):
+    return jobs_lanes.RoutingRequest(
+        job_id="j_route", executor=executor, model=model
+    )
+
+
+def test_healthy_matching_pc_lane_wins():
+    registry = jobs_lanes.load_lane_registry()
+
+    decision = jobs_lanes.select_lane(
+        registry,
+        _routing_health(registry),
+        _routing_request(),
+        active_load={},
+        now=ROUTING_NOW,
+    )
+
+    assert decision.lane_id == "claude-pc-1"
+    assert decision.host_id == "pc"
+    assert decision.fallback_applied is False
+
+
+@pytest.mark.parametrize(
+    "pc_reason",
+    [
+        "HOST_UNREACHABLE",
+        "SSH_AUTH_FAILED",
+        "AUTH_REQUIRED",
+        "HEALTH_FAILED",
+        "CAPACITY_FULL",
+    ],
+)
+def test_policy_allows_matching_mac_when_pc_is_unavailable(pc_reason):
+    registry = jobs_lanes.load_lane_registry()
+    health = _block_host(_routing_health(registry), registry, "pc", pc_reason)
+
+    decision = jobs_lanes.select_lane(
+        registry,
+        health,
+        _routing_request(),
+        active_load={},
+        now=ROUTING_NOW,
+    )
+
+    assert decision.lane_id == "claude-mac-1"
+    assert decision.host_id == "mac"
+    assert decision.fallback_applied is True
+    assert decision.policy_version == "jobs-lanes.v1"
+    assert (decision.executor, decision.model) == ("claude", "claude-opus-5")
+
+
+def test_fallback_never_changes_executor_or_model(tmp_path):
+    def remove_matching_mac(manifest):
+        for lane in manifest["lanes"]:
+            if lane["host_id"] == "mac" and lane["executor"] == "claude":
+                lane["model_patterns"] = ["claude-haiku-*"]
+
+    registry = jobs_lanes.load_lane_registry(
+        _write_registry(tmp_path, mutate=remove_matching_mac)
+    )
+    health = _block_host(_routing_health(registry), registry, "pc", "SSH_AUTH_FAILED")
+
+    decision = jobs_lanes.select_lane(
+        registry,
+        health,
+        _routing_request(),
+        active_load={},
+        now=ROUTING_NOW,
+    )
+
+    assert (decision.status, decision.reason_code) == (
+        "BLOCKED",
+        "NO_MATCHING_MAC_LANE",
+    )
+    assert decision.lane_id is None
+    assert (decision.executor, decision.model) == ("claude", "claude-opus-5")
+
+
+def test_three_occupied_pc_seats_force_policy_authorized_mac_fallback():
+    registry = jobs_lanes.load_lane_registry()
+    active_load = {
+        f"claude-pc-{slot}": 1
+        for slot in range(1, 4)
+    }
+
+    decision = jobs_lanes.select_lane(
+        registry,
+        _routing_health(registry),
+        _routing_request(),
+        active_load=active_load,
+        now=ROUTING_NOW,
+    )
+
+    assert decision.lane_id == "claude-mac-1"
+    assert decision.fallback_applied is True
+    assert decision.reason_code == "MAC_FALLBACK_SELECTED"
+
+
+def test_all_matching_seats_busy_keeps_job_queued():
+    registry = jobs_lanes.load_lane_registry()
+    active_load = {
+        lane.id: 1
+        for lane in registry.lanes
+        if lane.executor == "claude"
+    }
+
+    decision = jobs_lanes.select_lane(
+        registry,
+        _routing_health(registry),
+        _routing_request(),
+        active_load=active_load,
+        now=ROUTING_NOW,
+    )
+
+    assert (decision.status, decision.reason_code, decision.lane_id) == (
+        "QUEUED",
+        "CAPACITY_FULL",
+        None,
+    )
+
+
+def test_tie_chooses_lowest_active_load_then_lane_id():
+    registry = jobs_lanes.load_lane_registry()
+    active_load = {"codex-pc-1": 1, "codex-pc-2": 0, "codex-pc-3": 0}
+
+    decision = jobs_lanes.select_lane(
+        registry,
+        _routing_health(registry),
+        _routing_request(executor="codex", model="gpt-5.6-sol"),
+        active_load=active_load,
+        now=ROUTING_NOW,
+    )
+
+    assert decision.lane_id == "codex-pc-2"
+
+
+def test_expired_health_cannot_be_selected():
+    registry = jobs_lanes.load_lane_registry()
+    health = [replace(item, expires_at=ROUTING_NOW - 1) for item in _routing_health(registry)]
+
+    decision = jobs_lanes.select_lane(
+        registry,
+        health,
+        _routing_request(),
+        active_load={},
+        now=ROUTING_NOW,
+    )
+
+    assert decision.status == "BLOCKED"
+    assert decision.lane_id is None
+    assert decision.reason_code == "NO_HEALTHY_MAC_LANE"
+
+
+def test_duplicate_health_observation_fails_closed():
+    registry = jobs_lanes.load_lane_registry()
+    health = _routing_health(registry)
+    health.append(health[0])
+
+    with pytest.raises(ValueError, match="duplicate lane health"):
+        jobs_lanes.select_lane(
+            registry,
+            health,
+            _routing_request(),
+            active_load={},
+            now=ROUTING_NOW,
+        )
