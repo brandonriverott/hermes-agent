@@ -157,6 +157,14 @@ class ReplayIntegrity(ValueError):
     """
 
 
+class GraphConflict(ValueError):
+    """Raised when an idempotency key is replayed with contradictory facts."""
+
+
+class StaleJobRevision(ValueError):
+    """Raised when a reliability write loses its Job revision comparison."""
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -360,6 +368,59 @@ CREATE TABLE IF NOT EXISTS job_sources (
     job_id      TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     created_at  INTEGER NOT NULL,
     PRIMARY KEY (source_type, source_key)
+);
+
+CREATE TABLE IF NOT EXISTS job_preflights (
+    id                    TEXT PRIMARY KEY,
+    job_id                TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    attempt_id            TEXT REFERENCES job_attempts(id),
+    execution_spec_digest TEXT NOT NULL,
+    expected_job_revision INTEGER NOT NULL,
+    status                TEXT NOT NULL CHECK (status IN ('PASS', 'BLOCKED')),
+    failure_class         TEXT,
+    checks_json           TEXT NOT NULL,
+    receipt_id            TEXT NOT NULL REFERENCES job_receipts(id),
+    idempotency_key       TEXT NOT NULL,
+    created_at            INTEGER NOT NULL,
+    UNIQUE (job_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS job_attempt_transitions (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id                TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    attempt_id            TEXT NOT NULL REFERENCES job_attempts(id) ON DELETE CASCADE,
+    source_state          TEXT,
+    target_state          TEXT NOT NULL,
+    initiator_type        TEXT NOT NULL,
+    initiator_id          TEXT NOT NULL,
+    expected_job_revision INTEGER NOT NULL,
+    evidence_json         TEXT NOT NULL,
+    failure_class         TEXT,
+    blocker_code          TEXT,
+    receipt_id            TEXT NOT NULL REFERENCES job_receipts(id),
+    component             TEXT NOT NULL,
+    component_version     TEXT NOT NULL,
+    idempotency_key       TEXT NOT NULL,
+    created_at            INTEGER NOT NULL,
+    UNIQUE (attempt_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_attempt_transitions_job
+    ON job_attempt_transitions(job_id, attempt_id, id);
+
+CREATE TABLE IF NOT EXISTS job_retry_evidence (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id                TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    chain_id              TEXT NOT NULL,
+    attempt_id            TEXT NOT NULL REFERENCES job_attempts(id) ON DELETE CASCADE,
+    parent_attempt_id     TEXT REFERENCES job_attempts(id),
+    ordinal               INTEGER NOT NULL,
+    evidence_digest       TEXT NOT NULL,
+    decision              TEXT NOT NULL,
+    reason_code           TEXT NOT NULL,
+    created_at            INTEGER NOT NULL,
+    UNIQUE (chain_id, ordinal),
+    UNIQUE (chain_id, evidence_digest)
 );
 
 -- Durable monotonic number allocator. A single row (id = 1) holds the highest
@@ -923,6 +984,40 @@ def _bump_revision_locked(
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PreflightRecord:
+    id: str
+    job_id: str
+    attempt_id: Optional[str]
+    execution_spec_digest: str
+    expected_job_revision: int
+    status: str
+    failure_class: Optional[str]
+    checks: Sequence[Mapping[str, object]]
+    receipt_id: str
+    idempotency_key: str
+    created_at: int
+
+
+@dataclass(frozen=True)
+class TransitionWrite:
+    job_id: str
+    attempt_id: str
+    source_state: Optional[str]
+    target_state: str
+    initiator_type: str
+    initiator_id: str
+    expected_job_revision: int
+    evidence: Mapping[str, str]
+    failure_class: Optional[str]
+    blocker_code: Optional[str]
+    receipt_id: str
+    component: str
+    component_version: str
+    idempotency_key: str
+    created_at: int
 
 
 @dataclass
@@ -3309,6 +3404,308 @@ def get_receipts(conn: sqlite3.Connection, id_or_number) -> List[dict]:
         (job.id,),
     ).fetchall()
     return [_receipt_to_dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Reliability decisions (signed, append-only, and transactionally paired)
+# ---------------------------------------------------------------------------
+
+
+def _reliability_json(value: object) -> str:
+    from hermes_cli import jobs_receipts
+
+    return jobs_receipts.canonical_json_bytes(value).decode("utf-8")
+
+
+def _receipt_blob(envelope: Mapping[str, object], receipt_id: str) -> str:
+    if not isinstance(envelope, Mapping):
+        raise ValueError("receipt envelope must be a mapping")
+    if envelope.get("receipt_id") != receipt_id:
+        raise GraphConflict("receipt envelope id contradicts the reliability record")
+    return _reliability_json(dict(envelope))
+
+
+def _require_job_revision_locked(
+    conn: sqlite3.Connection, job_id: str, expected_revision: int
+) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no such job: {job_id!r}")
+    if row["revision"] != expected_revision:
+        raise StaleJobRevision(
+            f"job {job_id!r} revision is {row['revision']}, expected {expected_revision}"
+        )
+    return row
+
+
+def _require_attempt_job_locked(
+    conn: sqlite3.Connection, attempt_id: Optional[str], job_id: str
+) -> None:
+    if attempt_id is None:
+        return
+    row = conn.execute(
+        "SELECT job_id FROM job_attempts WHERE id = ?", (attempt_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"no such attempt: {attempt_id!r}")
+    if row["job_id"] != job_id:
+        raise ValueError(f"attempt {attempt_id!r} belongs to a different job")
+
+
+def _insert_reliability_receipt_locked(
+    conn: sqlite3.Connection,
+    *,
+    receipt_id: str,
+    job_id: str,
+    attempt_id: Optional[str],
+    blob: str,
+    created_at: int,
+) -> None:
+    existing = conn.execute(
+        "SELECT * FROM job_receipts WHERE id = ?", (receipt_id,)
+    ).fetchone()
+    idempotency_key = f"reliability:{receipt_id}"
+    if existing is not None:
+        if (
+            existing["job_id"] == job_id
+            and existing["attempt_id"] == attempt_id
+            and existing["data"] == blob
+            and existing["idempotency_key"] == idempotency_key
+        ):
+            return
+        raise GraphConflict(f"receipt {receipt_id!r} already stores different facts")
+    conn.execute(
+        "INSERT INTO job_receipts "
+        "(id, job_id, attempt_id, data, idempotency_key, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (receipt_id, job_id, attempt_id, blob, idempotency_key, created_at),
+    )
+
+
+def _preflight_material(row: sqlite3.Row) -> tuple:
+    return tuple(
+        row[name]
+        for name in (
+            "job_id",
+            "attempt_id",
+            "execution_spec_digest",
+            "expected_job_revision",
+            "status",
+            "failure_class",
+            "checks_json",
+            "receipt_id",
+            "idempotency_key",
+            "created_at",
+        )
+    )
+
+
+def record_preflight(
+    conn: sqlite3.Connection,
+    record: PreflightRecord,
+    envelope: Mapping[str, object],
+) -> str:
+    """Persist one complete preflight and its signed receipt atomically."""
+
+    if record.status not in {"PASS", "BLOCKED"}:
+        raise ValueError("preflight status must be PASS or BLOCKED")
+    if not record.idempotency_key:
+        raise ValueError("preflight idempotency_key must not be empty")
+    checks_json = _reliability_json(list(record.checks))
+    receipt_blob = _receipt_blob(envelope, record.receipt_id)
+    expected_material = (
+        record.job_id,
+        record.attempt_id,
+        record.execution_spec_digest,
+        record.expected_job_revision,
+        record.status,
+        record.failure_class,
+        checks_json,
+        record.receipt_id,
+        record.idempotency_key,
+        record.created_at,
+    )
+    with write_txn(conn):
+        _require_job_revision_locked(
+            conn, record.job_id, record.expected_job_revision
+        )
+        _require_attempt_job_locked(conn, record.attempt_id, record.job_id)
+        existing = conn.execute(
+            "SELECT * FROM job_preflights WHERE job_id = ? AND idempotency_key = ?",
+            (record.job_id, record.idempotency_key),
+        ).fetchone()
+        if existing is not None:
+            stored_receipt = conn.execute(
+                "SELECT data FROM job_receipts WHERE id = ?", (existing["receipt_id"],)
+            ).fetchone()
+            if (
+                _preflight_material(existing) == expected_material
+                and stored_receipt is not None
+                and stored_receipt["data"] == receipt_blob
+            ):
+                return existing["id"]
+            raise GraphConflict("preflight idempotency key stores different facts")
+        _insert_reliability_receipt_locked(
+            conn,
+            receipt_id=record.receipt_id,
+            job_id=record.job_id,
+            attempt_id=record.attempt_id,
+            blob=receipt_blob,
+            created_at=record.created_at,
+        )
+        conn.execute(
+            "INSERT INTO job_preflights "
+            "(id, job_id, attempt_id, execution_spec_digest, expected_job_revision, "
+            " status, failure_class, checks_json, receipt_id, idempotency_key, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record.id,
+                record.job_id,
+                record.attempt_id,
+                record.execution_spec_digest,
+                record.expected_job_revision,
+                record.status,
+                record.failure_class,
+                checks_json,
+                record.receipt_id,
+                record.idempotency_key,
+                record.created_at,
+            ),
+        )
+    return record.id
+
+
+def _transition_material(row: sqlite3.Row) -> tuple:
+    return tuple(
+        row[name]
+        for name in (
+            "job_id",
+            "attempt_id",
+            "source_state",
+            "target_state",
+            "initiator_type",
+            "initiator_id",
+            "expected_job_revision",
+            "evidence_json",
+            "failure_class",
+            "blocker_code",
+            "receipt_id",
+            "component",
+            "component_version",
+            "idempotency_key",
+            "created_at",
+        )
+    )
+
+
+def record_transition(
+    conn: sqlite3.Connection,
+    request: TransitionWrite,
+    envelope: Mapping[str, object],
+) -> int:
+    """Persist one detailed-state transition and receipt in one transaction."""
+
+    if not request.idempotency_key:
+        raise ValueError("transition idempotency_key must not be empty")
+    evidence_json = _reliability_json(dict(request.evidence))
+    receipt_blob = _receipt_blob(envelope, request.receipt_id)
+    expected_material = (
+        request.job_id,
+        request.attempt_id,
+        request.source_state,
+        request.target_state,
+        request.initiator_type,
+        request.initiator_id,
+        request.expected_job_revision,
+        evidence_json,
+        request.failure_class,
+        request.blocker_code,
+        request.receipt_id,
+        request.component,
+        request.component_version,
+        request.idempotency_key,
+        request.created_at,
+    )
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT * FROM job_attempt_transitions "
+            "WHERE attempt_id = ? AND idempotency_key = ?",
+            (request.attempt_id, request.idempotency_key),
+        ).fetchone()
+        if existing is not None:
+            stored_receipt = conn.execute(
+                "SELECT data FROM job_receipts WHERE id = ?", (existing["receipt_id"],)
+            ).fetchone()
+            if (
+                _transition_material(existing) == expected_material
+                and stored_receipt is not None
+                and stored_receipt["data"] == receipt_blob
+            ):
+                return int(existing["id"])
+            raise GraphConflict("transition idempotency key stores different facts")
+        _require_job_revision_locked(
+            conn, request.job_id, request.expected_job_revision
+        )
+        _require_attempt_job_locked(conn, request.attempt_id, request.job_id)
+        _insert_reliability_receipt_locked(
+            conn,
+            receipt_id=request.receipt_id,
+            job_id=request.job_id,
+            attempt_id=request.attempt_id,
+            blob=receipt_blob,
+            created_at=request.created_at,
+        )
+        cursor = conn.execute(
+            "INSERT INTO job_attempt_transitions "
+            "(job_id, attempt_id, source_state, target_state, initiator_type, "
+            " initiator_id, expected_job_revision, evidence_json, failure_class, "
+            " blocker_code, receipt_id, component, component_version, "
+            " idempotency_key, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            expected_material,
+        )
+        transition_id = int(cursor.lastrowid)
+    return transition_id
+
+
+def _transition_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "job_id": row["job_id"],
+        "attempt_id": row["attempt_id"],
+        "source_state": row["source_state"],
+        "target_state": row["target_state"],
+        "initiator_type": row["initiator_type"],
+        "initiator_id": row["initiator_id"],
+        "expected_job_revision": row["expected_job_revision"],
+        "evidence": json.loads(row["evidence_json"]),
+        "failure_class": row["failure_class"],
+        "blocker_code": row["blocker_code"],
+        "receipt_id": row["receipt_id"],
+        "component": row["component"],
+        "component_version": row["component_version"],
+        "idempotency_key": row["idempotency_key"],
+        "created_at": row["created_at"],
+    }
+
+
+def latest_transition(
+    conn: sqlite3.Connection, attempt_id: str
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM job_attempt_transitions WHERE attempt_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (attempt_id,),
+    ).fetchone()
+    return None if row is None else _transition_to_dict(row)
+
+
+def list_transitions(conn: sqlite3.Connection, job_id: str) -> List[dict]:
+    rows = conn.execute(
+        "SELECT * FROM job_attempt_transitions WHERE job_id = ? ORDER BY id ASC",
+        (job_id,),
+    ).fetchall()
+    return [_transition_to_dict(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------
