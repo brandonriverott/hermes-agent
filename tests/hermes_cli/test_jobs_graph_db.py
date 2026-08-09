@@ -187,3 +187,50 @@ def test_transition_idempotency_requires_an_exact_material_match(conn, signing_k
         jdb.record_transition(conn, replace(write, target_state="ASSIGNED"), envelope)
     assert conn.execute("SELECT COUNT(*) FROM job_attempt_transitions").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM job_receipts").fetchone()[0] == 1
+
+
+def test_retry_evidence_is_persisted_before_duplicate_evidence_is_rejected(conn):
+    job_id, attempt_id = _attempt(conn)
+    write = jdb.RetryEvidenceWrite(
+        job_id=job_id,
+        chain_id=attempt_id,
+        attempt_id=attempt_id,
+        parent_attempt_id=None,
+        ordinal=1,
+        evidence_digest="sha256:" + "d" * 64,
+        decision="RETRY",
+        reason_code="NEW_EVIDENCE",
+        created_at=4,
+    )
+
+    accepted = jdb.record_retry_decision(conn, write)
+    duplicate = jdb.record_retry_decision(conn, write)
+
+    assert accepted["decision"] == "RETRY"
+    assert (duplicate["decision"], duplicate["reason_code"]) == (
+        "BLOCKED",
+        "RETRY_REJECTED_NO_NEW_EVIDENCE",
+    )
+    assert conn.execute("SELECT COUNT(*) FROM job_retry_evidence").fetchone()[0] == 1
+
+
+def test_retry_ordinal_cannot_be_reused_with_different_evidence(conn):
+    job_id, attempt_id = _attempt(conn)
+    original = jdb.RetryEvidenceWrite(
+        job_id=job_id,
+        chain_id=attempt_id,
+        attempt_id=attempt_id,
+        parent_attempt_id=None,
+        ordinal=1,
+        evidence_digest="sha256:" + "d" * 64,
+        decision="RETRY",
+        reason_code="NEW_EVIDENCE",
+        created_at=4,
+    )
+    jdb.record_retry_decision(conn, original)
+
+    with pytest.raises(jdb.GraphConflict):
+        jdb.record_retry_decision(
+            conn,
+            replace(original, evidence_digest="sha256:" + "e" * 64),
+        )

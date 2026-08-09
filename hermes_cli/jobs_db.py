@@ -35,6 +35,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -1017,6 +1018,19 @@ class TransitionWrite:
     component: str
     component_version: str
     idempotency_key: str
+    created_at: int
+
+
+@dataclass(frozen=True)
+class RetryEvidenceWrite:
+    job_id: str
+    chain_id: str
+    attempt_id: str
+    parent_attempt_id: Optional[str]
+    ordinal: int
+    evidence_digest: str
+    decision: str
+    reason_code: str
     created_at: int
 
 
@@ -3706,6 +3720,126 @@ def list_transitions(conn: sqlite3.Connection, job_id: str) -> List[dict]:
         (job_id,),
     ).fetchall()
     return [_transition_to_dict(row) for row in rows]
+
+
+_RELIABILITY_DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+_RELIABILITY_REASON_RE = re.compile(r"\A[A-Z][A-Z0-9_]{0,63}\Z")
+
+
+def _retry_evidence_to_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "job_id": row["job_id"],
+        "chain_id": row["chain_id"],
+        "attempt_id": row["attempt_id"],
+        "parent_attempt_id": row["parent_attempt_id"],
+        "ordinal": row["ordinal"],
+        "evidence_digest": row["evidence_digest"],
+        "decision": row["decision"],
+        "reason_code": row["reason_code"],
+        "created_at": row["created_at"],
+    }
+
+
+def _duplicate_retry_decision(row: sqlite3.Row) -> dict:
+    result = _retry_evidence_to_dict(row)
+    result["decision"] = "BLOCKED"
+    result["reason_code"] = "RETRY_REJECTED_NO_NEW_EVIDENCE"
+    return result
+
+
+def record_retry_decision(
+    conn: sqlite3.Connection, record: RetryEvidenceWrite
+) -> dict:
+    """Persist retry evidence before returning authorization to retry."""
+
+    if record.ordinal <= 0:
+        raise ValueError("retry ordinal must be positive")
+    if _RELIABILITY_DIGEST_RE.fullmatch(record.evidence_digest) is None:
+        raise ValueError("retry evidence digest must be sha256:<64 lowercase hex>")
+    if record.decision not in {"RETRY", "BLOCKED", "HUMAN_ACTION"}:
+        raise ValueError("invalid retry decision")
+    if _RELIABILITY_REASON_RE.fullmatch(record.reason_code) is None:
+        raise ValueError("invalid retry reason code")
+
+    with write_txn(conn):
+        job = conn.execute(
+            "SELECT id FROM jobs WHERE id = ?", (record.job_id,)
+        ).fetchone()
+        if job is None:
+            raise ValueError(f"no such job: {record.job_id!r}")
+        chain = get_attempt(conn, record.chain_id)
+        if chain is None or chain["job_id"] != record.job_id:
+            raise ValueError("retry chain must name an attempt on the same job")
+        if chain["parent_attempt_id"] is not None:
+            raise GraphConflict("retry chain_id must be the first attempt id")
+        attempt = get_attempt(conn, record.attempt_id)
+        if attempt is None or attempt["job_id"] != record.job_id:
+            raise ValueError("retry evidence attempt belongs to a different job")
+        if attempt["parent_attempt_id"] != record.parent_attempt_id:
+            raise GraphConflict("retry parent attempt contradicts attempt lineage")
+        if attempt["ordinal"] != record.ordinal:
+            raise GraphConflict("retry ordinal contradicts attempt lineage")
+
+        duplicate = conn.execute(
+            "SELECT * FROM job_retry_evidence "
+            "WHERE chain_id = ? AND evidence_digest = ?",
+            (record.chain_id, record.evidence_digest),
+        ).fetchone()
+        if duplicate is not None:
+            return _duplicate_retry_decision(duplicate)
+        occupied = conn.execute(
+            "SELECT * FROM job_retry_evidence WHERE chain_id = ? AND ordinal = ?",
+            (record.chain_id, record.ordinal),
+        ).fetchone()
+        if occupied is not None:
+            raise GraphConflict("retry ordinal already stores different evidence")
+        try:
+            cursor = conn.execute(
+                "INSERT INTO job_retry_evidence "
+                "(job_id, chain_id, attempt_id, parent_attempt_id, ordinal, "
+                " evidence_digest, decision, reason_code, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.job_id,
+                    record.chain_id,
+                    record.attempt_id,
+                    record.parent_attempt_id,
+                    record.ordinal,
+                    record.evidence_digest,
+                    record.decision,
+                    record.reason_code,
+                    record.created_at,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            duplicate = conn.execute(
+                "SELECT * FROM job_retry_evidence "
+                "WHERE chain_id = ? AND evidence_digest = ?",
+                (record.chain_id, record.evidence_digest),
+            ).fetchone()
+            if duplicate is not None:
+                return _duplicate_retry_decision(duplicate)
+            raise GraphConflict("retry evidence conflicts with stored history") from exc
+        stored = conn.execute(
+            "SELECT * FROM job_retry_evidence WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        return _retry_evidence_to_dict(stored)
+
+
+def list_retry_evidence(
+    conn: sqlite3.Connection, job_id: str, *, chain_id: Optional[str] = None
+) -> List[dict]:
+    sql = "SELECT * FROM job_retry_evidence WHERE job_id = ?"
+    params: tuple = (job_id,)
+    if chain_id is not None:
+        sql += " AND chain_id = ?"
+        params = (job_id, chain_id)
+    sql += " ORDER BY ordinal ASC, id ASC"
+    return [
+        _retry_evidence_to_dict(row)
+        for row in conn.execute(sql, params).fetchall()
+    ]
 
 
 # ---------------------------------------------------------------------------
