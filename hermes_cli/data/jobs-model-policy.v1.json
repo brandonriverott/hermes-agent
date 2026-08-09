@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "policy_version": "2026-08-09.1",
+  "source_kind": "operator_policy",
+  "models": [
+    {
+      "id": "claude-fable-5",
+      "executor": "claude",
+      "policy_role": "design_fidelity"
+    },
+    {
+      "id": "claude-opus-5",
+      "executor": "claude",
+      "policy_role": "high_risk_generalist"
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "executor": "codex",
+      "policy_role": "specified_implementation"
+    }
+  ],
+  "rules": [
+    {
+      "id": "critical-opus",
+      "select": "claude-opus-5",
+      "risk_in": [
+        "critical"
+      ],
+      "any_true": [
+        "architectural_judgment",
+        "security",
+        "money",
+        "schema_or_migration",
+        "irreversible"
+      ]
+    },
+    {
+      "id": "design-fidelity-fable",
+      "select": "claude-fable-5",
+      "work_kind_in": [
+        "design",
+        "specification"
+      ],
+      "any_true": [
+        "visual_fidelity"
+      ]
+    },
+    {
+      "id": "specified-build-sol",
+      "select": "gpt-5.6-sol",
+      "work_kind_in": [
+        "implementation",
+        "refactor",
+        "testing",
+        "debugging"
+      ],
+      "requirements_complete": true
+    },
+    {
+      "id": "unknown-opus",
+      "select": "claude-opus-5",
+      "default": true
+    }
+  ],
+  "unverified_facts": [
+    "benchmarks",
+    "pricing",
+    "provider_capacity",
+    "quota"
+  ]
+}
