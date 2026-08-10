@@ -413,9 +413,9 @@ def test_message_is_structured_and_preserves_origin_metadata(jobs_path, session_
     assert len(msgs) == 1
     msg = msgs[0]
     assert msg["role"] == "system"
-    # Structured, minimal content (Task 8 owns phase wording/heartbeat).
-    assert msg["content"].startswith("jobs:queued")
-    assert job_id in msg["content"]
+    # Task 8 wording: concise user-facing lifecycle message, structured and
+    # stable (the raw job id lives in display_metadata, not the chat text).
+    assert msg["content"] == "Queued — job (#1) accepted"
     assert msg["display_kind"] == "jobs_update"
     meta = json.loads(msg["display_metadata"]) if isinstance(
         msg["display_metadata"], str
@@ -425,3 +425,4 @@ def test_message_is_structured_and_preserves_origin_metadata(jobs_path, session_
     assert meta["thread_id"] == "thread-1"
     assert meta["session_id"] == "session-1"
     assert meta["profile"] == "default"
+    assert meta["job_id"] == job_id

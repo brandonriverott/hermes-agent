@@ -23,9 +23,11 @@ Contract:
   via ``block_notification`` — it is surfaced by health/status commands,
   never silently retried forever.
 
-This worker is passive: it never wakes an LLM turn.  Phase wording and
-the 10-minute heartbeat belong to Task 8; this module appends a minimal
-structured system message only.
+This worker is passive: it never wakes an LLM turn.  Task 8 owns the
+user-facing phase wording (rendered from the bounded payload by
+:func:`hermes_cli.jobs_notifications.render_milestone_message`) and the
+one-per-episode ten-minute heartbeat, which is enqueued before claiming so
+it participates in normal per-Job delivery order.
 """
 
 from __future__ import annotations
@@ -113,12 +115,33 @@ def _resolve_target_session_id(
     return session_id
 
 
-def _format_message(record) -> str:
-    """Minimal structured system message (Task 8 owns phase wording)."""
-    payload = record.payload
-    number = payload.get("number") or ""
-    name = payload.get("name") or record.job_id
-    return f"jobs:{record.milestone} #{number} {name} ({record.job_id})"
+def _is_re_review(conn, record) -> bool:
+    """True when a ``review`` milestone follows a delivered ``correcting``.
+
+    A later ``REVIEWING`` transition after a correction renders as a
+    re-review while retaining the stable ``review`` milestone type.  The
+    flag is derived from the durable delivered history, never from file
+    mtimes or logs.
+    """
+    from hermes_cli import jobs_notifications as jn
+
+    if record.milestone != jn.MILESTONE_REVIEW:
+        return False
+    row = conn.execute(
+        "SELECT milestone FROM job_notifications "
+        "WHERE job_id = ? AND id < ? AND delivered_at IS NOT NULL "
+        "AND milestone != ? "
+        "ORDER BY id DESC LIMIT 1",
+        (record.job_id, record.id, jn.MILESTONE_HEARTBEAT),
+    ).fetchone()
+    return row is not None and row["milestone"] == jn.MILESTONE_CORRECTING
+
+
+def _format_message(conn, record, *, re_review: bool) -> str:
+    """User-facing lifecycle message for a milestone (Task 8 wording)."""
+    from hermes_cli import jobs_notifications as jn
+
+    return jn.render_milestone_message(record, re_review=re_review)
 
 
 def _display_metadata(
@@ -222,7 +245,11 @@ def _deliver_one(
     session_db.append_message(
         target_session_id,
         role="system",
-        content=_format_message(record),
+        content=_format_message(
+            conn,
+            record,
+            re_review=_is_re_review(conn, record),
+        ),
         platform_message_id=record.notification_id,
         display_kind="jobs_update",
         display_metadata=_display_metadata(origin, record, target_session_id),
@@ -252,6 +279,10 @@ def deliver_due_notification_once(
     now = int(now) if now is not None else int(time.time())
     conn = jdb.connect(jobs_path)
     try:
+        # Task 8: enqueue one heartbeat per stagnant phase episode (≥10
+        # minutes without a delivered phase change) before claiming rows, so
+        # the heartbeat participates in normal per-Job delivery order.
+        jn.enqueue_due_heartbeats(conn, now=now)
         record = jn.claim_due(conn, owner=owner, now=now)
         if record is None:
             return None

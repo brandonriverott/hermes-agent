@@ -34,6 +34,7 @@ MILESTONE_CORRECTING = "correcting"
 MILESTONE_NEEDS_YOU = "needs-you"
 MILESTONE_FAILURE = "failure"
 MILESTONE_FINISHED = "finished"
+MILESTONE_HEARTBEAT = "heartbeat"
 
 ALL_MILESTONES = frozenset(
     {
@@ -46,8 +47,13 @@ ALL_MILESTONES = frozenset(
         MILESTONE_NEEDS_YOU,
         MILESTONE_FAILURE,
         MILESTONE_FINISHED,
+        MILESTONE_HEARTBEAT,
     }
 )
+
+# One heartbeat is emitted per stagnant phase episode, and only after this
+# many seconds have passed since the phase's milestone was delivered.
+HEARTBEAT_AFTER_SECONDS = 600
 
 MAX_PAYLOAD_CHARS = 4096
 MAX_ERROR_CHARS = 512
@@ -389,8 +395,142 @@ def _now() -> int:
     return int(time.time())
 
 
+def render_milestone_message(
+    record: NotificationRecord,
+    *,
+    re_review: bool = False,
+) -> str:
+    """One concise, stable user-facing message for a milestone record.
+
+    Pure over the bounded outbox payload: it reads only ``number``, ``name``
+    and (for heartbeats) ``phase``.  Raw goal text, stdout, stack traces,
+    token counts, and full review text are never part of the payload or the
+    rendered message.
+
+    The stable ``review`` milestone renders as a re-review only when the
+    caller passes ``re_review=True`` (the delivery worker derives that from
+    the job's delivered history); the milestone type itself stays ``review``.
+    """
+    number = record.payload.get("number") or ""
+    name = record.payload.get("name") or record.job_id
+
+    if record.milestone == MILESTONE_HEARTBEAT:
+        phase = record.payload.get("phase") or "working"
+        return f"Still working — {name} (#{number}) (still {phase})"
+    if record.milestone == MILESTONE_REVIEW and re_review:
+        return f"Re-review — {name} (#{number}) back under review"
+
+    templates = {
+        MILESTONE_QUEUED: f"Queued — {name} (#{number}) accepted",
+        MILESTONE_ASSIGNED: f"Assigned — {name} (#{number}) started",
+        MILESTONE_BUILDING: f"Building — {name} (#{number}) in progress",
+        MILESTONE_TESTING: (
+            f"Testing — {name} (#{number}) running tests and evidence"
+        ),
+        MILESTONE_REVIEW: f"Review — {name} (#{number}) under review",
+        MILESTONE_CORRECTING: f"Correcting — {name} (#{number}) fixing findings",
+        MILESTONE_NEEDS_YOU: (
+            f"Needs you — {name} (#{number}) requires your decision"
+        ),
+        MILESTONE_FAILURE: f"Failed — {name} (#{number}) ended unsuccessfully",
+        MILESTONE_FINISHED: f"Finished — {name} (#{number}) complete",
+    }
+    return templates.get(
+        record.milestone,
+        f"Update — {name} (#{number}) ({record.milestone})",
+    )
+
+
+def enqueue_due_heartbeats(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+) -> list[str]:
+    """Enqueue one heartbeat per stagnant phase episode, if due.
+
+    The current phase of a Job is its most recent *delivered* non-heartbeat
+    milestone row.  When ``now - delivered_at`` has reached
+    :data:`HEARTBEAT_AFTER_SECONDS` and no heartbeat row exists for that
+    episode, one heartbeat is inserted with a unique phase-episode key:
+
+    - the key is ``n:<job_id>:<revision>:heartbeat``, so a phase change
+      (which always bumps the graph revision) resets eligibility and a
+      restart cannot duplicate the heartbeat;
+    - ``INSERT OR IGNORE`` plus the ``(job_id, job_revision, milestone)``
+      unique constraint make concurrent enqueue calls idempotent;
+    - heartbeats participate in the normal per-Job delivery order, so a
+      pending earlier milestone can never be overtaken by a heartbeat.
+
+    Progress is derived only from the durable outbox — never from file
+    mtimes or logs.  Returns the notification ids enqueued by this call.
+    """
+    now = int(now) if now is not None else _now()
+    from hermes_cli.sqlite_util import write_txn
+
+    # The current phase anchor per Job: its latest delivered row that is not
+    # itself a heartbeat.
+    anchors = conn.execute(
+        "SELECT * FROM job_notifications n "
+        "WHERE n.delivered_at IS NOT NULL "
+        "AND n.milestone != ? "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM job_notifications later "
+        "  WHERE later.job_id = n.job_id "
+        "  AND later.id > n.id "
+        "  AND later.delivered_at IS NOT NULL "
+        "  AND later.milestone != ?"
+        ")",
+        (MILESTONE_HEARTBEAT, MILESTONE_HEARTBEAT),
+    ).fetchall()
+
+    enqueued: list[str] = []
+    with write_txn(conn):
+        for row in anchors:
+            anchor = _record(row)
+            delivered_at = int(anchor.delivered_at or 0)
+            if now - delivered_at < HEARTBEAT_AFTER_SECONDS:
+                continue
+            notification_id = (
+                f"n:{anchor.job_id}:{anchor.job_revision}:{MILESTONE_HEARTBEAT}"
+            )
+            payload = {
+                "number": anchor.payload.get("number"),
+                "name": anchor.payload.get("name"),
+                "phase": anchor.milestone,
+            }
+            payload_json = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True
+            )
+            if len(payload_json) > MAX_PAYLOAD_CHARS:
+                raise ValueError("heartbeat payload exceeds size bound")
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO job_notifications "
+                "(notification_id, job_id, attempt_id, job_revision, milestone, "
+                " payload_json, transition_id, created_at, next_attempt_at, "
+                " delivery_attempts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                (
+                    notification_id,
+                    anchor.job_id,
+                    None,
+                    anchor.job_revision,
+                    MILESTONE_HEARTBEAT,
+                    payload_json,
+                    None,
+                    now,
+                    now,
+                ),
+            )
+            # rowcount is 1 when the row actually landed, 0 when the unique
+            # phase-episode key already existed (idempotent no-op).
+            if cursor.rowcount == 1:
+                enqueued.append(notification_id)
+    return enqueued
+
+
 __all__ = [
     "ALL_MILESTONES",
+    "HEARTBEAT_AFTER_SECONDS",
     "MAX_ERROR_CHARS",
     "MAX_PAYLOAD_CHARS",
     "MILESTONE_ASSIGNED",
@@ -398,6 +538,7 @@ __all__ = [
     "MILESTONE_CORRECTING",
     "MILESTONE_FAILURE",
     "MILESTONE_FINISHED",
+    "MILESTONE_HEARTBEAT",
     "MILESTONE_NEEDS_YOU",
     "MILESTONE_QUEUED",
     "MILESTONE_REVIEW",
@@ -407,9 +548,11 @@ __all__ = [
     "acknowledge",
     "block_notification",
     "claim_due",
+    "enqueue_due_heartbeats",
     "enqueue_locked",
     "list_notifications",
     "milestone_for_state",
     "release_claim",
+    "render_milestone_message",
     "renew_claim",
 ]
