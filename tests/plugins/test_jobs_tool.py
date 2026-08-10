@@ -518,6 +518,33 @@ def test_create_handler_commits_identity_origin_and_creation_event_atomically(
         conn.close()
 
 
+def test_create_handler_durably_queues_one_notification(
+    tmp_path, monkeypatch, git_repo, exact_origin
+):
+    repo, _ = git_repo
+    result = _invoke_create(
+        tmp_path,
+        monkeypatch,
+        _valid_args(repo),
+        origin=exact_origin,
+    )
+
+    from hermes_cli import jobs_db as jdb
+    from hermes_cli import jobs_notifications as jn
+
+    conn = jdb.connect(tmp_path / "hermes-home" / "jobs.db")
+    try:
+        rows = jn.list_notifications(conn, job_id=result["job_id"])
+    finally:
+        conn.close()
+
+    assert len(rows) == 1
+    assert rows[0].milestone == "queued"
+    assert rows[0].job_revision == 1
+    assert rows[0].attempt_id is None
+    assert rows[0].delivered_at is None
+
+
 def test_creation_event_failure_rolls_back_job_and_origin(
     tmp_path, monkeypatch, git_repo, exact_origin
 ):

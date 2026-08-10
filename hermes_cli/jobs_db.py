@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
 
 from hermes_cli import jobs_identity as ji
+from hermes_cli import jobs_notifications as jnotif
 from hermes_cli.sqlite_util import add_column_if_missing, write_txn
 from hermes_constants import get_hermes_home
 
@@ -363,6 +364,39 @@ CREATE TABLE IF NOT EXISTS job_origins (
     origin      TEXT NOT NULL,
     created_at  INTEGER NOT NULL
 );
+
+-- Transactional notification outbox: one row per user-visible milestone,
+-- written in the same IMMEDIATE transaction as the Job creation or graph
+-- transition that produced it, so a state cannot commit without its
+-- notification intent.  ``id`` is the durable per-Job order; a later
+-- milestone never overtakes an earlier undelivered one.  ``notification_id``
+-- is stable (derived from Job, graph revision, and milestone), and the
+-- uniqueness on ``(job_id, job_revision, milestone)`` makes transition
+-- retries idempotent.
+CREATE TABLE IF NOT EXISTS job_notifications (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    notification_id   TEXT NOT NULL UNIQUE,
+    job_id            TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    attempt_id        TEXT REFERENCES job_attempts(id),
+    job_revision      INTEGER NOT NULL,
+    milestone         TEXT NOT NULL,
+    payload_json      TEXT NOT NULL,
+    transition_id     INTEGER,
+    created_at        INTEGER NOT NULL,
+    next_attempt_at   INTEGER NOT NULL,
+    claim_owner       TEXT,
+    claim_expires_at  INTEGER,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT,
+    delivered_at      INTEGER,
+    UNIQUE (job_id, job_revision, milestone)
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_notifications_job
+    ON job_notifications(job_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_job_notifications_due
+    ON job_notifications(next_attempt_at, id);
 
 -- Idempotent source registry for scheduled jobs and later migration. The
 -- ``(source_type, source_key)`` pair is globally unique, so replaying the same
@@ -1497,6 +1531,23 @@ def _create_job_locked(
                 "INSERT INTO job_origins (job_id, origin, created_at) "
                 "VALUES (?, ?, ?)",
                 (jid, json.dumps(allowed, ensure_ascii=False, sort_keys=True), now),
+            )
+            # The exact-origin Job's ``queued`` milestone commits in this same
+            # transaction; an originless operator Job has no notification.
+            jnotif.enqueue_locked(
+                conn,
+                job_id=jid,
+                attempt_id=None,
+                job_revision=1,
+                milestone=jnotif.MILESTONE_QUEUED,
+                payload={
+                    "number": number,
+                    "name": name,
+                    "requested_lane": requested_lane,
+                    "executor": executor,
+                    "model": model,
+                },
+                now=now,
             )
     _append_event_locked(
         conn,
@@ -3849,7 +3900,7 @@ def record_transition(
             ):
                 return int(existing["id"])
             raise GraphConflict("transition idempotency key stores different facts")
-        _require_job_revision_locked(
+        job_row = _require_job_revision_locked(
             conn, request.job_id, request.expected_job_revision
         )
         _require_attempt_job_locked(conn, request.attempt_id, request.job_id)
@@ -3964,6 +4015,39 @@ def record_transition(
             idempotency_key=f"reliability-transition:{request.attempt_id}:{request.idempotency_key}",
             now=request.created_at,
         )
+        # The user-visible milestone commits in this same transaction, so the
+        # transition cannot exist without its ordered notification intent.
+        terminal_failure = None
+        if request.target_state == "FAILED":
+            failure_row = conn.execute(
+                "SELECT terminal_failure FROM job_attempts WHERE id = ?",
+                (request.attempt_id,),
+            ).fetchone()
+            terminal_failure = (
+                failure_row["terminal_failure"]
+                if failure_row is not None
+                else None
+            )
+        milestone = jnotif.milestone_for_state(
+            request.target_state, attempt_terminal_failure=terminal_failure
+        )
+        if milestone is not None:
+            jnotif.enqueue_locked(
+                conn,
+                job_id=request.job_id,
+                attempt_id=request.attempt_id,
+                job_revision=request.expected_job_revision + 1,
+                milestone=milestone,
+                transition_id=transition_id,
+                payload={
+                    "number": job_row["number"],
+                    "name": job_row["name"],
+                    "target_state": request.target_state,
+                    "failure_class": request.failure_class,
+                    "blocker_code": request.blocker_code,
+                },
+                now=request.created_at,
+            )
     return transition_id
 
 
