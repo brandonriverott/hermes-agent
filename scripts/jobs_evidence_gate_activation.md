@@ -166,3 +166,83 @@ Historical job records are not touched, read, or rewritten by any of this.
   blocking reason. Historical job directories are left untouched.
 - **Nothing here verifies merge, deploy, or live behaviour.** The packet says
   so on its own line, every time.
+
+## Release, parity, and rollback (Task 10 tooling)
+
+The Jobs runtime ships as a **versioned immutable bundle**: a content-addressed
+directory plus a JSON manifest. This is the only supported way to change the
+installed Jobs plugin/runtime/policy set.
+
+Artifact format (`<output-root>/releases/<release-sha>/jobs-release-v1/`):
+
+- `manifest.json` — `schema_version`, `release_sha` (full git HEAD of the
+  source tree), `created_at` / `created_by` (creation metadata), `source`
+  (absolute source root), `files` (exact list with `relpath`, SHA-256
+  `sha256`, `size` per file), and `bundle_digest` (SHA-256 over the canonical
+  manifest content);
+- `files/<relpath>` — byte-identical copies of every release file.
+
+Refusals (all of them safe, none silent):
+
+- **dirty source tree** — uncommitted changes or untracked files;
+- **missing manifest files** — a bundle that does not contain every file its
+  manifest lists;
+- **digest mismatch** — any bundle file (or installed target) whose SHA-256
+  differs from the manifest;
+- **target drift** — in the dry-run validation gate, install check, parity,
+  and rollback: a target whose bytes differ from the expected state is
+  refused, never clobbered;
+- **live Hermes root** — `~/.hermes` / `~/.local` targets are refused until
+  real activation is explicitly decided (Task 11). Dry-run is the default;
+  `--apply` is the only way to mutate a target, and it always backs up every
+  replaced file and writes an activation receipt first.
+
+Build, dry-run activate (default; refuses drift, writes nothing):
+
+```sh
+python scripts/jobs-release-activate.py \
+  --source-root . \
+  --output-root ~/jobs-releases \
+  --root <mac-root> \
+  [--pc-root <pc-root>]
+```
+
+Apply to simulated roots (backup + install + receipt; real live activation is
+Task 11 only):
+
+```sh
+python scripts/jobs-release-activate.py \
+  --source-root . \
+  --output-root ~/jobs-releases \
+  --root <mac-root> --pc-root <pc-root> \
+  --apply
+```
+
+Verify byte-identical install across Mac and PC roots:
+
+```sh
+python scripts/jobs-runtime-parity.py \
+  --bundle ~/jobs-releases/releases/<release-sha>/jobs-release-v1 \
+  --mac-root <mac-root> --pc-root <pc-root>
+```
+
+Roll back to the prior recorded state — the exact rollback command is the
+receipt path printed by the activation tool:
+
+```sh
+python scripts/jobs-release-rollback.py \
+  --root <mac-root> \
+  --receipt <path printed by activation output>
+```
+
+Rollback restores only the targets recorded in the receipt: files that
+existed before activation are restored from backup, files that did not are
+removed, and rollback evidence is written next to the receipt.
+
+### Activation gate (Task 11, stated now)
+
+Real activation must not proceed when any critical Jobs/gateway test is
+skipped — a skip is an unproven activation boundary, not a green result. If a
+live canary fails after activation, roll back immediately with the command
+above and retain the rollback evidence.
+
