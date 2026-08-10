@@ -72,8 +72,20 @@ def resolve_requested_lane(requested_lane: object) -> JobIdentity:
         return _BY_LANE[lane]
     except KeyError as exc:
         raise UnsupportedJobLane(
-            f"unsupported job lane {requested_lane!r}; expected 'claude' or 'codex'"
+            "unsupported job lane; expected exactly 'claude' or 'codex'"
         ) from exc
+
+
+def resolve_canonical_specialist(specialist: object) -> JobIdentity:
+    """Resolve only current canonical specialist names, never migration aliases."""
+
+    if specialist == CLAUDE_SPECIALIST:
+        return _BY_LANE[CLAUDE_REQUESTED_LANE]
+    if specialist == CODEX_SPECIALIST:
+        return _BY_LANE[CODEX_REQUESTED_LANE]
+    raise UnsupportedJobLane(
+        "unsupported Job specialist; expected a canonical execution specialist"
+    )
 
 
 def _field(job: object, name: str) -> Any:
@@ -108,7 +120,7 @@ def effective_identity(job: object) -> JobIdentity:
             continue
         if not isinstance(value, str) or value not in lookup:
             raise UnsupportedJobLane(
-                f"unsupported persisted Job {field} {value!r}"
+                f"persisted Job {field} is unsupported"
             )
         lane = value if field == "requested_lane" else lookup[value]
         candidates.append(lane)

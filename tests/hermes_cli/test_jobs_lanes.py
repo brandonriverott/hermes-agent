@@ -654,8 +654,8 @@ def test_atomic_lane_claim_rechecks_capacity_and_never_overbooks(tmp_path):
     registry = jobs_lanes.load_lane_registry()
     try:
         _record_idle_registry_health(conn, registry)
-        first_job = jdb.create_job(conn, name="first", goal="first")
-        second_job = jdb.create_job(conn, name="second", goal="second")
+        first_job = jdb.create_job(conn, requested_lane="claude", name="first", goal="first")
+        second_job = jdb.create_job(conn, requested_lane="claude", name="second", goal="second")
         first_revision = jdb.get_job(conn, first_job).revision
         second_revision = jdb.get_job(conn, second_job).revision
         first_preflight = _record_passing_preflight(
@@ -710,7 +710,7 @@ def test_three_claims_fill_pc_pool_then_fallback_preserves_executor_and_model(
         claimed = []
         for index in range(3):
             job_id = jdb.create_job(
-                conn, name=f"job {index}", goal=f"goal {index}"
+                conn, requested_lane="claude", name=f"job {index}", goal=f"goal {index}"
             )
             revision = jdb.get_job(conn, job_id).revision
             preflight_id = _record_passing_preflight(
@@ -735,7 +735,7 @@ def test_three_claims_fill_pc_pool_then_fallback_preserves_executor_and_model(
                 )
             )
 
-        fourth_job = jdb.create_job(conn, name="fourth", goal="fourth")
+        fourth_job = jdb.create_job(conn, requested_lane="claude", name="fourth", goal="fourth")
         fallback = _route_from_store(
             conn,
             registry,
@@ -769,7 +769,7 @@ def test_lane_is_not_idle_until_verification_and_cleanup_finish(tmp_path):
     registry = jobs_lanes.load_lane_registry()
     try:
         _record_idle_registry_health(conn, registry)
-        job_id = jdb.create_job(conn, name="cleanup", goal="cleanup")
+        job_id = jdb.create_job(conn, requested_lane="claude", name="cleanup", goal="cleanup")
         revision = jdb.get_job(conn, job_id).revision
         preflight_id = _record_passing_preflight(
             conn, job_id, revision=revision, suffix="cleanup"

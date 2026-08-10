@@ -40,8 +40,8 @@ def _signed(signing_key, *, receipt_id, job_id, attempt_id, state):
 
 
 def _attempt(conn):
-    job_id = jdb.create_job(conn, name="job", goal="goal")
-    claim = jdb.claim_job(conn, worker="worker", lease_seconds=60, job=job_id, now=1)
+    job_id = jdb.create_job(conn, requested_lane="claude", name="job", goal="goal")
+    claim = jdb.claim_job(conn, specialist="claude-builder", worker="worker", lease_seconds=60, job=job_id, now=1)
     attempt_id = jdb.start_attempt(
         conn,
         job_id,
@@ -87,7 +87,7 @@ def _transition(conn, signing_key, *, idempotency_key="transition:queued"):
 def test_reliability_schema_is_additive_and_idempotent(tmp_path):
     path = tmp_path / "jobs.db"
     first = jdb.connect(path)
-    job_id = jdb.create_job(first, name="kept", goal="kept")
+    job_id = jdb.create_job(first, requested_lane="claude", name="kept", goal="kept")
     first.close()
     jdb._INITIALIZED_PATHS.discard(str(path.resolve()))
 
@@ -121,7 +121,7 @@ def test_transition_and_receipt_rollback_together(conn, signing_key):
 
 
 def test_preflight_revision_cas_and_idempotency_are_fail_closed(conn, signing_key):
-    job_id = jdb.create_job(conn, name="job", goal="goal")
+    job_id = jdb.create_job(conn, requested_lane="claude", name="job", goal="goal")
     revision = jdb.get_job(conn, job_id).revision
     record = jdb.PreflightRecord(
         id="p_1",

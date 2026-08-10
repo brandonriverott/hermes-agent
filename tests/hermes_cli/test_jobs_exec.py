@@ -44,18 +44,29 @@ def test_route_is_deterministic_across_calls():
     assert jx.route(specialist="codex-builder") == jx.route(
         specialist="codex-builder"
     )
-    assert jx.route(specialist="gpt-builder") == jx.route(specialist="gpt-builder")
 
 
-@pytest.mark.parametrize("specialist", ["codex-builder", "gpt-builder"])
-def test_route_codex_and_legacy_gpt_alias_share_the_canonical_route(specialist):
-    d = jx.route(specialist=specialist)
+def test_route_codex_builder_is_the_only_active_codex_specialist():
+    d = jx.route(specialist="codex-builder")
     assert d.specialist == "codex-builder"
     assert d.model == "gpt-5.6-sol"
     assert d.effort in jx.EFFORT_TIERS
     # Represented and tested, unreachable until its adapter exists.
     assert d.executable is False
     assert "adapter" in d.reason.lower()
+
+
+@pytest.mark.parametrize(
+    "secretish_alias",
+    ["gpt-builder", "gpt-builder authorization=Bearer secret-route-123456"],
+)
+def test_route_rejects_the_historical_gpt_alias_without_reflecting_it(
+    secretish_alias,
+):
+    with pytest.raises(jx.UnsupportedRouting) as exc:
+        jx.route(specialist=secretish_alias)
+
+    assert secretish_alias not in str(exc.value)
 
 
 def test_route_rejects_an_unknown_specialist():
@@ -115,6 +126,17 @@ def test_validate_execution_requires_the_execution_block():
         jx.validate_execution({"execution": "claude"})
     with pytest.raises(ValueError):
         jx.validate_execution(None)
+
+
+def test_unknown_execution_key_is_not_reflected_in_the_refusal():
+    secret = "authorization=Bearer secret-metadata-123456789"
+    meta = _meta()
+    meta["execution"][secret] = "unused"
+
+    with pytest.raises(ValueError) as exc:
+        jx.validate_execution(meta)
+
+    assert secret not in str(exc.value)
 
 
 @pytest.mark.parametrize(

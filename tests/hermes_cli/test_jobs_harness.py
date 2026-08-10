@@ -25,7 +25,7 @@ def passing_snapshot(conn, tmp_path):
     output.mkdir()
     memory = tmp_path / "memory.md"
     memory.write_text("scoped", encoding="utf-8")
-    job_id = jdb.create_job(conn, name="candidate", goal="goal")
+    job_id = jdb.create_job(conn, requested_lane="claude", name="candidate", goal="goal")
     return harness.PreflightSnapshot(
         job_id=job_id,
         execution_spec_digest="sha256:" + "e" * 64,

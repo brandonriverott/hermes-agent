@@ -61,11 +61,18 @@ def _claimed(
     V2 supersedes V1's tokenless attempt calling: running an attempt means
     holding a current, unexpired claim, so every attempt test starts here.
     """
-    jid = jdb.create_job(c, name=name, goal=goal, specialist=specialist)
+    selected_specialist = specialist or "claude-builder"
+    jid = jdb.create_job(
+        c,
+        requested_lane="claude",
+        name=name,
+        goal=goal,
+        specialist=selected_specialist,
+    )
     claim = jdb.claim_job(
         c,
         worker=worker,
-        specialist=specialist,
+        specialist=selected_specialist,
         job=jid,
         lease_seconds=lease_seconds,
         now=now,
@@ -139,6 +146,7 @@ def test_create_job_identity_and_initial_state(conn):
     goal = "Ship the thing.\n\n  Keep — verbatim: café \U0001f680 & <tags>."
     jid = jdb.create_job(
         conn,
+        requested_lane="claude",
         name="Ship the thing",
         goal=goal,
         specialist="claude-builder",
@@ -161,44 +169,49 @@ def test_create_job_identity_and_initial_state(conn):
 
 
 def test_create_job_defaults_optional_fields(conn):
-    jid = jdb.create_job(conn, name="Minimal", goal="do it")
+    jid = jdb.create_job(conn, requested_lane="claude", name="Minimal", goal="do it")
     job = jdb.get_job(conn, jid)
-    assert job.specialist is None
+    assert (
+        job.requested_lane,
+        job.executor,
+        job.specialist,
+        job.model,
+    ) == ("claude", "claude", "claude-builder", "claude-opus-5")
     assert job.routing_reason is None
     assert job.correlations == []
 
 
 def test_create_job_appends_job_created_event(conn):
-    jid = jdb.create_job(conn, name="X", goal="y")
+    jid = jdb.create_job(conn, requested_lane="claude", name="X", goal="y")
     events = jdb.get_events(conn, jid)
     assert len(events) == 1
     assert events[0]["kind"] == "job_created"
 
 
 def test_numbers_are_permanent_and_monotonic(conn):
-    j1 = jdb.create_job(conn, name="A", goal="a")
-    j2 = jdb.create_job(conn, name="B", goal="b")
-    j3 = jdb.create_job(conn, name="C", goal="c")
+    j1 = jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
+    j2 = jdb.create_job(conn, requested_lane="claude", name="B", goal="b")
+    j3 = jdb.create_job(conn, requested_lane="claude", name="C", goal="c")
     assert [jdb.get_job(conn, j).number for j in (j1, j2, j3)] == [1, 2, 3]
 
 
 def test_empty_name_or_goal_rejected(conn):
     with pytest.raises(ValueError):
-        jdb.create_job(conn, name="   ", goal="has goal")
+        jdb.create_job(conn, requested_lane="claude", name="   ", goal="has goal")
     with pytest.raises(ValueError):
-        jdb.create_job(conn, name="has name", goal="")
+        jdb.create_job(conn, requested_lane="claude", name="has name", goal="")
 
 
 def test_historical_correlations_recorded(conn):
     jid = jdb.create_job(
-        conn, name="Backlog", goal="port card", correlations=["card-123", "card-456"]
+        conn, requested_lane="claude", name="Backlog", goal="port card", correlations=["card-123", "card-456"]
     )
     job = jdb.get_job(conn, jid)
     assert sorted(job.correlations) == ["card-123", "card-456"]
 
 
 def test_resolve_by_number_and_label(conn):
-    jid = jdb.create_job(conn, name="Findable", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="Findable", goal="g")
     job = jdb.get_job(conn, jid)
     assert jdb.get_job(conn, str(job.number)).id == jid
     assert jdb.get_job(conn, job.number).id == jid
@@ -224,7 +237,7 @@ def test_concurrent_connections_never_share_a_number(tmp_path):
         c = jdb.connect(db_path=path)
         try:
             barrier.wait()
-            jid = jdb.create_job(c, name=name, goal="race")
+            jid = jdb.create_job(c, requested_lane="claude", name=name, goal="race")
             n = jdb.get_job(c, jid).number
             with lock:
                 numbers.append(n)
@@ -258,7 +271,7 @@ def test_concurrent_connections_never_share_a_number(tmp_path):
 
 def _job_in(conn, status: str) -> str:
     """Create a job and move it into ``status`` via a valid path."""
-    jid = jdb.create_job(conn, name="T", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="T", goal="g")
     if status == "working":
         return jid
     jdb.transition(conn, jid, status=status, step="building")
@@ -300,7 +313,7 @@ def test_finished_is_terminal(conn):
 
 
 def test_transition_rejects_bad_status_or_step(conn):
-    jid = jdb.create_job(conn, name="T", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="T", goal="g")
     with pytest.raises(ValueError):
         jdb.transition(conn, jid, status="bogus", step="building")
     with pytest.raises(ValueError):
@@ -308,7 +321,7 @@ def test_transition_rejects_bad_status_or_step(conn):
 
 
 def test_transition_appends_ordered_event(conn):
-    jid = jdb.create_job(conn, name="T", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="T", goal="g")
     jdb.transition(
         conn, jid, status="needs_you", step="waiting_for_login", reason="token expired"
     )
@@ -322,7 +335,7 @@ def test_transition_appends_ordered_event(conn):
 
 
 def test_set_step_updates_step_and_appends_event(conn):
-    jid = jdb.create_job(conn, name="T", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="T", goal="g")
     jdb.set_step(conn, jid, "building")
     job = jdb.get_job(conn, jid)
     assert job.status == "working"  # step change never alters public status
@@ -332,7 +345,7 @@ def test_set_step_updates_step_and_appends_event(conn):
 
 
 def test_set_step_rejects_unknown_step(conn):
-    jid = jdb.create_job(conn, name="T", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="T", goal="g")
     with pytest.raises(ValueError):
         jdb.set_step(conn, jid, "teleporting")
 
@@ -451,7 +464,7 @@ def test_receipt_stores_and_retrieves_structured_json(conn):
 
 
 def test_repeated_receipt_idempotency_key_returns_existing(conn):
-    jid = jdb.create_job(conn, name="Build", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="Build", goal="g")
     rid1 = jdb.add_receipt(conn, jid, data={"n": 1}, idempotency_key="k")
     rid2 = jdb.add_receipt(conn, jid, data={"n": 2}, idempotency_key="k")
     assert rid1 == rid2
@@ -464,8 +477,8 @@ def test_repeated_receipt_idempotency_key_returns_existing(conn):
 
 
 def test_same_receipt_key_allowed_on_different_job(conn):
-    j1 = jdb.create_job(conn, name="One", goal="g")
-    j2 = jdb.create_job(conn, name="Two", goal="g")
+    j1 = jdb.create_job(conn, requested_lane="claude", name="One", goal="g")
+    j2 = jdb.create_job(conn, requested_lane="claude", name="Two", goal="g")
     r1 = jdb.add_receipt(conn, j1, data={"x": 1}, idempotency_key="shared")
     r2 = jdb.add_receipt(conn, j2, data={"x": 2}, idempotency_key="shared")
     assert r1 != r2
@@ -474,7 +487,7 @@ def test_same_receipt_key_allowed_on_different_job(conn):
 
 
 def test_repeated_event_idempotency_key_returns_existing(conn):
-    jid = jdb.create_job(conn, name="X", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="X", goal="g")
     e1 = jdb.append_event(conn, jid, "note", data={"a": 1}, idempotency_key="once")
     e2 = jdb.append_event(conn, jid, "note", data={"a": 2}, idempotency_key="once")
     assert e1["id"] == e2["id"]
@@ -484,8 +497,8 @@ def test_repeated_event_idempotency_key_returns_existing(conn):
 
 
 def test_same_event_key_allowed_on_different_job(conn):
-    j1 = jdb.create_job(conn, name="One", goal="g")
-    j2 = jdb.create_job(conn, name="Two", goal="g")
+    j1 = jdb.create_job(conn, requested_lane="claude", name="One", goal="g")
+    j2 = jdb.create_job(conn, requested_lane="claude", name="Two", goal="g")
     jdb.append_event(conn, j1, "note", idempotency_key="shared")
     jdb.append_event(conn, j2, "note", idempotency_key="shared")
     assert [e for e in jdb.get_events(conn, j1) if e["kind"] == "note"]
@@ -495,7 +508,7 @@ def test_same_event_key_allowed_on_different_job(conn):
 def test_receipt_unique_constraint_is_a_real_backstop(conn):
     import sqlite3 as _sqlite3
 
-    jid = jdb.create_job(conn, name="X", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="X", goal="g")
     jdb.add_receipt(conn, jid, data={"n": 1}, idempotency_key="k")
     # Bypassing the helper, a raw duplicate (job_id, key) must be refused by the DB.
     with pytest.raises(_sqlite3.IntegrityError):
@@ -512,7 +525,7 @@ def test_receipt_unique_constraint_is_a_real_backstop(conn):
 
 
 def test_heartbeat_sets_timestamp(conn):
-    jid = jdb.create_job(conn, name="Build", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="Build", goal="g")
     assert jdb.get_job(conn, jid).last_heartbeat_at is None
     jdb.heartbeat(conn, jid, at=1000)
     assert jdb.get_job(conn, jid).last_heartbeat_at == 1000
@@ -521,7 +534,7 @@ def test_heartbeat_sets_timestamp(conn):
 
 
 def test_stale_projection_working_over_threshold(conn):
-    jid = jdb.create_job(conn, name="Build", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="Build", goal="g")
     jdb.heartbeat(conn, jid, at=1000)
     # now (1000+61) exceeds heartbeat + threshold(60): stale.
     proj = jdb.projection(conn, jid, now=1061, stale_threshold=60)
@@ -532,7 +545,7 @@ def test_stale_projection_working_over_threshold(conn):
 
 
 def test_stale_requires_heartbeat_and_positive_threshold(conn):
-    jid = jdb.create_job(conn, name="Build", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="Build", goal="g")
     # No heartbeat yet: never stale.
     assert jdb.projection(conn, jid, now=10_000, stale_threshold=60)["stale"] is False
     jdb.heartbeat(conn, jid, at=1000)
@@ -552,7 +565,7 @@ def test_non_working_never_projects_stale(conn, status):
 
 
 def test_projection_performs_no_mutation(conn):
-    jid = jdb.create_job(conn, name="Build", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="Build", goal="g")
     jdb.heartbeat(conn, jid, at=1000)
 
     def snapshot():
@@ -573,7 +586,7 @@ def test_projection_performs_no_mutation(conn):
 
 def test_transition_repeated_key_same_payload_is_noop(conn):
     """Re-issuing the exact same keyed transition writes no second event."""
-    jid = jdb.create_job(conn, name="T", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="T", goal="g")
     j1 = jdb.transition(conn, jid, status="needs_you", step="building", idempotency_key="k")
     j2 = jdb.transition(conn, jid, status="needs_you", step="building", idempotency_key="k")
     assert j1.status == j2.status == "needs_you"
@@ -588,7 +601,7 @@ def test_transition_repeated_key_different_payload_is_noop(conn):
     ``k``; a second transition with the same key toward ``finished`` must not
     mutate state and must not diverge state from the append-only ledger.
     """
-    jid = jdb.create_job(conn, name="T", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="T", goal="g")
     jdb.transition(conn, jid, status="needs_you", step="building", idempotency_key="k")
     jdb.transition(conn, jid, status="finished", step="complete", idempotency_key="k")
     job = jdb.get_job(conn, jid)
@@ -601,7 +614,7 @@ def test_transition_repeated_key_different_payload_is_noop(conn):
 
 
 def test_set_step_repeated_key_different_payload_is_noop(conn):
-    jid = jdb.create_job(conn, name="T", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="T", goal="g")
     jdb.set_step(conn, jid, "building", idempotency_key="s")
     jdb.set_step(conn, jid, "testing", idempotency_key="s")  # same key, new payload
     job = jdb.get_job(conn, jid)
@@ -624,7 +637,7 @@ def test_concurrent_transitions_never_emit_stale_from(tmp_path):
     """
     path = tmp_path / "jobs.db"
     c0 = jdb.connect(db_path=path)
-    jid = jdb.create_job(c0, name="race", goal="g")
+    jid = jdb.create_job(c0, requested_lane="claude", name="race", goal="g")
     c0.close()
 
     barrier = threading.Barrier(2)
@@ -683,7 +696,7 @@ def test_concurrent_transitions_never_emit_stale_from(tmp_path):
 
 
 def test_start_attempt_rejected_on_finished_job(conn):
-    jid = jdb.create_job(conn, name="Build", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="Build", goal="g")
     jdb.transition(conn, jid, status="finished", step="failed")
     events_before = jdb.get_events(conn, jid)
     with pytest.raises(jdb.InvalidTransition):
@@ -695,7 +708,7 @@ def test_start_attempt_rejected_on_finished_job(conn):
 
 def test_finished_to_finished_still_valid(conn):
     """Terminal finished->finished lifecycle semantics are preserved."""
-    jid = jdb.create_job(conn, name="Build", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="Build", goal="g")
     jdb.transition(conn, jid, status="finished", step="failed")
     jdb.transition(conn, jid, status="finished", step="failed", reason="re-verified")
     assert jdb.get_job(conn, jid).status == "finished"
@@ -708,24 +721,24 @@ def test_finished_to_finished_still_valid(conn):
 
 def test_deleted_number_is_never_reused(conn):
     """A row-level delete must not let a later job reclaim the freed number."""
-    j1 = jdb.create_job(conn, name="A", goal="a")
-    j2 = jdb.create_job(conn, name="B", goal="b")
+    j1 = jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
+    j2 = jdb.create_job(conn, requested_lane="claude", name="B", goal="b")
     assert jdb.get_job(conn, j1).number == 1
     assert jdb.get_job(conn, j2).number == 2
 
     conn.execute("DELETE FROM jobs WHERE id = ?", (j2,))
     conn.commit()
 
-    j3 = jdb.create_job(conn, name="C", goal="c")
+    j3 = jdb.create_job(conn, requested_lane="claude", name="C", goal="c")
     assert jdb.get_job(conn, j3).number == 3  # NOT 2
 
 
 def test_number_allocator_survives_schema_reinit(conn):
     """Re-running the schema script must never reset the monotonic allocator."""
-    jdb.create_job(conn, name="A", goal="a")
-    jdb.create_job(conn, name="B", goal="b")
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
+    jdb.create_job(conn, requested_lane="claude", name="B", goal="b")
     conn.executescript(jdb.SCHEMA_SQL)  # idempotent re-init
-    j3 = jdb.create_job(conn, name="C", goal="c")
+    j3 = jdb.create_job(conn, requested_lane="claude", name="C", goal="c")
     assert jdb.get_job(conn, j3).number == 3
 
 
@@ -757,7 +770,7 @@ def test_opening_early_schema_initializes_allocator(tmp_path):
 
     conn = jdb.connect(db_path=path)
     try:
-        j3 = jdb.create_job(conn, name="C", goal="c")
+        j3 = jdb.create_job(conn, requested_lane="claude", name="C", goal="c")
         # Continues past the existing max; never reissues 1 or 2.
         assert jdb.get_job(conn, j3).number == 3
         numbers = [r["number"] for r in conn.execute("SELECT number FROM jobs ORDER BY number")]
@@ -798,17 +811,17 @@ def test_v2_source_registry_table_exists(conn):
 
 def test_v2_claim_token_never_in_public_job_dict(conn):
     """The claim token is a capability — it must never ride on the Job dict."""
-    jid = jdb.create_job(conn, name="Secret", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="Secret", goal="g")
     assert "claim_token" not in jdb.get_job(conn, jid).to_dict()
 
 
 def test_create_job_starts_at_revision_one(conn):
-    jid = jdb.create_job(conn, name="R", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="R", goal="g")
     assert jdb.get_job(conn, jid).revision == 1
 
 
 def test_state_changing_writes_increment_revision(conn):
-    jid = jdb.create_job(conn, name="R", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="R", goal="g")
     r0 = jdb.get_job(conn, jid).revision
     jdb.transition(conn, jid, status="needs_you", step="building")
     r1 = jdb.get_job(conn, jid).revision
@@ -825,7 +838,7 @@ def test_state_changing_writes_increment_revision(conn):
 
 
 def test_idempotent_transition_does_not_bump_revision(conn):
-    jid = jdb.create_job(conn, name="R", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="R", goal="g")
     jdb.transition(conn, jid, status="needs_you", step="building", idempotency_key="k")
     r1 = jdb.get_job(conn, jid).revision
     # Same key toward a different target is a whole-op no-op: revision unchanged.
@@ -841,7 +854,7 @@ def test_idempotent_transition_does_not_bump_revision(conn):
 
 
 def test_public_append_event_adds_one_event_and_bumps_revision_once(conn):
-    jid = jdb.create_job(conn, name="R", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="R", goal="g")
     before = jdb.get_job(conn, jid).revision
     rows_before = len(jdb.get_events(conn, jid))
     jdb.append_event(conn, jid, "review_probe", data={"probe": True})
@@ -851,7 +864,7 @@ def test_public_append_event_adds_one_event_and_bumps_revision_once(conn):
 
 def test_append_event_failure_leaves_ledger_and_revision_untouched(conn, monkeypatch):
     """Forced failure mid-append: neither the event nor the bump may survive."""
-    jid = jdb.create_job(conn, name="R", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="R", goal="g")
     before = jdb.get_job(conn, jid).revision
     rows_before = len(jdb.get_events(conn, jid))
 
@@ -871,7 +884,7 @@ def test_append_event_failure_leaves_ledger_and_revision_untouched(conn, monkeyp
 
 
 def test_repeated_event_idempotency_key_does_not_bump_revision(conn):
-    jid = jdb.create_job(conn, name="R", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="R", goal="g")
     jdb.append_event(conn, jid, "note", data={"a": 1}, idempotency_key="once")
     r1 = jdb.get_job(conn, jid).revision
     e2 = jdb.append_event(conn, jid, "note", data={"a": 2}, idempotency_key="once")
@@ -908,7 +921,7 @@ def test_concurrent_event_appends_lose_no_event_and_no_revision(tmp_path):
     advances the revision — a lost update would leave the revision short."""
     path = tmp_path / "jobs.db"
     c0 = jdb.connect(db_path=path)
-    jid = jdb.create_job(c0, name="race", goal="g")
+    jid = jdb.create_job(c0, requested_lane="claude", name="race", goal="g")
     r0 = jdb.get_job(c0, jid).revision
     rows0 = len(jdb.get_events(c0, jid))
     c0.close()
@@ -980,7 +993,7 @@ def test_v2_migration_adds_columns_to_early_v1_db(tmp_path):
         job = jdb.get_job(conn, 1)
         assert job is not None and job.name == "A"
         # A new job continues the number line and gets a revision.
-        jid = jdb.create_job(conn, name="B", goal="b")
+        jid = jdb.create_job(conn, requested_lane="claude", name="B", goal="b")
         assert jdb.get_job(conn, jid).number == 2
         assert jdb.get_job(conn, jid).revision == 1
     finally:
@@ -1113,7 +1126,7 @@ def test_migration_reconstructs_ordinals_from_the_parent_chain(tmp_path):
         assert jdb.get_attempt(conn, "a_a")["ordinal"] == 2
         assert jdb.get_attempt(conn, "a_b")["ordinal"] == 3
         # The next real attempt continues the line instead of restarting at 1.
-        claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+        claim = jdb.claim_job(conn, specialist=None, worker="w1", lease_seconds=60)
         aid = jdb.start_attempt(conn, claim.job.id, claim_token=claim.claim_token)
         assert jdb.get_attempt(conn, aid)["ordinal"] == 4
     finally:
@@ -1123,8 +1136,8 @@ def test_migration_reconstructs_ordinals_from_the_parent_chain(tmp_path):
 def test_attempt_ordinal_uniqueness_is_database_enforced(conn):
     import sqlite3 as _sqlite3
 
-    jdb.create_job(conn, name="A", goal="g")
-    claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="g")
+    claim = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60)
     aid = jdb.start_attempt(conn, claim.job.id, claim_token=claim.claim_token)
     ordinal = jdb.get_attempt(conn, aid)["ordinal"]
     with pytest.raises(_sqlite3.IntegrityError):
@@ -1725,8 +1738,10 @@ def test_pre_column_v2_malformed_lineage_stays_unknown(tmp_path, attempts):
 def test_fresh_v2_attempts_store_an_explicit_terminal_failure_value(conn):
     """Nullable is only for unreconstructible history — new writes are explicit."""
     for terminal, expected in ((True, 1), (False, 0)):
-        jdb.create_job(conn, name="A", goal="g")
-        claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+        jdb.create_job(conn, requested_lane="claude", name="A", goal="g")
+        claim = jdb.claim_job(
+            conn, specialist="claude-builder", worker="w1", lease_seconds=60
+        )
         aid = jdb.start_attempt(conn, claim.job.id, claim_token=claim.claim_token)
         # A running attempt has no terminal outcome yet, so it is not "false".
         assert _stored_terminal_failure(conn, aid) is None
@@ -2375,7 +2390,7 @@ def test_start_attempt_refuses_known_contiguous_multiple_roots(tmp_path):
     )
     conn = jdb.connect(db_path=path)
     try:
-        claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+        claim = jdb.claim_job(conn, specialist=None, worker="w1", lease_seconds=60)
         before = _snapshot(conn)
         with pytest.raises(jdb.InvalidTransition) as excinfo:
             jdb.start_attempt(conn, claim.job.id, claim_token=claim.claim_token)
@@ -2409,7 +2424,7 @@ def test_known_contiguous_linear_chain_stays_authoritative(tmp_path):
             ("a_two", 2, 0, "a_one"),
             ("a_three", 3, 0, "a_two"),
         ]
-        claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+        claim = jdb.claim_job(conn, specialist=None, worker="w1", lease_seconds=60)
         aid = jdb.start_attempt(conn, claim.job.id, claim_token=claim.claim_token)
         att = jdb.get_attempt(conn, aid)
         assert (att["ordinal"], att["parent_attempt_id"]) == (4, "a_three")
@@ -2725,7 +2740,7 @@ def test_start_attempt_refuses_a_job_whose_legacy_positions_are_unknown(tmp_path
     _seed_early_v1(path, [("a_x", "succeeded", 10), ("a_y", "succeeded", 20)])
     conn = jdb.connect(db_path=path)
     try:
-        claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+        claim = jdb.claim_job(conn, specialist=None, worker="w1", lease_seconds=60)
         before = _snapshot(conn)
         with pytest.raises(jdb.InvalidTransition) as excinfo:
             jdb.start_attempt(conn, claim.job.id, claim_token=claim.claim_token)
@@ -2743,7 +2758,7 @@ def test_start_attempt_still_continues_a_reconstructible_legacy_history(tmp_path
     )
     conn = jdb.connect(db_path=path)
     try:
-        claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+        claim = jdb.claim_job(conn, specialist=None, worker="w1", lease_seconds=60)
         aid = jdb.start_attempt(
             conn, claim.job.id, claim_token=claim.claim_token,
             parent_attempt_id="a_leaf",
@@ -2766,7 +2781,7 @@ def test_start_attempt_continues_the_chain_when_no_parent_is_named(conn):
     for round_ in range(3):
         if round_:
             token = jdb.claim_job(
-                conn, worker=f"w{round_}", job=jid, lease_seconds=600
+                conn, specialist="claude-builder", worker=f"w{round_}", job=jid, lease_seconds=600
             ).claim_token
         aid = jdb.start_attempt(conn, jid, claim_token=token)
         jdb.finish_attempt(
@@ -2799,7 +2814,7 @@ def test_start_attempt_refuses_a_parent_that_is_not_the_lineage_leaf(conn):
         claim_token=token,
     )
     token = jdb.claim_job(
-        conn, worker="w2", job=jid, lease_seconds=600
+        conn, specialist="claude-builder", worker="w2", job=jid, lease_seconds=600
     ).claim_token
     second = jdb.start_attempt(conn, jid, claim_token=token)
     jdb.finish_attempt(
@@ -2807,7 +2822,7 @@ def test_start_attempt_refuses_a_parent_that_is_not_the_lineage_leaf(conn):
         claim_token=token,
     )
     token = jdb.claim_job(
-        conn, worker="w3", job=jid, lease_seconds=600
+        conn, specialist="claude-builder", worker="w3", job=jid, lease_seconds=600
     ).claim_token
 
     before = _snapshot(conn)
@@ -2824,9 +2839,9 @@ def test_start_attempt_refuses_a_parent_that_is_not_the_lineage_leaf(conn):
 
 
 def test_claim_acquires_oldest_eligible_job_first(conn):
-    j1 = jdb.create_job(conn, name="A", goal="a")
-    jdb.create_job(conn, name="B", goal="b")
-    claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+    j1 = jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
+    jdb.create_job(conn, requested_lane="claude", name="B", goal="b")
+    claim = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60)
     assert claim is not None
     assert claim.job.id == j1  # oldest permanent number wins
     assert claim.job.claimed_by == "w1"
@@ -2837,8 +2852,8 @@ def test_claim_acquires_oldest_eligible_job_first(conn):
 
 def test_claim_token_absent_from_list_show_events(conn):
     claim = None
-    jdb.create_job(conn, name="A", goal="a")
-    claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
+    claim = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60)
     jid = claim.job.id
     # Never on the public dict.
     assert "claim_token" not in jdb.get_job(conn, jid).to_dict()
@@ -2855,8 +2870,8 @@ def test_claim_repr_and_str_never_carry_the_token(conn):
     ``print(claim)``; the token is handed over exactly once, through the
     explicit field the custody flow reads.
     """
-    jdb.create_job(conn, name="A", goal="a")
-    claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
+    claim = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60)
     token = claim.claim_token
     assert token  # still returned programmatically
     assert token not in repr(claim)
@@ -2869,64 +2884,91 @@ def test_claim_repr_and_str_never_carry_the_token(conn):
 
 
 def test_claim_skips_needs_you_and_finished(conn):
-    jdb.create_job(conn, name="A", goal="a")  # will go needs_you
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="a")  # will go needs_you
     jdb.transition(conn, 1, status="needs_you", step="waiting_for_decision")
-    jdb.create_job(conn, name="B", goal="b")  # will go finished
+    jdb.create_job(conn, requested_lane="claude", name="B", goal="b")  # will go finished
     jdb.transition(conn, 2, status="finished", step="failed")
-    assert jdb.claim_job(conn, worker="w1", lease_seconds=60) is None
+    assert jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60) is None
 
 
 def test_claim_requires_executable_step(conn):
-    jid = jdb.create_job(conn, name="A", goal="a")
+    jid = jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
     # Working but parked on a non-executable step: not claimable.
     jdb.set_step(conn, jid, "complete")
-    assert jdb.claim_job(conn, worker="w1", lease_seconds=60) is None
+    assert jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60) is None
 
 
 def test_claim_matches_specialist(conn):
-    jdb.create_job(conn, name="A", goal="a", specialist="claude-builder")
-    jdb.create_job(conn, name="B", goal="b", specialist="codex-builder")
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="a", specialist="claude-builder")
+    jdb.create_job(conn, requested_lane="codex", name="B", goal="b", specialist="codex-builder")
     claim = jdb.claim_job(conn, worker="cx", specialist="codex-builder", lease_seconds=60)
     assert claim is not None and claim.job.number == 2  # skips the claude one
 
 
-def test_claim_unassigned_routing_work(conn):
-    jdb.create_job(conn, name="Routed", goal="a", specialist="claude-builder")
-    jid = jdb.create_job(conn, name="Unrouted", goal="b")  # specialist is None
-    claim = jdb.claim_job(conn, worker="router", lease_seconds=60)  # specialist=None
+def _insert_historical_unassigned_job(conn, *, name, goal):
+    """Seed a genuine pre-identity row without using a current write seam."""
+
+    with jdb.write_txn(conn):
+        conn.execute("UPDATE job_number_seq SET last = last + 1 WHERE id = 1")
+        number = conn.execute(
+            "SELECT last FROM job_number_seq WHERE id = 1"
+        ).fetchone()[0]
+        job_id = f"j_historical_unassigned_{number}"
+        conn.execute(
+            "INSERT INTO jobs "
+            "(id, number, name, goal, status, step, requested_lane, executor, "
+            "specialist, model, routing_reason, created_at, updated_at, revision) "
+            "VALUES (?, ?, ?, ?, 'working', 'routing', NULL, NULL, NULL, NULL, "
+            "NULL, 1, 1, 1)",
+            (job_id, number, name, goal),
+        )
+        conn.execute(
+            "INSERT INTO job_events (job_id, kind, data, created_at) "
+            "VALUES (?, 'job_created', ?, 1)",
+            (job_id, json.dumps({"specialist": None})),
+        )
+    return job_id
+
+
+def test_claim_unassigned_historical_routing_work(conn):
+    jdb.create_job(conn, requested_lane="claude", name="Routed", goal="a", specialist="claude-builder")
+    jid = _insert_historical_unassigned_job(conn, name="Unrouted", goal="b")
+    claim = jdb.claim_job(
+        conn, specialist=None, worker="router", lease_seconds=60
+    )
     assert claim is not None and claim.job.id == jid
     # A specialist request must not pick up unassigned routing work.
-    jdb.create_job(conn, name="AlsoUnrouted", goal="c")
+    _insert_historical_unassigned_job(conn, name="AlsoUnrouted", goal="c")
     assert jdb.claim_job(conn, worker="cx", specialist="codex-builder", lease_seconds=60) is None
 
 
 def test_claim_never_steals_an_active_claim(conn):
-    jdb.create_job(conn, name="A", goal="a")
-    first = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
+    first = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60)
     assert first is not None
     # No other eligible job, and the held claim is not expired → nothing to give.
-    assert jdb.claim_job(conn, worker="w2", lease_seconds=60) is None
+    assert jdb.claim_job(conn, specialist="claude-builder", worker="w2", lease_seconds=60) is None
 
 
 def test_claim_explicit_job_by_number(conn):
-    jdb.create_job(conn, name="A", goal="a")
-    j2 = jdb.create_job(conn, name="B", goal="b")
-    claim = jdb.claim_job(conn, worker="w1", job=2, lease_seconds=60)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
+    j2 = jdb.create_job(conn, requested_lane="claude", name="B", goal="b")
+    claim = jdb.claim_job(conn, specialist="claude-builder", worker="w1", job=2, lease_seconds=60)
     assert claim is not None and claim.job.id == j2
 
 
 def test_claim_rejects_bad_lease(conn):
-    jdb.create_job(conn, name="A", goal="a")
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
     for bad in (0, -5, jdb.MAX_LEASE_SECONDS + 1):
         with pytest.raises(ValueError):
-            jdb.claim_job(conn, worker="w1", lease_seconds=bad)
+            jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=bad)
 
 
 def test_concurrent_claim_gives_one_job_to_one_worker(tmp_path):
     """Two workers race for the single eligible job; exactly one wins it."""
     path = tmp_path / "jobs.db"
     c0 = jdb.connect(db_path=path)
-    jdb.create_job(c0, name="only", goal="g")
+    jdb.create_job(c0, requested_lane="claude", name="only", goal="g")
     c0.close()
 
     barrier = threading.Barrier(2)
@@ -2937,7 +2979,7 @@ def test_concurrent_claim_gives_one_job_to_one_worker(tmp_path):
         c = jdb.connect(db_path=path)
         try:
             barrier.wait()
-            claim = jdb.claim_job(c, worker=name, lease_seconds=60)
+            claim = jdb.claim_job(c, specialist="claude-builder", worker=name, lease_seconds=60)
             with lock:
                 results[name] = claim
         except Exception as exc:  # pragma: no cover - only on real defect
@@ -2978,7 +3020,7 @@ def test_attempt_ordinals_are_permanent_and_per_job(conn):
         conn, a1, status="failed", failure_class="implementation", claim_token=t1
     )
     # A recoverable implementation failure hands the Job back for correction.
-    c2 = jdb.claim_job(conn, worker="w2", job=j1, lease_seconds=600)
+    c2 = jdb.claim_job(conn, specialist="claude-builder", worker="w2", job=j1, lease_seconds=600)
     a2 = jdb.start_attempt(
         conn, j1, claim_token=c2.claim_token, parent_attempt_id=a1
     )
@@ -3002,7 +3044,7 @@ def _chain(c, monkeypatch, entries):
     """
     queue = [aid for aid, _ in entries]
     monkeypatch.setattr(jdb, "_new_attempt_id", lambda: queue.pop(0))
-    jid = jdb.create_job(c, name="Build", goal="g", specialist="claude-builder")
+    jid = jdb.create_job(c, requested_lane="claude", name="Build", goal="g", specialist="claude-builder")
     parent = None
     for _, at in entries:
         claim = jdb.claim_job(
@@ -3131,7 +3173,7 @@ def test_attempt_start_requires_valid_claim_token(conn):
     jdb.finish_attempt(
         conn, aid, status="failed", failure_class="max_turns", claim_token=token
     )
-    jdb.claim_job(conn, worker="w2", job=jid, lease_seconds=600)
+    jdb.claim_job(conn, specialist="claude-builder", worker="w2", job=jid, lease_seconds=600)
     # A wrong token fails closed — no new attempt.
     with pytest.raises(jdb.InvalidClaim):
         jdb.start_attempt(conn, jid, claim_token="not-the-token")
@@ -3139,8 +3181,8 @@ def test_attempt_start_requires_valid_claim_token(conn):
 
 
 def test_attempt_finish_wrong_token_fails_closed(conn):
-    jdb.create_job(conn, name="A", goal="g")
-    claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="g")
+    claim = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60)
     jid = claim.job.id
     aid = jdb.start_attempt(conn, jid, claim_token=claim.claim_token)
     with pytest.raises(jdb.InvalidClaim):
@@ -3153,8 +3195,8 @@ def test_attempt_start_on_claimed_job_requires_token(conn):
     # A claimed Job is under exclusive custody: starting an attempt WITHOUT the
     # token must fail closed. Otherwise a tokenless caller could seize the single
     # running-attempt slot and lock the real claimholder out of its own Job.
-    jdb.create_job(conn, name="A", goal="g")
-    claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="g")
+    claim = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60)
     jid = claim.job.id
     with pytest.raises(jdb.InvalidClaim):
         jdb.start_attempt(conn, jid)  # no token on a claimed Job
@@ -3165,8 +3207,8 @@ def test_attempt_start_on_claimed_job_requires_token(conn):
 
 
 def test_attempt_finish_on_claimed_job_requires_token(conn):
-    jdb.create_job(conn, name="A", goal="g")
-    claim = jdb.claim_job(conn, worker="w1", lease_seconds=60)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="g")
+    claim = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60)
     jid = claim.job.id
     aid = jdb.start_attempt(conn, jid, claim_token=claim.claim_token)
     with pytest.raises(jdb.InvalidClaim):
@@ -3177,7 +3219,7 @@ def test_attempt_finish_on_claimed_job_requires_token(conn):
 def test_attempt_start_requires_a_claim_even_on_an_unclaimed_job(conn):
     # V2 supersedes V1's tokenless attempt calling: running work on a Job means
     # holding custody of it, so an unclaimed Job cannot start an attempt at all.
-    jid = jdb.create_job(conn, name="A", goal="g")
+    jid = jdb.create_job(conn, requested_lane="claude", name="A", goal="g")
     with pytest.raises(jdb.InvalidClaim):
         jdb.start_attempt(conn, jid)
     assert jdb.get_attempts(conn, jid) == []
@@ -3250,9 +3292,9 @@ def test_all_terminal_statuses_accepted(conn, st):
 
 
 def _claim(conn, **kw):
-    jdb.create_job(conn, name=kw.pop("name", "A"), goal=kw.pop("goal", "g"),
+    jdb.create_job(conn, requested_lane="claude", name=kw.pop("name", "A"), goal=kw.pop("goal", "g"),
                    specialist=kw.pop("specialist", None))
-    return jdb.claim_job(conn, worker=kw.pop("worker", "w1"),
+    return jdb.claim_job(conn, specialist="claude-builder", worker=kw.pop("worker", "w1"),
                          lease_seconds=kw.pop("lease_seconds", 60), now=kw.pop("now", 1000))
 
 
@@ -3307,7 +3349,7 @@ def test_release_returns_job_to_working_and_clears_custody(conn):
     assert released.lease_expires_at is None
     assert released.current_attempt_id is None
     # A released Job is immediately claimable again.
-    again = jdb.claim_job(conn, worker="w2", lease_seconds=60, now=1020)
+    again = jdb.claim_job(conn, specialist="claude-builder", worker="w2", lease_seconds=60, now=1020)
     assert again is not None and again.job.id == jid
 
 
@@ -3329,7 +3371,7 @@ def test_release_closes_a_running_attempt_as_cancelled(conn):
     assert att["finished_at"] is not None
     # The next worker can actually run the Job instead of hitting the
     # one-running index forever.
-    again = jdb.claim_job(conn, worker="w2", job=jid, lease_seconds=600)
+    again = jdb.claim_job(conn, specialist="claude-builder", worker="w2", job=jid, lease_seconds=600)
     assert again is not None
     a2 = jdb.start_attempt(conn, jid, claim_token=again.claim_token)
     assert jdb.get_attempt(conn, a2)["status"] == "running"
@@ -3593,10 +3635,10 @@ def test_reviewer_rejection_keeps_job_working_correcting_with_findings(conn):
 
 
 def test_recover_only_recovers_expired_claims(conn):
-    jdb.create_job(conn, name="A", goal="g")
-    jdb.create_job(conn, name="B", goal="g")
-    jdb.claim_job(conn, worker="w1", job=1, lease_seconds=60, now=1000)  # expires 1060
-    c2 = jdb.claim_job(conn, worker="w2", job=2, lease_seconds=60, now=1000)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="g")
+    jdb.create_job(conn, requested_lane="claude", name="B", goal="g")
+    jdb.claim_job(conn, specialist="claude-builder", worker="w1", job=1, lease_seconds=60, now=1000)  # expires 1060
+    c2 = jdb.claim_job(conn, specialist="claude-builder", worker="w2", job=2, lease_seconds=60, now=1000)
     # Keep job 2's lease alive past recovery time (1050 + 3600 = 4650 > 2000).
     jdb.claim_heartbeat(conn, 2, claim_token=c2.claim_token, lease_seconds=3600, now=1050)
 
@@ -3607,8 +3649,8 @@ def test_recover_only_recovers_expired_claims(conn):
 
 
 def test_recover_interrupts_running_attempt_as_infrastructure(conn):
-    jdb.create_job(conn, name="A", goal="g")
-    c = jdb.claim_job(conn, worker="w1", lease_seconds=60, now=1000)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="g")
+    c = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60, now=1000)
     jid = c.job.id
     aid = jdb.start_attempt(conn, jid, claim_token=c.claim_token, now=1010)
     jdb.recover_expired_claims(conn, now=2000)
@@ -3622,8 +3664,8 @@ def test_recover_interrupts_running_attempt_as_infrastructure(conn):
 
 
 def test_recover_returns_to_routing_and_preserves_goal(conn):
-    jdb.create_job(conn, name="A", goal="verbatim goal \U0001f680")
-    c = jdb.claim_job(conn, worker="w1", lease_seconds=60, now=1000)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="verbatim goal \U0001f680")
+    c = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60, now=1000)
     jid = c.job.id
     number = c.job.number
     jdb.set_step(conn, jid, "building")
@@ -3636,8 +3678,8 @@ def test_recover_returns_to_routing_and_preserves_goal(conn):
 
 @pytest.mark.parametrize("step", ["correcting", "reviewing"])
 def test_recover_preserves_correction_review_step(conn, step):
-    jdb.create_job(conn, name="A", goal="g")
-    c = jdb.claim_job(conn, worker="w1", lease_seconds=60, now=1000)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="g")
+    c = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60, now=1000)
     jid = c.job.id
     jdb.set_step(conn, jid, step)
     jdb.recover_expired_claims(conn, now=2000)
@@ -3645,8 +3687,8 @@ def test_recover_preserves_correction_review_step(conn, step):
 
 
 def test_recover_is_idempotent(conn):
-    jdb.create_job(conn, name="A", goal="g")
-    c = jdb.claim_job(conn, worker="w1", lease_seconds=60, now=1000)
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="g")
+    c = jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60, now=1000)
     jid = c.job.id
     jdb.start_attempt(conn, jid, claim_token=c.claim_token, now=1010)
     first = jdb.recover_expired_claims(conn, now=2000)
@@ -3662,7 +3704,7 @@ def test_recover_is_idempotent(conn):
 
 
 def test_recover_does_not_touch_unclaimed_jobs(conn):
-    jdb.create_job(conn, name="A", goal="g")  # never claimed
+    jdb.create_job(conn, requested_lane="claude", name="A", goal="g")  # never claimed
     before = jdb.get_events(conn, 1)
     assert jdb.recover_expired_claims(conn, now=10_000_000) == []
     assert jdb.get_events(conn, 1) == before
@@ -3675,12 +3717,12 @@ def test_recover_does_not_touch_unclaimed_jobs(conn):
 
 def test_intake_creates_then_returns_same_job(conn):
     r1 = jdb.create_or_get_job(
-        conn, source_type="cron", source_key="daily-report",
+        conn, requested_lane="claude", source_type="cron", source_key="daily-report",
         name="Daily report", goal="compile the report",
     )
     assert r1.created is True and r1.conflict is False
     r2 = jdb.create_or_get_job(
-        conn, source_type="cron", source_key="daily-report",
+        conn, requested_lane="claude", source_type="cron", source_key="daily-report",
         name="Daily report", goal="compile the report",
     )
     assert r2.created is False and r2.conflict is False
@@ -3691,11 +3733,11 @@ def test_intake_creates_then_returns_same_job(conn):
 
 def test_intake_changed_payload_is_a_conflict_and_preserves_original(conn):
     r1 = jdb.create_or_get_job(
-        conn, source_type="kanban", source_key="card-9",
+        conn, requested_lane="claude", source_type="kanban", source_key="card-9",
         name="Original name", goal="original goal",
     )
     r2 = jdb.create_or_get_job(
-        conn, source_type="kanban", source_key="card-9",
+        conn, requested_lane="claude", source_type="kanban", source_key="card-9",
         name="Rewritten name", goal="rewritten goal",
     )
     assert r2.job_id == r1.job_id
@@ -3709,10 +3751,10 @@ def test_intake_changed_payload_is_a_conflict_and_preserves_original(conn):
 
 def test_intake_different_source_types_reuse_the_same_key(conn):
     r1 = jdb.create_or_get_job(
-        conn, source_type="cron", source_key="shared-1", name="A", goal="a",
+        conn, requested_lane="claude", source_type="cron", source_key="shared-1", name="A", goal="a",
     )
     r2 = jdb.create_or_get_job(
-        conn, source_type="kanban", source_key="shared-1", name="B", goal="b",
+        conn, requested_lane="claude", source_type="kanban", source_key="shared-1", name="B", goal="b",
     )
     assert r1.created and r2.created
     assert r1.job_id != r2.job_id
@@ -3720,9 +3762,9 @@ def test_intake_different_source_types_reuse_the_same_key(conn):
 
 def test_intake_requires_source_fields(conn):
     with pytest.raises(ValueError):
-        jdb.create_or_get_job(conn, source_type="", source_key="k", name="N", goal="g")
+        jdb.create_or_get_job(conn, requested_lane="claude", source_type="", source_key="k", name="N", goal="g")
     with pytest.raises(ValueError):
-        jdb.create_or_get_job(conn, source_type="cron", source_key="  ", name="N", goal="g")
+        jdb.create_or_get_job(conn, requested_lane="claude", source_type="cron", source_key="  ", name="N", goal="g")
 
 
 def test_intake_on_migrated_early_v1_db(tmp_path):
@@ -3746,11 +3788,11 @@ def test_intake_on_migrated_early_v1_db(tmp_path):
     conn = jdb.connect(db_path=path)
     try:
         r1 = jdb.create_or_get_job(
-            conn, source_type="cron", source_key="daily-1", name="Daily", goal="run",
+            conn, requested_lane="claude", source_type="cron", source_key="daily-1", name="Daily", goal="run",
         )
         assert r1.created is True
         r2 = jdb.create_or_get_job(
-            conn, source_type="cron", source_key="daily-1", name="Daily", goal="run",
+            conn, requested_lane="claude", source_type="cron", source_key="daily-1", name="Daily", goal="run",
         )
         assert r2.created is False and r2.job_id == r1.job_id
     finally:
@@ -3771,7 +3813,7 @@ def test_concurrent_same_source_creates_exactly_one_job(tmp_path):
         try:
             barrier.wait()
             res = jdb.create_or_get_job(
-                c, source_type="cron", source_key="same", name="X", goal="g",
+                c, requested_lane="claude", source_type="cron", source_key="same", name="X", goal="g",
             )
             with lock:
                 results[name] = res
@@ -3957,7 +3999,7 @@ def test_jobs_store_initializes_outside_kanban(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     conn = jdb.connect(tmp_path / "candidate-jobs.db")
     try:
-        job_id = jdb.create_job(conn, name="candidate", goal="prove isolation")
+        job_id = jdb.create_job(conn, requested_lane="claude", name="candidate", goal="prove isolation")
         job = jdb.get_job(conn, job_id)
         assert job.id == job_id
         assert (job.status, job.step) == ("working", "routing")

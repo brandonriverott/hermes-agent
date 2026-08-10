@@ -501,7 +501,7 @@ def test_the_adapter_does_not_touch_the_jobs_database(tmp_path, repo, monkeypatc
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     with jdb.connect_closing() as conn:
-        jid = jdb.create_job(conn, name="untouched", goal="stay put")
+        jid = jdb.create_job(conn, requested_lane="claude", name="untouched", goal="stay put")
         before = jdb.get_job(conn, jid).to_dict()
         events_before = len(jdb.get_events(conn, jid))
 

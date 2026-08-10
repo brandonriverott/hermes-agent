@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from hermes_cli import jobs_adapter_claude as adapter
 from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_dispatch as dispatch
+from hermes_cli import jobs_executors
 from hermes_cli import jobs_graph as graph
 from hermes_cli import jobs_harness as harness
 from hermes_cli import jobs_lanes
@@ -81,7 +82,10 @@ class ReliabilityRig:
         self.memory = tmp_path / "memory.md"
         self.memory.write_text("scoped", encoding="utf-8")
         self.job_id = jdb.create_job(
-            self.conn, name="reliability e2e", goal="prove the sequence"
+            self.conn,
+            name="reliability e2e",
+            goal="prove the sequence",
+            requested_lane="claude",
         )
 
         def passed(_probe_input):
@@ -101,9 +105,11 @@ class ReliabilityRig:
             branch="jobs/reliability-e2e",
             output_parents=(self.output,),
             scoped_memory_paths=(self.memory,),
+            requested_lane="claude",
             lane_id="lane:e2e",
-            executor="fake",
-            model="fake-model",
+            executor="claude",
+            specialist="claude-builder",
+            model="claude-opus-5",
             worktree_parent=self.workspace,
         )
         self.clock = 100
@@ -131,7 +137,9 @@ class ReliabilityRig:
             signer=self.signer,
             verifier=self.verifier,
             worker_id="worker:e2e",
-            executor=executor,
+            executor_registry=jobs_executors.registry.with_reliability_adapters(
+                {"claude": executor}
+            ),
             gate=(
                 (lambda _context, _execution: None)
                 if gate_callback is None

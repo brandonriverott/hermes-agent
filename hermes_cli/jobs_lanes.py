@@ -34,6 +34,10 @@ class InvalidLaneRegistry(ValueError):
     """Raised when a lane registry violates its strict schema or policy."""
 
 
+class InvalidLaneDecision(ValueError):
+    """Raised when a supplied routing decision is not bound to its registry."""
+
+
 @dataclass(frozen=True)
 class HostPolicy:
     id: HostId
@@ -419,6 +423,53 @@ def registry_digest(registry: LaneRegistry) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def validate_lane_decision(
+    registry: LaneRegistry, decision: LaneDecision
+) -> LaneDefinition:
+    """Bind one selected decision to the immutable policy that produced it."""
+
+    if not isinstance(registry, LaneRegistry):
+        raise TypeError("registry must be a LaneRegistry")
+    if not isinstance(decision, LaneDecision):
+        raise InvalidLaneDecision("lane decision has an invalid contract")
+    if decision.status != "SELECTED" or decision.lane_id is None:
+        raise InvalidLaneDecision("lane decision is not selected")
+    if (
+        decision.policy_version != registry.policy_version
+        or decision.policy_digest != registry_digest(registry)
+    ):
+        raise InvalidLaneDecision("lane decision policy is not current")
+    lane = next((item for item in registry.lanes if item.id == decision.lane_id), None)
+    if lane is None:
+        raise InvalidLaneDecision("lane decision references an unknown seat")
+    if (
+        decision.host_id != lane.host_id
+        or decision.executor != lane.executor
+        or not _model_matches(lane, decision.model)
+    ):
+        raise InvalidLaneDecision("lane decision contradicts its registered seat")
+
+    host_preference = {host.id: host.preference for host in registry.hosts}
+    matching = sorted(
+        (
+            item
+            for item in registry.lanes
+            if item.executor == decision.executor
+            and _model_matches(item, decision.model)
+        ),
+        key=lambda item: (host_preference[item.host_id], item.id),
+    )
+    if decision.considered_lane_ids != tuple(item.id for item in matching):
+        raise InvalidLaneDecision("lane decision candidate set is not canonical")
+    if lane.host_id == "pc":
+        expected = (False, "PC_LANE_SELECTED")
+    else:
+        expected = (True, "MAC_FALLBACK_SELECTED")
+    if (decision.fallback_applied, decision.reason_code) != expected:
+        raise InvalidLaneDecision("lane decision selection reason is inconsistent")
+    return lane
 
 
 def _sanitize_safe_value(value: object, *, depth: int = 0) -> JsonValue | None:

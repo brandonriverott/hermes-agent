@@ -14,16 +14,16 @@ The order is the design:
    recovery caller one dead worker parks a Job forever. Doing it here means the
    recovery caller ships with the runner instead of being somebody's cron job to
    remember.
-2. **Refuse before committing.** Metadata validation, routing agreement, and
-   repository/base preflight all happen *after* the claim (so the decision is
-   made about a Job we actually hold) but *before* the attempt starts. A refusal
-   hands custody straight back with :func:`~hermes_cli.jobs_db.release_claim`, so
-   the Job is immediately claimable again and has no burned attempt on it.
+2. **Validate before custody.** Metadata and the selected candidate's complete
+   persisted identity are checked inside atomic claim selection, before its
+   custody update or event. Repository/base and skill preflight then run while
+   custody is held but before an attempt starts; refusal releases the claim
+   without burning an attempt.
 3. **Once an attempt starts, it settles.** Everything before ``start_attempt``
-   can hand custody back and leave no trace; everything after it is a result,
-   including a workspace that could not be built and a receipt that could not be
-   sanitized. A terminal attempt hidden behind ``attempt_id=null`` is a lie the
-   caller cannot detect.
+   can hand custody back without creating an attempt; everything after it is a
+   result, including a workspace that could not be built and a receipt that
+   could not be sanitized. A terminal attempt hidden behind ``attempt_id=null``
+   is a lie the caller cannot detect.
 4. **The attempt is the verdict, settled with its evidence.**
    ``settle_attempt`` writes the terminal status, the Job outcome, the custody
    clear, and the final receipt in *one* transaction. Two transactions would
@@ -41,15 +41,18 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-from hermes_cli import jobs_adapter_claude as adapter
 from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_exec as jx
+from hermes_cli import jobs_execution
+from hermes_cli import jobs_executors
+from hermes_cli import jobs_identity
 from hermes_cli import jobs_loop
 from hermes_cli.jobs_contract import JobEnvelope
 
 # The Claude lane's wall clock. The lease is sized from this, not the other way
 # round, so a dead runner's claim expires shortly after the run could have ended.
 DEFAULT_WALL_CLOCK_SECONDS = 1500
+MAX_PUBLIC_ERROR_BYTES = 512
 
 
 @dataclass(frozen=True)
@@ -119,6 +122,7 @@ def run_once(
     workspace_root,
     worker_id: str,
     execution: Optional[Mapping[str, Any]],
+    executor_registry: Optional[jobs_executors.ExecutorRegistry] = None,
     specialist: Optional[str] = None,
     job: Optional[str] = None,
     wall_clock_seconds: int = DEFAULT_WALL_CLOCK_SECONDS,
@@ -145,6 +149,13 @@ def run_once(
     lease_seconds = jx.lease_for(wall_clock_seconds=wall_clock_seconds)
     base_now = int(time.time()) if now is None else int(now)
     started = time.monotonic()
+    registry = (
+        jobs_executors.production_registry()
+        if executor_registry is None
+        else executor_registry
+    )
+    if not isinstance(registry, jobs_executors.ExecutorRegistry):
+        raise TypeError("executor_registry must be an ExecutorRegistry")
 
     def clock() -> int:
         return base_now + int(time.monotonic() - started)
@@ -169,16 +180,40 @@ def run_once(
             return _refused(
                 "invalid_execution_metadata", recovered=[], error=str(exc),
             )
+        requested_identity = None
         if specialist is not None:
             # claim_job matches this specialist and no other, so the routing
             # answer is already knowable and a Job need never be picked up only
             # to be put straight back down.
             try:
-                jx.require_agreement(jx.route(specialist=specialist), spec)
-            except jx.UnsupportedRouting as exc:
+                requested_identity = jobs_identity.resolve_canonical_specialist(
+                    specialist
+                )
+                registry.require(requested_identity.executor)
+                if spec.model != requested_identity.model:
+                    raise jobs_executors.UnsupportedExecutor(
+                        "approved model contradicts the requested executor"
+                    )
+                registry.require_legacy(requested_identity.executor)
+            except (
+                jobs_identity.UnsupportedJobLane,
+                jobs_executors.UnsupportedExecutor,
+            ) as exc:
                 return _refused(
                     "unsupported_routing", recovered=[], error=str(exc),
                 )
+
+        def validate_candidate(candidate):
+            identity = registry.require_job_identity(candidate)
+            if requested_identity is not None and identity != requested_identity:
+                raise jobs_executors.UnsupportedExecutor(
+                    "candidate Job identity contradicts the selected specialist"
+                )
+            if spec.model != identity.model:
+                raise jobs_executors.UnsupportedExecutor(
+                    "approved model contradicts the persisted Job identity"
+                )
+            registry.require_legacy(identity.executor)
 
         # Recovery first, ownership second. An abandoned request is bound to an
         # attempt, and it is *this* pass that makes that attempt terminal, so
@@ -212,14 +247,21 @@ def run_once(
                 # settled by a racing runner between the read above and here.
                 return _public(reservation.response)
 
-        claim = jdb.claim_job(
-            conn,
-            worker=worker_id,
-            specialist=specialist,
-            job=job,
-            lease_seconds=lease_seconds,
-            now=base_now,
-        )
+        try:
+            claim = jdb.claim_job(
+                conn,
+                worker=worker_id,
+                specialist=specialist,
+                job=job,
+                lease_seconds=lease_seconds,
+                now=base_now,
+                candidate_guard=validate_candidate,
+            )
+        except jobs_executors.UnsupportedExecutor as exc:
+            release_request()
+            return _refused(
+                "unsupported_routing", recovered=recovered, error=str(exc),
+            )
         if claim is None:
             release_request()
             return _refused("nothing_eligible", recovered=recovered)
@@ -240,14 +282,23 @@ def run_once(
             return _refused(reason, recovered=recovered, job=held, error=str(exc))
 
         try:
-            decision = jx.route(specialist=held.specialist)
-            jx.require_agreement(decision, spec)
-        except jx.UnsupportedRouting as exc:
+            identity = registry.require_job_identity(held)
+            if requested_identity is not None and identity != requested_identity:
+                raise jobs_executors.UnsupportedExecutor(
+                    "claimed Job identity contradicts the selected specialist"
+                )
+            if spec.model != identity.model:
+                raise jobs_executors.UnsupportedExecutor(
+                    "approved model contradicts the persisted Job identity"
+                )
+            selected_adapter = registry.require_legacy(identity.executor)
+            route_reason = f"Job persisted with canonical {identity.executor} executor"
+        except jobs_executors.UnsupportedExecutor as exc:
             return refuse("unsupported_routing", exc)
 
         try:
-            adapter.preflight(spec)
-        except adapter.AdapterError as exc:
+            selected_adapter.preflight(spec)
+        except jobs_execution.AdapterError as exc:
             return refuse("preflight_failed", exc)
 
         try:
@@ -255,15 +306,17 @@ def run_once(
             # can resolve is handed straight back rather than run without it. It
             # lands here, beside the other refusals, so it costs no attempt and
             # no provider spend.
-            adapter.preflight_skills(held.skills, name=held.name, goal=held.goal)
-        except adapter.AdapterError as exc:
+            selected_adapter.preflight_skills(
+                held.skills, name=held.name, goal=held.goal
+            )
+        except jobs_execution.AdapterError as exc:
             return refuse("skill_attachment_failed", exc)
 
         attempt_id = jdb.start_attempt(
             conn,
             held.id,
             claim_token=token,
-            specialist=decision.specialist,
+            specialist=identity.specialist,
             repository=spec.repo_path,
             # Persisted now, while it is still an input. After the run nothing
             # left behind can reconstruct which commit this was allowed to
@@ -283,8 +336,8 @@ def run_once(
             attempt_id=attempt_id,
             ordinal=attempt["ordinal"],
             claim_token=token,
-            specialist=decision.specialist,
-            routing_reason=decision.reason,
+            specialist=identity.specialist,
+            routing_reason=route_reason,
             repository=spec.repo_path,
             skills=held.skills,
             # Exactly what was approved, never the caller's raw input.
@@ -336,7 +389,7 @@ def run_once(
                     "ran": True, "recovered": recovered,
                 }),
                 base_commit=spec.base_commit,
-                route=decision.reason,
+                route=route_reason,
                 reason=reason,
                 error=error,
                 now=clock(),
@@ -362,7 +415,7 @@ def run_once(
                     "job_id": held.id,
                     "attempt_id": attempt_id,
                     "ordinal": attempt["ordinal"],
-                    "specialist": decision.specialist,
+                    "specialist": identity.specialist,
                     "repository": spec.repo_path,
                     "base_commit": spec.base_commit,
                     "status": "failed",
@@ -378,7 +431,7 @@ def run_once(
             )
 
         try:
-            outcome = adapter.run_claude_attempt(
+            outcome = selected_adapter.run_attempt(
                 envelope,
                 spec,
                 worker_command=worker_command,
@@ -459,5 +512,25 @@ def _public(record: Mapping[str, Any]) -> dict:
         "job_status": record.get("job_status"),
         "job_step": record.get("job_step"),
         "routing_reason": record.get("routing_reason"),
-        "error": record.get("error"),
+        "error": _public_error(record.get("error")),
     }
+
+
+def _public_error(value: object) -> Optional[str]:
+    """Redact and byte-cap every error crossing the public run boundary."""
+
+    if value is None:
+        return None
+    cleaned = jx.redact_secrets(str(value))
+    encoded = cleaned.encode("utf-8")
+    if len(encoded) <= MAX_PUBLIC_ERROR_BYTES:
+        return cleaned
+    marker = "…[truncated]"
+    budget = MAX_PUBLIC_ERROR_BYTES - len(marker.encode("utf-8"))
+    prefix = encoded[:budget]
+    while prefix:
+        try:
+            return prefix.decode("utf-8") + marker
+        except UnicodeDecodeError:
+            prefix = prefix[:-1]
+    return marker

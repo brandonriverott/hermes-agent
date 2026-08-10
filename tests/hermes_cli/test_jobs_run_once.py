@@ -20,8 +20,11 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import jobs as jobs_cli
+from hermes_cli import jobs_adapter_claude as claude_adapter
 from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_exec as jx
+from hermes_cli import jobs_executors as executors
+from hermes_cli import jobs_identity as identity
 from hermes_cli import jobs_run
 
 
@@ -112,9 +115,17 @@ def _execution(repo_path, base, **overrides):
     return {"execution": execution}
 
 
-def _make_job(name="Ship it", specialist="claude-builder"):
+def _make_job(
+    name="Ship it", specialist="claude-builder", requested_lane="claude"
+):
     with jdb.connect_closing() as conn:
-        jid = jdb.create_job(conn, name=name, goal="do the work", specialist=specialist)
+        jid = jdb.create_job(
+            conn,
+            name=name,
+            goal="do the work",
+            specialist=specialist,
+            requested_lane=requested_lane,
+        )
         return jdb.get_job(conn, jid)
 
 
@@ -135,6 +146,35 @@ def _run_once(tmp_path, repo_path, base, worker=None, **kwargs):
 def _events(job_id):
     with jdb.connect_closing() as conn:
         return [e["kind"] for e in jdb.get_events(conn, job_id)]
+
+
+def _store_snapshot(job_id):
+    """Every durable row a pre-attempt routing refusal must leave untouched."""
+
+    with jdb.connect_closing() as conn:
+        return {
+            "job": dict(
+                conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            ),
+            "events": [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM job_events WHERE job_id = ? ORDER BY id", (job_id,)
+                )
+            ],
+            "attempts": [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM job_attempts WHERE job_id = ? ORDER BY id", (job_id,)
+                )
+            ],
+            "receipts": [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM job_receipts WHERE job_id = ? ORDER BY id", (job_id,)
+                )
+            ],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -481,21 +521,302 @@ def test_a_missing_repository_fails_closed(home, tmp_path, repo):
     _assert_clean_refusal(job, res, "preflight_failed")
 
 
-def test_a_specialist_with_no_adapter_fails_closed(home, tmp_path, repo):
+def _neutral_fake_adapter(name, calls, *, forbidden=False):
+    """Independent provider fake: no callable delegates to another provider."""
+
+    def record(stage):
+        calls.append((name, stage))
+        if forbidden:
+            raise AssertionError(f"wrong provider invoked at {stage}")
+
+    def preflight(_spec):
+        record("preflight")
+
+    def preflight_skills(_skills, **_kwargs):
+        record("preflight_skills")
+        return ()
+
+    def run_attempt(_envelope, spec, **_kwargs):
+        record("run_attempt")
+        return types.SimpleNamespace(
+            status="failed",
+            failure_class="implementation",
+            repository=spec.repo_path,
+            branch=None,
+            worktree=None,
+            commit=None,
+            receipt={"status": "failed", "failure_class": "implementation"},
+        )
+
+    return executors.LegacyExecutorAdapter(
+        name=name,
+        preflight=preflight,
+        preflight_skills=preflight_skills,
+        run_attempt=run_attempt,
+    )
+
+
+@pytest.mark.parametrize("lane", ["claude", "codex"])
+def test_run_once_invokes_only_the_persisted_executor(
+    home, tmp_path, repo, lane
+):
     path, base = repo
-    job = _make_job(specialist="gpt-builder")
+    resolved = identity.resolve_requested_lane(lane)
+    _make_job(
+        specialist=resolved.specialist,
+        requested_lane=resolved.requested_lane,
+    )
+    calls: list[tuple[str, str]] = []
+    other = "codex" if lane == "claude" else "claude"
+    registry = executors.registry.with_legacy_adapters(
+        {
+            lane: _neutral_fake_adapter(lane, calls),
+            other: _neutral_fake_adapter(other, calls, forbidden=True),
+        }
+    )
+
+    result = _run_once(
+        tmp_path,
+        path,
+        base,
+        specialist=resolved.specialist,
+        execution=_execution(
+            path,
+            base,
+            model=resolved.model,
+            effort="max" if lane == "claude" else "high",
+        ),
+        executor_registry=registry,
+    )
+
+    assert result["ran"] is True
+    assert calls == [
+        (lane, "preflight"),
+        (lane, "preflight_skills"),
+        (lane, "run_attempt"),
+    ]
+
+
+def test_a_canonical_codex_job_with_no_installed_adapter_fails_closed(
+    home, tmp_path, repo, monkeypatch
+):
+    path, base = repo
+    job = _make_job(specialist="codex-builder", requested_lane="codex")
+    claude_calls: list[str] = []
+
+    def forbidden(stage):
+        def call(*_args, **_kwargs):
+            claude_calls.append(stage)
+            raise AssertionError(f"Claude {stage} must not serve Codex")
+
+        return call
+
+    monkeypatch.setattr(claude_adapter, "preflight", forbidden("preflight"))
+    monkeypatch.setattr(
+        claude_adapter, "preflight_skills", forbidden("preflight_skills")
+    )
+    monkeypatch.setattr(
+        claude_adapter, "run_claude_attempt", forbidden("run_attempt")
+    )
     res = _run_once(
-        tmp_path, path, base, specialist="gpt-builder",
+        tmp_path, path, base, specialist="codex-builder",
         execution=_execution(path, base, model="gpt-5.6-sol", effort="high"),
     )
     _assert_clean_refusal(job, res, "unsupported_routing")
+    assert claude_calls == []
+
+
+def test_contradictory_persisted_identity_fails_before_provider_invocation(
+    home, tmp_path, repo
+):
+    path, base = repo
+    job = _make_job(requested_lane="claude")
+    with jdb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE jobs SET model = 'gpt-5.6-sol' WHERE id = ?", (job.id,)
+        )
+        conn.commit()
+    calls: list[tuple[str, str]] = []
+    registry = executors.registry.with_legacy_adapters(
+        {
+            "claude": _neutral_fake_adapter("claude", calls),
+            "codex": _neutral_fake_adapter("codex", calls),
+        }
+    )
+
+    res = _run_once(
+        tmp_path,
+        path,
+        base,
+        executor_registry=registry,
+    )
+
+    _assert_clean_refusal(job, res, "unsupported_routing")
+    assert calls == []
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_invalid_candidate_identity_is_refused_before_custody_or_any_write(
+    home, tmp_path, repo, missing
+):
+    path, base = repo
+    job = _make_job()
+    with jdb.connect_closing() as conn:
+        if missing:
+            conn.execute(
+                "UPDATE jobs SET requested_lane = NULL, executor = NULL, "
+                "specialist = NULL, model = NULL WHERE id = ?",
+                (job.id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET executor = 'codex' WHERE id = ?", (job.id,)
+            )
+        conn.commit()
+        corrupted = jdb.get_job(conn, job.id)
+    before = _store_snapshot(job.id)
+    calls: list[tuple[str, str]] = []
+    registry = executors.registry.with_legacy_adapters(
+        {
+            "claude": _neutral_fake_adapter("claude", calls),
+            "codex": _neutral_fake_adapter("codex", calls),
+        }
+    )
+
+    result = _run_once(
+        tmp_path,
+        path,
+        base,
+        specialist=None if missing else "claude-builder",
+        executor_registry=registry,
+    )
+
+    assert result["ran"] is False
+    assert result["reason"] == "unsupported_routing"
+    assert calls == []
+    assert _store_snapshot(job.id) == before
+    assert corrupted.revision == before["job"]["revision"]
+
+
+def test_public_refusals_redact_secrets_and_cap_utf8_bytes_without_mutation(
+    home, tmp_path, repo
+):
+    path, base = repo
+    job = _make_job()
+    secret = "sk-super-secret-value-1234567890"
+    hostile_key = "authorization=" + secret + ("\N{SNOWMAN}" * 1000)
+    execution = _execution(path, base)
+    execution["execution"][hostile_key] = "ignored"
+    before = _store_snapshot(job.id)
+    calls: list[tuple[str, str]] = []
+    registry = executors.registry.with_legacy_adapters(
+        {
+            "claude": _neutral_fake_adapter("claude", calls),
+            "codex": _neutral_fake_adapter("codex", calls),
+        }
+    )
+
+    result = _run_once(
+        tmp_path,
+        path,
+        base,
+        execution=execution,
+        executor_registry=registry,
+    )
+
+    assert result["ran"] is False
+    assert result["reason"] == "invalid_execution_metadata"
+    assert secret not in result["error"]
+    assert len(result["error"].encode("utf-8")) <= 512
+    assert calls == []
+    assert _store_snapshot(job.id) == before
+
+
+def test_long_secret_shaped_caller_specialist_is_bounded_without_custody(
+    home, tmp_path, repo
+):
+    path, base = repo
+    job = _make_job()
+    secret = "sk-caller-specialist-secret-123456789"
+    hostile_specialist = "authorization=Bearer " + secret + ("\N{SNOWMAN}" * 1000)
+    before = _store_snapshot(job.id)
+    calls: list[tuple[str, str]] = []
+    registry = executors.registry.with_legacy_adapters(
+        {
+            "claude": _neutral_fake_adapter("claude", calls),
+            "codex": _neutral_fake_adapter("codex", calls),
+        }
+    )
+
+    result = _run_once(
+        tmp_path,
+        path,
+        base,
+        specialist=hostile_specialist,
+        executor_registry=registry,
+    )
+
+    assert result["ran"] is False
+    assert result["reason"] == "unsupported_routing"
+    assert secret not in result["error"]
+    assert len(result["error"].encode("utf-8")) <= 512
+    assert calls == []
+    assert _store_snapshot(job.id) == before
+
+
+def test_public_error_cap_is_deterministic_utf8_bytes():
+    raw = "safe error " + ("\N{SNOWMAN}" * 1000)
+
+    first = jobs_run._public({"ran": False, "error": raw})["error"]
+    second = jobs_run._public({"ran": False, "error": raw})["error"]
+
+    assert first == second
+    assert first.endswith("…[truncated]")
+    assert len(first.encode("utf-8")) <= jobs_run.MAX_PUBLIC_ERROR_BYTES
+
+
+def test_corrupted_secret_shaped_identity_is_not_reflected_or_claimed(
+    home, tmp_path, repo
+):
+    path, base = repo
+    job = _make_job()
+    secret = "Bearer sk-secret-persisted-123456789"
+    with jdb.connect_closing() as conn:
+        conn.execute("UPDATE jobs SET executor = ? WHERE id = ?", (secret, job.id))
+        conn.commit()
+    before = _store_snapshot(job.id)
+    calls: list[tuple[str, str]] = []
+    registry = executors.registry.with_legacy_adapters(
+        {
+            "claude": _neutral_fake_adapter("claude", calls),
+            "codex": _neutral_fake_adapter("codex", calls),
+        }
+    )
+
+    result = _run_once(
+        tmp_path, path, base, executor_registry=registry
+    )
+
+    assert result["ran"] is False
+    assert secret not in result["error"]
+    assert len(result["error"].encode("utf-8")) <= 512
+    assert calls == []
+    assert _store_snapshot(job.id) == before
 
 
 def test_an_unassigned_legacy_job_has_no_implicit_claude_route(
     home, tmp_path, repo
 ):
     path, base = repo
-    job = _make_job(specialist=None)
+    job = _make_job()
+    with jdb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE jobs SET requested_lane = NULL, executor = NULL, "
+            "specialist = NULL, model = NULL WHERE id = ?",
+            (job.id,),
+        )
+        conn.commit()
+        job = jdb.get_job(conn, job.id)
     res = _run_once(tmp_path, path, base, specialist=None)
     _assert_clean_refusal(job, res, "unsupported_routing")
 
@@ -582,13 +903,19 @@ def test_the_claim_token_is_absent_from_failure_text(home, tmp_path, repo, monke
     monkeypatch.setattr(jobs_run.jdb, "claim_job", spy)
     # An adapter that blows up mid-run: the reported error text is the most
     # likely place for a capability to ride out on.
-    monkeypatch.setattr(
-        jobs_run.adapter, "run_claude_attempt",
-        lambda envelope, spec, **kw: (_ for _ in ()).throw(
-            RuntimeError(f"exploded handling {envelope!r}")
-        ),
+    registry = executors.registry.with_legacy_adapters(
+        {
+            "claude": executors.LegacyExecutorAdapter(
+                name="claude",
+                preflight=claude_adapter.preflight,
+                preflight_skills=claude_adapter.preflight_skills,
+                run_attempt=lambda envelope, spec, **kw: (_ for _ in ()).throw(
+                    RuntimeError(f"exploded handling {envelope!r}")
+                ),
+            )
+        }
     )
-    res = _run_once(tmp_path, path, base)
+    res = _run_once(tmp_path, path, base, executor_registry=registry)
 
     # The attempt started, so it settled — with the failure text on it.
     assert res["ran"] is True
@@ -884,7 +1211,9 @@ def test_a_different_request_id_is_not_a_replay(home, tmp_path, repo):
     assert first["job"]["id"] != second["job"]["id"]
 
 
-def _replay_is_exact(tmp_path, path, base, job, request_id, env):
+def _replay_is_exact(
+    tmp_path, path, base, job, request_id, env, executor_registry=None
+):
     """Run twice under one request id; return ``(first, second)``.
 
     Asserts the whole point in between: the second call is a read. Every one of
@@ -892,11 +1221,25 @@ def _replay_is_exact(tmp_path, path, base, job, request_id, env):
     short-circuit runs a *second* real attempt — which is exactly what the
     counters here would catch.
     """
-    first = _run_once(tmp_path, path, base, request_id=request_id, extra_env=env)
+    first = _run_once(
+        tmp_path,
+        path,
+        base,
+        request_id=request_id,
+        extra_env=env,
+        executor_registry=executor_registry,
+    )
     with jdb.connect_closing() as conn:
         events = jdb.get_events(conn, job.id)
         revision = jdb.get_job(conn, job.id).revision
-    second = _run_once(tmp_path, path, base, request_id=request_id, extra_env=env)
+    second = _run_once(
+        tmp_path,
+        path,
+        base,
+        request_id=request_id,
+        extra_env=env,
+        executor_registry=executor_registry,
+    )
     with jdb.connect_closing() as conn:
         assert jdb.get_events(conn, job.id) == events
         assert jdb.get_job(conn, job.id).revision == revision
@@ -917,11 +1260,21 @@ def test_a_setup_failure_replays_exactly_for_the_same_request_id(
         adapter_calls.append(envelope.attempt_id)
         raise RuntimeError("worktree setup failed: no space left on device")
 
-    monkeypatch.setattr(jobs_run.adapter, "run_claude_attempt", explode)
+    registry = executors.registry.with_legacy_adapters(
+        {
+            "claude": executors.LegacyExecutorAdapter(
+                name="claude",
+                preflight=claude_adapter.preflight,
+                preflight_skills=claude_adapter.preflight_skills,
+                run_attempt=explode,
+            )
+        }
+    )
 
     first, second = _replay_is_exact(
         tmp_path, path, base, job, "lost-setup",
         {"JOBS_TEST_LAUNCH_LOG": str(launches)},
+        executor_registry=registry,
     )
 
     assert first["ran"] is True and first["reason"] == "adapter_error"
@@ -938,7 +1291,7 @@ def test_an_unsafe_receipt_replays_exactly_for_the_same_request_id(
     path, base = repo
     job = _make_job()
     launches = tmp_path / "launches.log"
-    real = jobs_run.adapter.run_claude_attempt
+    real = claude_adapter.run_claude_attempt
 
     def poisoned(envelope, spec, **kw):
         # A real worker really runs; only the evidence coming back is unusable.
@@ -947,11 +1300,21 @@ def test_an_unsafe_receipt_replays_exactly_for_the_same_request_id(
             outcome, receipt={**outcome.receipt, "worker_password": "hunter2"}
         )
 
-    monkeypatch.setattr(jobs_run.adapter, "run_claude_attempt", poisoned)
+    registry = executors.registry.with_legacy_adapters(
+        {
+            "claude": executors.LegacyExecutorAdapter(
+                name="claude",
+                preflight=claude_adapter.preflight,
+                preflight_skills=claude_adapter.preflight_skills,
+                run_attempt=poisoned,
+            )
+        }
+    )
 
     first, second = _replay_is_exact(
         tmp_path, path, base, job, "lost-receipt",
         {"JOBS_TEST_LAUNCH_LOG": str(launches)},
+        executor_registry=registry,
     )
 
     assert first["ran"] is True and first["reason"] == "unsafe_receipt"
@@ -1005,7 +1368,7 @@ def test_run_once_cli_exits_non_zero_for_unsupported_routing(
     home, tmp_path, repo, capsys
 ):
     path, base = repo
-    job = _make_job(specialist="gpt-builder")
+    job = _make_job(specialist="codex-builder", requested_lane="codex")
     ef = tmp_path / "execution.json"
     ef.write_text(
         json.dumps(_execution(path, base, model="gpt-5.6-sol", effort="high"))

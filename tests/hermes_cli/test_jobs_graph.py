@@ -67,9 +67,10 @@ class GraphRig:
         self.verifier = graph.ReceiptVerifier(
             trusted_keys={"lane:test:v1": self.private_key.public_key()}
         )
-        self.job_id = jdb.create_job(conn, name="graph", goal="goal")
+        self.job_id = jdb.create_job(conn, requested_lane="claude", name="graph", goal="goal")
         claim = jdb.claim_job(
             conn,
+            specialist="claude-builder",
             worker="worker",
             lease_seconds=60,
             job=self.job_id,
@@ -340,6 +341,7 @@ def test_retryable_failed_edge_closes_attempt_before_next_attempt(graph_rig):
     assert first["status"] == "failed"
     claim = jdb.claim_job(
         graph_rig.conn,
+        specialist="claude-builder",
         worker="retry-worker",
         lease_seconds=60,
         job=graph_rig.job_id,

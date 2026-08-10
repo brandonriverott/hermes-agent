@@ -48,8 +48,10 @@ def test_requested_lane_resolves_to_one_frozen_identity(lane, expected):
     "lane", [None, "", "   ", "kat", "kat-builder", "gpt", "unknown"]
 )
 def test_requested_lane_rejects_every_non_public_lane(lane):
-    with pytest.raises(UnsupportedJobLane):
+    with pytest.raises(UnsupportedJobLane) as exc:
         resolve_requested_lane(lane)
+    if isinstance(lane, str) and lane.strip():
+        assert repr(lane) not in str(exc.value)
 
 
 @pytest.mark.parametrize("specialist", ["gpt-builder", "codex-builder"])
@@ -94,3 +96,18 @@ def test_effective_identity_rejects_contradictory_persisted_fields():
     )
     with pytest.raises(UnsupportedJobLane, match="contradictory"):
         effective_identity(job)
+
+
+def test_effective_identity_does_not_reflect_corrupted_persisted_values():
+    secret = "authorization=Bearer persisted-secret-123456789"
+    job = SimpleNamespace(
+        requested_lane="claude",
+        executor=secret,
+        specialist="claude-builder",
+        model="claude-opus-5",
+    )
+
+    with pytest.raises(UnsupportedJobLane) as exc:
+        effective_identity(job)
+
+    assert secret not in str(exc.value)

@@ -41,7 +41,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
 
 from hermes_cli import jobs_identity as ji
 from hermes_cli.sqlite_util import add_column_if_missing, write_txn
@@ -1347,10 +1347,8 @@ def get_events(conn: sqlite3.Connection, id_or_number) -> List[dict]:
 
 def _creation_identity(
     *, requested_lane: Optional[str], specialist: Optional[str]
-) -> Optional[ji.JobIdentity]:
-    """Resolve a canonical new-write identity while preserving legacy callers."""
-    if requested_lane is None:
-        return None
+) -> ji.JobIdentity:
+    """Resolve the mandatory canonical identity for every current write."""
     identity = ji.resolve_requested_lane(requested_lane)
     if specialist is not None and specialist != identity.specialist:
         raise ji.UnsupportedJobLane(
@@ -1399,7 +1397,6 @@ def create_job(
             conn,
             name=clean_name,
             goal=goal,
-            specialist=specialist,
             identity=identity,
             routing_reason=routing_reason,
             correlations=correlations,
@@ -1413,8 +1410,7 @@ def _create_job_locked(
     *,
     name: str,
     goal: str,
-    specialist: Optional[str],
-    identity: Optional[ji.JobIdentity],
+    identity: ji.JobIdentity,
     routing_reason: Optional[str],
     correlations: Optional[Iterable[str]],
     now: Optional[int] = None,
@@ -1441,10 +1437,10 @@ def _create_job_locked(
 
     declared = None if skills is None else list(jskills.parse_declared_skills(skills))
     skills_json = None if declared is None else json.dumps(declared, ensure_ascii=False)
-    requested_lane = None if identity is None else identity.requested_lane
-    executor = None if identity is None else identity.executor
-    persisted_specialist = specialist if identity is None else identity.specialist
-    model = None if identity is None else identity.model
+    requested_lane = identity.requested_lane
+    executor = identity.executor
+    persisted_specialist = identity.specialist
+    model = identity.model
 
     # Allocate through the durable monotonic sequence, never MAX(number)+1: a
     # deleted Job row must not free its number for reuse. Atomic with the INSERT
@@ -1711,9 +1707,7 @@ def reassign_specialist(
             "reassignment must name claude-builder or codex-builder"
         )
     specialist = specialist.strip()
-    # ``gpt-builder`` is accepted only as a historical input alias.  The target
-    # written below is always the canonical Codex identity.
-    target_identity = ji.effective_identity({"specialist": specialist})
+    target_identity = ji.resolve_canonical_specialist(specialist)
     target = {
         "requested_lane": target_identity.requested_lane,
         "executor": target_identity.executor,
@@ -4525,7 +4519,6 @@ def claim_selected_lane(
 ) -> PlacedClaim:
     """Atomically bind fresh PASS/IDLE health, Job custody, and one lane seat."""
 
-    from fnmatch import fnmatchcase
     from hermes_cli import jobs_lanes
 
     if not isinstance(decision, jobs_lanes.LaneDecision):
@@ -4542,16 +4535,9 @@ def claim_selected_lane(
         raise ValueError("preflight_id must not be empty")
 
     registry = jobs_lanes.load_lane_registry()
-    policy_digest = jobs_lanes.registry_digest(registry)
-    lane = next((item for item in registry.lanes if item.id == lane_id), None)
-    if (
-        lane is None
-        or decision.policy_version != registry.policy_version
-        or decision.policy_digest != policy_digest
-        or decision.host_id != lane.host_id
-        or decision.executor != lane.executor
-        or not any(fnmatchcase(decision.model, pattern) for pattern in lane.model_patterns)
-    ):
+    try:
+        jobs_lanes.validate_lane_decision(registry, decision)
+    except jobs_lanes.InvalidLaneDecision:
         return _placed_refusal(lane_id, "POLICY_RACE")
 
     token = _new_claim_token()
@@ -5018,13 +5004,16 @@ def claim_job(
     specialist: Optional[str] = None,
     job=None,
     now: Optional[int] = None,
+    candidate_guard: Optional[Callable[[Job], None]] = None,
 ) -> Optional[Claim]:
     """Atomically claim one eligible Job and return its :class:`Claim`.
 
     The whole select-and-claim runs in one IMMEDIATE transaction, so two racing
     workers can never both win the same Job: the second serializes behind the
-    first and re-reads the now-claimed row as ineligible. Returns ``None`` when
-    nothing eligible is available (never an error — the caller polls).
+    first and re-reads the now-claimed row as ineligible. ``candidate_guard`` is
+    invoked on the selected row inside that transaction, before the custody
+    update or event; a refusal rolls back with no Job mutation. Returns ``None``
+    when nothing eligible is available (never an error — the caller polls).
     """
     worker = str(worker or "").strip()
     if not worker:
@@ -5037,6 +5026,11 @@ def claim_job(
         row = _select_claimable_locked(conn, specialist=specialist, job=job)
         if row is None:
             return None
+        candidate = _attach_correlations(conn, _job_from_row(row))
+        if candidate_guard is not None:
+            if not callable(candidate_guard):
+                raise TypeError("candidate_guard must be callable")
+            candidate_guard(candidate)
         jid = row["id"]
         expires = now + lease_seconds
         conn.execute(
@@ -5381,7 +5375,7 @@ def create_or_get_job(
             conflict = job is not None and (
                 job.name != clean_name or job.goal != goal
             )
-            if job is not None and identity is not None:
+            if job is not None:
                 try:
                     conflict = conflict or ji.effective_identity(job) != identity
                 except ji.UnsupportedJobLane:
@@ -5392,7 +5386,6 @@ def create_or_get_job(
             conn,
             name=clean_name,
             goal=goal,
-            specialist=specialist,
             identity=identity,
             routing_reason=routing_reason,
             correlations=correlations,

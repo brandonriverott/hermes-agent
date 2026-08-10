@@ -22,8 +22,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from hermes_cli import jobs_adapter_claude as adapter
 from hermes_cli import jobs_db as jdb
+from hermes_cli import jobs_execution
+from hermes_cli import jobs_executors
 from hermes_cli import jobs_graph as graph
 from hermes_cli import jobs_harness as harness
 from hermes_cli import jobs_loop
@@ -100,7 +101,7 @@ def _header_values(goal: str) -> dict[str, str]:
 
         if key not in LEGACY_KEYS:
             if _HEADER_KEY_RE.fullmatch(key):
-                _refuse("unknown_key", key, f"unsupported metadata key {key}")
+                _refuse("unknown_key", "UNKNOWN", "unsupported metadata key")
             if started:
                 break
             continue
@@ -161,7 +162,7 @@ def parse_legacy_execution_header(goal: str) -> LegacyExecutionHeader:
         _refuse(
             "invalid_repo_path",
             "REPO_PATH",
-            f"REPO_PATH must be absolute: {repo_path!r}",
+            "REPO_PATH must be absolute",
         )
 
     base_commit = _required(values, "BASE_COMMIT")
@@ -177,7 +178,7 @@ def parse_legacy_execution_header(goal: str) -> LegacyExecutionHeader:
         _refuse(
             "unsupported_value",
             "EFFORT",
-            f"unsupported EFFORT value {effort!r}",
+            "unsupported EFFORT value",
         )
 
     workspace_kind = values.get("WORKSPACE_KIND", "worktree")
@@ -185,13 +186,13 @@ def parse_legacy_execution_header(goal: str) -> LegacyExecutionHeader:
         _refuse(
             "unsupported_value",
             "WORKSPACE_KIND",
-            f"unsupported WORKSPACE_KIND value {workspace_kind!r}",
+            "unsupported WORKSPACE_KIND value",
         )
 
     return LegacyExecutionHeader(
         repo_path=repo_path,
         base_commit=base_commit,
-        model=values.get("MODEL", "claude-opus-5"),
+        model=_required(values, "MODEL"),
         effort=effort,
         max_turns=_max_turns(values.get("MAX_TURNS", "120")),
         workspace_kind=workspace_kind,
@@ -209,8 +210,10 @@ class DispatchSpec:
     branch: str
     output_parents: tuple[Path, ...]
     scoped_memory_paths: tuple[Path, ...]
+    requested_lane: str
     lane_id: str
     executor: str
+    specialist: str
     model: str
     worktree_parent: Optional[Path] = None
     lane_root: Optional[Path] = None
@@ -228,8 +231,10 @@ class DispatchContext:
     base_commit: str
     branch: str
     worktree: Path
+    requested_lane: str
     lane_id: str
     executor: str
+    specialist: str
     model: str
 
 
@@ -264,9 +269,9 @@ class LaneCleanupResult:
     evidence_digest: str
 
 
-Executor = Callable[[DispatchContext], adapter.ReliabilityExecution]
+Executor = Callable[[DispatchContext], jobs_execution.ReliabilityExecution]
 Gate = Callable[
-    [DispatchContext, adapter.ReliabilityExecution], jobs_run.GateEvidence
+    [DispatchContext, jobs_execution.ReliabilityExecution], jobs_run.GateEvidence
 ]
 ActivationGate = Callable[
     [DispatchContext, jobs_run.GateEvidence], ActivationDecision
@@ -287,8 +292,10 @@ def _execution_spec_digest(spec: DispatchSpec) -> str:
             "scoped_memory_paths": [
                 str(path) for path in spec.scoped_memory_paths
             ],
+            "requested_lane": spec.requested_lane,
             "lane_id": spec.lane_id,
             "executor": spec.executor,
+            "specialist": spec.specialist,
             "model": spec.model,
             "worktree_parent": (
                 None
@@ -298,6 +305,47 @@ def _execution_spec_digest(spec: DispatchSpec) -> str:
             "lane_root": None if spec.lane_root is None else str(spec.lane_root),
         }
     )
+
+
+def resolve_dispatch_executor(
+    *,
+    job: object,
+    spec: DispatchSpec,
+    executor_registry: jobs_executors.ExecutorRegistry,
+    lane_decision: Optional[jobs_lanes.LaneDecision] = None,
+) -> Executor:
+    """Validate all persisted/selected identity before selecting a callable."""
+
+    identity = executor_registry.require_job_identity(job)
+    expected = (
+        identity.requested_lane,
+        identity.executor,
+        identity.specialist,
+        identity.model,
+    )
+    observed = (
+        spec.requested_lane,
+        spec.executor,
+        spec.specialist,
+        spec.model,
+    )
+    if observed != expected:
+        raise jobs_executors.UnsupportedExecutor(
+            "dispatch identity contradicts the persisted Job identity"
+        )
+    if lane_decision is not None:
+        policy = jobs_lanes.load_lane_registry()
+        jobs_lanes.validate_lane_decision(policy, lane_decision)
+        if (
+            lane_decision.status != "SELECTED"
+            or lane_decision.lane_id != spec.lane_id
+            or lane_decision.executor != identity.executor
+            or lane_decision.model != identity.model
+        ):
+            raise jobs_executors.UnsupportedExecutor(
+                "selected lane contradicts the persisted Job identity"
+            )
+    return executor_registry.require_reliability(identity.executor)
 
 
 def _receipt_id(attempt_id: str, target_state: str) -> str:
@@ -440,7 +488,7 @@ def dispatch_once(
     signer: harness.ReceiptSigner,
     verifier: graph.ReceiptVerifier,
     worker_id: str,
-    executor: Executor,
+    executor_registry: jobs_executors.ExecutorRegistry,
     gate: Gate,
     activation_gate: ActivationGate,
     observed_at: str,
@@ -461,16 +509,14 @@ def dispatch_once(
         raise ValueError(f"no such job: {job_id!r}")
     if _SHA_RE.fullmatch(spec.base_commit) is None:
         raise ValueError("dispatch base_commit must be a full lowercase SHA")
+    selected_executor = resolve_dispatch_executor(
+        job=job,
+        spec=spec,
+        executor_registry=executor_registry,
+        lane_decision=lane_decision,
+    )
+    identity = executor_registry.require_job_identity(job)
     if lane_decision is not None:
-        if not isinstance(lane_decision, jobs_lanes.LaneDecision):
-            raise TypeError("lane_decision must be a LaneDecision")
-        if (
-            lane_decision.status != "SELECTED"
-            or lane_decision.lane_id != spec.lane_id
-            or lane_decision.executor != spec.executor
-            or lane_decision.model != spec.model
-        ):
-            raise ValueError("lane decision contradicts the dispatch spec")
         if spec.lane_root is None:
             raise ValueError("lane-aware dispatch requires lane_root")
         lane_root = Path(spec.lane_root)
@@ -565,7 +611,7 @@ def dispatch_once(
             conn,
             job.id,
             claim_token=claim_token,
-            specialist=job.specialist or spec.executor,
+            specialist=identity.specialist,
             repository=str(spec.repository),
             base_commit=spec.base_commit,
             branch=spec.branch,
@@ -608,9 +654,11 @@ def dispatch_once(
         base_commit=spec.base_commit,
         branch=spec.branch,
         worktree=planned_worktree,
+        requested_lane=identity.requested_lane,
         lane_id=spec.lane_id,
-        executor=spec.executor,
-        model=spec.model,
+        executor=identity.executor,
+        specialist=identity.specialist,
+        model=identity.model,
     )
     sequence = 0
 
@@ -845,7 +893,7 @@ def dispatch_once(
         )
 
     try:
-        execution = executor(context)
+        execution = selected_executor(context)
     except Exception as exc:  # noqa: BLE001 - the attempt must become evidence
         evidence_digest = _digest(
             {"stage": "executor", "exception": type(exc).__name__}
@@ -857,7 +905,7 @@ def dispatch_once(
             evidence_digest=evidence_digest,
             commit=spec.base_commit,
         )
-    if not isinstance(execution, adapter.ReliabilityExecution):
+    if not isinstance(execution, jobs_execution.ReliabilityExecution):
         return fail(
             jobs_loop.FailureSignal(
                 reason_code="PROCESS_CRASHED", stage="executor"

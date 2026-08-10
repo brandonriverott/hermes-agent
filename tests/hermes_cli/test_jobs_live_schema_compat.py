@@ -46,18 +46,38 @@ def live_shape_db(tmp_path):
     path = tmp_path / "jobs.db"
     conn = jdb.connect(path)
     ids = {}
-    for slug, specialist in (
-        ("kat", "kat-builder"),
-        ("gpt", "gpt-builder"),
-        ("claude", "claude-builder"),
-    ):
-        ids[slug] = jdb.create_job(
-            conn,
-            name=f"Historical {slug} build",
-            goal=f"preserve {slug}",
-            specialist=specialist,
-        )
     with jdb.write_txn(conn):
+        for number, (slug, specialist) in enumerate(
+            (
+                ("kat", "kat-builder"),
+                ("gpt", "gpt-builder"),
+                ("claude", "claude-builder"),
+            ),
+            start=1,
+        ):
+            jid = f"j_{slug}_history"
+            ids[slug] = jid
+            conn.execute(
+                "INSERT INTO jobs "
+                "(id, number, name, goal, status, step, requested_lane, executor, "
+                "specialist, model, routing_reason, created_at, updated_at, "
+                "last_heartbeat_at, revision, skills) "
+                "VALUES (?, ?, ?, ?, 'working', 'routing', NULL, NULL, ?, NULL, "
+                "NULL, 1, 1, NULL, 1, NULL)",
+                (
+                    jid,
+                    number,
+                    f"Historical {slug} build",
+                    f"preserve {slug}",
+                    specialist,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO job_events "
+                "(job_id, kind, data, idempotency_key, created_at) "
+                "VALUES (?, 'job_created', ?, NULL, 1)",
+                (jid, json.dumps({"specialist": specialist})),
+            )
         for ordinal, (slug, specialist) in enumerate(
             (
                 ("kat", "kat-builder"),
@@ -262,6 +282,7 @@ def test_create_job_persists_a_bounded_origin_in_the_creation_transaction(tmp_pa
         conn,
         name="Origin-aware",
         goal="g",
+        requested_lane="claude",
         origin={
             "platform": "api_server",
             "chat_id": "room-92",
@@ -327,19 +348,143 @@ def test_reassignment_atomically_moves_the_full_canonical_identity(
     conn.close()
 
 
-def test_reassignment_normalizes_the_historical_gpt_builder_alias(tmp_path):
+def test_reassignment_rejects_the_historical_gpt_builder_alias(tmp_path):
     conn = jdb.connect(tmp_path / "jobs.db")
     jid = jdb.create_job(
         conn, name="Alias move", goal="g", requested_lane="claude"
     )
-    moved = jdb.reassign_specialist(
+    before = _snapshot(
         conn,
-        jid,
-        specialist="gpt-builder",
-        reason="normalize the historical alias",
+        {
+            "jobs": _table_columns(conn, "jobs"),
+            "job_events": _table_columns(conn, "job_events"),
+        },
     )
-    assert _identity_dict(moved) == _identity_dict(resolve_requested_lane("codex"))
-    assert moved.specialist == "codex-builder"
+    with pytest.raises(ValueError):
+        jdb.reassign_specialist(
+            conn,
+            jid,
+            specialist="gpt-builder",
+            reason="aliases are read-only",
+        )
+    after = _snapshot(
+        conn,
+        {
+            "jobs": _table_columns(conn, "jobs"),
+            "job_events": _table_columns(conn, "job_events"),
+        },
+    )
+    assert after == before
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("requested_lane", "specialist"),
+    [
+        (None, None),
+        (None, "claude-builder"),
+        ("gpt", None),
+        ("kat", None),
+        ("unknown", None),
+        ("codex", "gpt-builder"),
+        ("claude", "kat-builder"),
+        ("claude", "codex-builder"),
+    ],
+)
+def test_current_creation_rejects_missing_alias_or_contradictory_identity_without_rows(
+    tmp_path, requested_lane, specialist
+):
+    conn = jdb.connect(tmp_path / "jobs.db")
+    before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("jobs", "job_events", "job_sources")
+    }
+
+    with pytest.raises(ValueError):
+        jdb.create_job(
+            conn,
+            name="Refuse",
+            goal="g",
+            requested_lane=requested_lane,
+            specialist=specialist,
+        )
+
+    after = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("jobs", "job_events", "job_sources")
+    }
+    assert after == before
+    conn.close()
+
+
+def test_idempotent_intake_requires_identity_before_source_lookup_or_write(tmp_path):
+    conn = jdb.connect(tmp_path / "jobs.db")
+    first = jdb.create_or_get_job(
+        conn,
+        source_type="schedule",
+        source_key="one",
+        name="Canonical",
+        goal="g",
+        requested_lane="claude",
+    )
+    before = _snapshot(
+        conn,
+        {
+            table: _table_columns(conn, table)
+            for table in ("jobs", "job_events", "job_sources")
+        },
+    )
+
+    with pytest.raises(ValueError):
+        jdb.create_or_get_job(
+            conn,
+            source_type="schedule",
+            source_key="one",
+            name="Canonical",
+            goal="g",
+        )
+
+    assert first.created is True
+    assert _snapshot(
+        conn,
+        {
+            table: _table_columns(conn, table)
+            for table in ("jobs", "job_events", "job_sources")
+        },
+    ) == before
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("requested_lane", "specialist"),
+    [
+        (None, None),
+        ("gpt", None),
+        ("kat", None),
+        ("unknown", None),
+        ("codex", "gpt-builder"),
+        ("claude", "kat-builder"),
+    ],
+)
+def test_idempotent_intake_rejects_noncanonical_new_identity_without_rows(
+    tmp_path, requested_lane, specialist
+):
+    conn = jdb.connect(tmp_path / "jobs.db")
+
+    with pytest.raises(ValueError):
+        jdb.create_or_get_job(
+            conn,
+            source_type="schedule",
+            source_key="invalid",
+            name="Refuse",
+            goal="g",
+            requested_lane=requested_lane,
+            specialist=specialist,
+        )
+
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM job_events").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM job_sources").fetchone()[0] == 0
     conn.close()
 
 
@@ -421,7 +566,9 @@ def test_reassignment_refuses_active_custody(tmp_path):
 
 def test_unbuilt_job_cannot_claim_finished_complete(tmp_path):
     conn = jdb.connect(tmp_path / "jobs.db")
-    jid = jdb.create_job(conn, name="Never built", goal="g")
+    jid = jdb.create_job(
+        conn, name="Never built", goal="g", requested_lane="claude"
+    )
 
     with pytest.raises(jdb.InvalidTransition, match="no attempt"):
         jdb.transition(conn, jid, status="finished", step="complete")

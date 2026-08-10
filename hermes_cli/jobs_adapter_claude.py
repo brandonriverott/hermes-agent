@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from hermes_cli import jobs_exec as jx
-from hermes_cli import jobs_receipts
+from hermes_cli import jobs_execution as execution
 from hermes_cli import jobs_skills as jskills
 from hermes_cli.jobs_contract import JobEnvelope
 
@@ -71,21 +71,18 @@ _OUTPUT_TAIL_BYTES = 4000
 # A result file is a handful of JSON fields; a huge one is a worker misbehaving.
 _MAX_RESULT_BYTES = 64 * 1024
 
-# What a preserved worker file is allowed to weigh once the run is over. The
-# worker writes its stdout straight to disk (a pipe would deadlock the parent),
-# so the file is unbounded and unredacted *while* the run happens; this is the
-# ceiling it is rewritten to before anything is preserved.
-MAX_PRESERVED_BYTES = 64 * 1024
+# Compatibility re-exports.  Evidence belongs to the provider-neutral contract;
+# existing imports from this adapter keep resolving while new executors depend
+# only on :mod:`hermes_cli.jobs_execution`.
+MAX_PRESERVED_BYTES = execution.MAX_PRESERVED_BYTES
+AdapterError = execution.AdapterError
+ArtifactClaim = execution.ArtifactClaim
+ReliabilityExecution = execution.ReliabilityExecution
+claim_artifact = execution.claim_artifact
+_bounded_text = execution.bounded_text
+_capped_utf8 = execution.capped_utf8
 
 _GIT_TIMEOUT = 120
-
-
-class AdapterError(RuntimeError):
-    """Preflight refused: the repository or base identity is not usable.
-
-    Raised before any attempt work begins, so the caller can hand custody back
-    without having burned an attempt on a workspace that could never exist.
-    """
 
 
 @dataclass(frozen=True)
@@ -102,52 +99,6 @@ class AdapterResult:
 
     def to_dict(self) -> dict:
         return asdict(self)
-
-
-@dataclass(frozen=True)
-class ArtifactClaim:
-    """One executor-authored byte claim for dispatcher readback.
-
-    The executor captures the digest immediately after writing.  The dispatcher
-    reads the path independently before REVIEWING, so a later rewrite is
-    observable rather than silently becoming the new expected value.
-    """
-
-    name: str
-    path: Path
-    digest: str
-    size: int
-
-
-@dataclass(frozen=True)
-class ReliabilityExecution:
-    """Provider-neutral evidence returned to the reliability dispatcher."""
-
-    status: str
-    commit: Optional[str]
-    worktree: Path
-    artifacts: tuple[ArtifactClaim, ...]
-    executor_exit_digest: str
-    output_capture_digest: str
-    failure_reason_code: Optional[str] = None
-    http_status: Optional[int] = None
-    safety_gate: bool = False
-
-
-def claim_artifact(path: Path, *, name: str) -> ArtifactClaim:
-    """Capture a bounded identity claim without granting it authority."""
-
-    clean_name = str(name or "").strip()
-    if not clean_name:
-        raise ValueError("artifact name must not be empty")
-    source = Path(path)
-    data = source.read_bytes()
-    return ArtifactClaim(
-        name=clean_name,
-        path=source,
-        digest=jobs_receipts.digest_bytes(data),
-        size=len(data),
-    )
 
 
 def branch_name(envelope: JobEnvelope) -> str:
@@ -353,43 +304,6 @@ def _write_private(path: Path, body: bytes) -> None:
                 victim.unlink()
             except OSError:
                 pass
-
-
-def _bounded_text(path: Path) -> Optional[str]:
-    """The last :data:`MAX_PRESERVED_BYTES` of ``path`` as valid UTF-8, or ``None``.
-
-    A tail can start mid-character *and* mid-secret, so the first partial line is
-    dropped: half of a token no longer matches the pattern that would have
-    redacted the whole of it, and a half-token is still a leak.
-    """
-    marker = f"{jx.TRUNCATED}\n"
-    budget = MAX_PRESERVED_BYTES - len(marker.encode("utf-8"))
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as fh:
-            if size > budget:
-                fh.seek(size - budget)
-            raw = fh.read(budget)
-    except OSError:
-        return None
-    text = raw.decode("utf-8", "replace")
-    if size > budget:
-        _, sep, rest = text.partition("\n")
-        text = marker + (rest if sep else "")
-    return text
-
-
-def _capped_utf8(text: str) -> bytes:
-    """``text`` as at most :data:`MAX_PRESERVED_BYTES` of valid UTF-8, tail kept."""
-    body = text.encode("utf-8")
-    if len(body) <= MAX_PRESERVED_BYTES:
-        return body
-    body = body[-MAX_PRESERVED_BYTES:]
-    # Redaction can lengthen a line ("[redacted]" is longer than some of what it
-    # replaces), so the recut tail may start mid-character. Drop the fragment.
-    while body and (body[0] & 0xC0) == 0x80:
-        body = body[1:]
-    return body
 
 
 def _sanitize_log(path: Path) -> None:

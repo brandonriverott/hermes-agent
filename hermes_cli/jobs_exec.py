@@ -82,9 +82,9 @@ class RoutingDecision:
 def route(*, specialist: Optional[str]) -> RoutingDecision:
     """Decide the execution lane for a Job. Pure, total, and deterministic.
 
-    The specialist must be explicit.  ``gpt-builder`` remains a read-only alias
-    for historical rows and normalizes to ``codex-builder``; neither an absent
-    nor malformed specialist silently lands on Claude.
+    The specialist must be an explicit current canonical name. Historical
+    aliases normalize only while reading persisted identity and are never an
+    active route; neither an absent nor malformed specialist lands on Claude.
 
     ponytail: the Job's step is deliberately not an input. Nothing in this slice
     routes differently for ``correcting`` vs ``building``; the reviewer lane that
@@ -104,18 +104,15 @@ def route(*, specialist: Optional[str]) -> RoutingDecision:
             reason="job assigned to the Claude builder",
             executable=True,
         )
-    if name in (ji.CODEX_SPECIALIST, ji.LEGACY_GPT_SPECIALIST):
-        reason = "job assigned to the Codex builder"
-        if name == ji.LEGACY_GPT_SPECIALIST:
-            reason += " through the historical gpt-builder alias"
+    if name == ji.CODEX_SPECIALIST:
         return RoutingDecision(
             specialist=ji.CODEX_SPECIALIST,
             model=ji.CODEX_MODEL,
             effort="high",
-            reason=f"{reason}; its adapter is not built in this slice",
+            reason="job assigned to the Codex builder; its adapter is not built in this slice",
             executable=False,
         )
-    raise UnsupportedRouting(f"no execution lane for specialist {specialist!r}")
+    raise UnsupportedRouting("no execution lane for the supplied specialist")
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +158,7 @@ def validate_execution(metadata: Optional[Mapping[str, Any]]) -> ExecutionSpec:
 
     unknown = sorted(set(execution) - _EXECUTION_KEYS)
     if unknown:
-        raise ValueError(f"unknown metadata.execution keys: {', '.join(unknown)}")
+        raise ValueError("metadata.execution contains unsupported keys")
 
     values = {}
     for name in _EXECUTION_STRINGS:
