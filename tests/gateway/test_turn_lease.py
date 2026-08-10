@@ -183,6 +183,14 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
 
     runner = _bootstrap(monkeypatch, tmp_path)
     runner._turn_leases = SessionTurnLeaseRegistry()
+    # This test owns the outer-dispatch/lease seam, not AsyncSessionStore's
+    # thread-pool scheduling. Keep session lookup in-process so a saturated
+    # suite-wide executor cannot spend the entire assertion budget before the
+    # 20 ms lease timeout is even reached.
+    runner._async_session_store = MagicMock()
+    runner._async_session_store.get_or_create_session = AsyncMock(
+        return_value=runner.session_store.get_or_create_session.return_value
+    )
     holder = await runner._turn_leases.acquire(
         "sess-dedup", owner_key="holder-key", generation=1, timeout=1
     )
