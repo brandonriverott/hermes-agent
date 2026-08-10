@@ -100,6 +100,62 @@ def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> Non
     assert "1 tests passed" in proc.stdout
 
 
+def test_parallel_files_receive_distinct_pytest_temp_roots(tmp_path: Path) -> None:
+    """Per-file pytest cleanup must never race on ``pytest-current``."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "probe"
+    evidence_dir = tmp_path / "evidence"
+    probe_dir.mkdir()
+    evidence_dir.mkdir()
+
+    for index in range(2):
+        (probe_dir / f"test_temp_root_{index}.py").write_text(
+            textwrap.dedent(
+                f"""
+                import os
+                from pathlib import Path
+
+                def test_records_pytest_temp_root():
+                    Path({str(evidence_dir / f'root-{index}.txt')!r}).write_text(
+                        os.environ.get('PYTEST_DEBUG_TEMPROOT', ''),
+                        encoding='utf-8',
+                    )
+                """
+            ),
+            encoding="utf-8",
+        )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "2",
+            "--file-retries",
+            "0",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    roots = [
+        (evidence_dir / f"root-{index}.txt").read_text(encoding="utf-8")
+        for index in range(2)
+    ]
+    assert all(roots), proc.stdout
+    assert len(set(roots)) == 2, roots
+    assert all(not Path(root).exists() for root in roots)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")
 @pytest.mark.live_system_guard_bypass
 def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
