@@ -14,7 +14,10 @@ Discovers, loads, and manages plugins from four sources:
    entry-point group.
 
 Later sources override earlier ones on name collision, so a user or project
-plugin with the same name as a bundled plugin replaces it.
+plugin with the same name as a bundled plugin replaces it.  A bundled plugin
+may opt into the narrowly-scoped, versioned ``bundled-wins-v1`` collision
+policy when allowing an older out-of-tree copy to shadow it would remove a
+core safety contract.  Unmarked plugins retain the general precedence rule.
 
 Each directory plugin must contain a ``plugin.yaml`` manifest **and** an
 ``__init__.py`` with a ``register(ctx)`` function.
@@ -279,6 +282,7 @@ def _get_enabled_plugins() -> Optional[set]:
 # ---------------------------------------------------------------------------
 
 _VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+_BUNDLED_COLLISION_POLICY = "bundled-wins-v1"
 
 
 def _portable_skill_namespace(key: str) -> str:
@@ -341,6 +345,9 @@ class PluginManifest:
     key: str = ""
     portable: bool = False
     skill_namespace: str = ""
+    # Versioned exception to normal later-source precedence. Only a bundled
+    # manifest may carry this marker; user/project copies cannot self-promote.
+    collision_policy: str = ""
 
 
 @dataclass
@@ -1399,7 +1406,20 @@ class PluginManager:
         enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
-            winners[manifest.key or manifest.name] = manifest
+            lookup_key = manifest.key or manifest.name
+            incumbent = winners.get(lookup_key)
+            if (
+                incumbent is not None
+                and incumbent.source == "bundled"
+                and incumbent.collision_policy == _BUNDLED_COLLISION_POLICY
+            ):
+                logger.warning(
+                    "Ignoring %s plugin collision for protected bundled plugin %s",
+                    manifest.source,
+                    lookup_key,
+                )
+                continue
+            winners[lookup_key] = manifest
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
 
@@ -1787,6 +1807,23 @@ class PluginManager:
                 "Parsed manifest: key=%s name=%s kind=%s source=%s path=%s",
                 key, name, kind, source, plugin_dir,
             )
+            raw_collision_policy = data.get("collision_policy", "")
+            collision_policy = (
+                raw_collision_policy.strip()
+                if isinstance(raw_collision_policy, str)
+                else ""
+            )
+            if collision_policy and (
+                source != "bundled"
+                or collision_policy != _BUNDLED_COLLISION_POLICY
+            ):
+                logger.warning(
+                    "Plugin %s: ignoring unsupported collision policy %r",
+                    key,
+                    raw_collision_policy,
+                )
+                collision_policy = ""
+
             return PluginManifest(
                 name=name,
                 version=str(data.get("version", "")),
@@ -1799,6 +1836,7 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                collision_policy=collision_policy,
             )
         except Exception as exc:
             logger.warning(

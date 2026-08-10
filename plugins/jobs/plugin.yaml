@@ -1,0 +1,9 @@
+name: jobs
+version: "1.0.0"
+description: "Durable exact-origin Jobs intake for explicit Claude and Codex executor lanes."
+author: NousResearch
+kind: backend
+collision_policy: bundled-wins-v1
+provides_tools:
+  - jobs_create
+  - jobs_queue
