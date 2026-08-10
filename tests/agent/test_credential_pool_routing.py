@@ -372,6 +372,17 @@ class TestFailureAttribution:
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        # These routing tests exercise only the explicit fixture entries.
+        # Do not let host Claude credentials silently expand the pool and
+        # turn a single-entry rotation case into a multi-entry one.
+        monkeypatch.setattr(
+            "agent.credential_pool._seed_from_singletons",
+            lambda *_args, **_kwargs: (False, set()),
+        )
+        monkeypatch.setattr(
+            "agent.credential_pool._seed_from_env",
+            lambda *_args, **_kwargs: (False, set()),
+        )
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(
@@ -542,4 +553,3 @@ class TestFailureAttribution:
 
         failed = {e.id: e for e in pool.entries()}["cred-1"]
         assert failed.failure_reason != "billing"
-

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -203,9 +204,9 @@ def spawn_async_diagnostic(
     """Fire-and-forget ``ps``-style snapshot written to ``log_path``.
 
     Runs as a detached subprocess so it can't block the asyncio event loop
-    or compete with platform teardown.  The subprocess uses its own
-    ``timeout`` so a wedged ``ps`` still self-cleans within
-    ``timeout_seconds``.
+    or compete with platform teardown.  On hosts with GNU ``timeout`` (or
+    Homebrew ``gtimeout``), a wedged ``ps`` self-cleans within
+    ``timeout_seconds``; other POSIX hosts still get the detached snapshot.
 
     Returns the subprocess PID on success, ``None`` on failure.  Never
     raises.
@@ -254,8 +255,12 @@ def spawn_async_diagnostic(
         # would also reap us anyway, but defense in depth).  Without
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
+        timeout_binary = shutil.which("timeout") or shutil.which("gtimeout")
+        command = ["bash", "-c", script]
+        if timeout_binary:
+            command = [timeout_binary, f"{timeout_seconds:.0f}", *command]
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            command,
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

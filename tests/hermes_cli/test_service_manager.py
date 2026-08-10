@@ -7,6 +7,8 @@ implementation in this same file once that phase ships.
 """
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from hermes_cli.service_manager import (
@@ -192,6 +194,10 @@ def fake_subprocess_run(monkeypatch: pytest.MonkeyPatch):
 # tests/docker/test_s6_profile_gateway_integration.py.
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="s6 service modes are a Linux-container contract",
+)
 def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     """Verifies the dirs + FIFO + modes the helper lays down."""
     import stat
@@ -487,5 +493,4 @@ def test_s6_log_run_never_invokes_chown_with_symlinked_log_dir(tmp_path) -> None
     assert after.st_gid == before.st_gid
     assert (victim / "marker").read_text(encoding="utf-8") == "keep"
     assert (victim / "lock").read_text(encoding="utf-8") == "keep-lock"
-
 

@@ -1592,16 +1592,21 @@ def _load_local_whisper_model(model_name: str, device: str = "auto", compute_typ
         # Importing ctranslate2/faster-whisper itself can abort on some
         # Apple Silicon/Rosetta installs because multiple Intel OpenMP runtimes
         # are already loaded.  Set this before importing faster_whisper so the
-        # gateway survives, then keep inference on CPU to avoid device probing.
+        # gateway survives. Replace only auto-selected values; explicit user
+        # device/compute_type pins remain authoritative.
         os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        device = "cpu" if device == "auto" else device
+        compute_type = "int8" if compute_type == "auto" else compute_type
 
     from faster_whisper import WhisperModel
     if force_cpu:
         logger.info(
-            "Apple Silicon/Rosetta detected — loading faster-whisper on CPU "
-            "(int8) to avoid native device autodetection crashes"
+            "Apple Silicon/Rosetta detected — loading faster-whisper with "
+            "device=%s compute_type=%s",
+            device,
+            compute_type,
         )
-        return WhisperModel(model_name, device="cpu", compute_type="int8")
+        return WhisperModel(model_name, device=device, compute_type=compute_type)
 
     try:
         return WhisperModel(model_name, device=device, compute_type=compute_type)
