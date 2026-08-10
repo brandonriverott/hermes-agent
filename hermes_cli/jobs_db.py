@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
 
+from hermes_cli import jobs_identity as ji
 from hermes_cli.sqlite_util import add_column_if_missing, write_txn
 from hermes_constants import get_hermes_home
 
@@ -193,7 +194,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     goal              TEXT NOT NULL,
     status            TEXT NOT NULL,
     step              TEXT NOT NULL,
+    requested_lane    TEXT,
+    executor          TEXT,
     specialist        TEXT,
+    model             TEXT,
     routing_reason    TEXT,
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
@@ -558,6 +562,12 @@ _JOBS_V2_COLUMNS = (
     ("current_attempt_id", "current_attempt_id TEXT"),
 )
 
+_JOBS_IDENTITY_COLUMNS = (
+    ("requested_lane", "requested_lane TEXT"),
+    ("executor", "executor TEXT"),
+    ("model", "model TEXT"),
+)
+
 
 # Indexes deliberately kept OUT of ``SCHEMA_SQL``: an early V1 database can hold
 # history that violates them (several ``running`` attempts on one Job, NULL
@@ -902,6 +912,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """
     for name, ddl in _JOBS_V2_COLUMNS:
         add_column_if_missing(conn, "jobs", name, ddl)
+    # Executor identity is additive and nullable.  NULL means exactly
+    # "pre-identity history"; historical aliases are interpreted at read/use
+    # time and are never rewritten during migration.
+    for name, ddl in _JOBS_IDENTITY_COLUMNS:
+        add_column_if_missing(conn, "jobs", name, ddl)
     # Skill attachment. Nullable, and every pre-existing Job arrives NULL, which
     # is exactly the truth about them: nobody declared any skills, so the default
     # rules table decides for them the same way it does for a new Job.
@@ -1114,7 +1129,10 @@ class Job:
     step: str
     created_at: int
     updated_at: int
+    requested_lane: Optional[str] = None
+    executor: Optional[str] = None
     specialist: Optional[str] = None
+    model: Optional[str] = None
     routing_reason: Optional[str] = None
     last_heartbeat_at: Optional[int] = None
     revision: int = 0
@@ -1144,7 +1162,10 @@ class Job:
             "goal": self.goal,
             "status": self.status,
             "step": self.step,
+            "requested_lane": self.requested_lane,
+            "executor": self.executor,
             "specialist": self.specialist,
+            "model": self.model,
             "routing_reason": self.routing_reason,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -1189,7 +1210,10 @@ def _job_from_row(row: sqlite3.Row) -> Job:
         step=row["step"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        requested_lane=row["requested_lane"],
+        executor=row["executor"],
         specialist=row["specialist"],
+        model=row["model"],
         routing_reason=row["routing_reason"],
         last_heartbeat_at=row["last_heartbeat_at"],
         revision=row["revision"],
@@ -1321,11 +1345,26 @@ def get_events(conn: sqlite3.Connection, id_or_number) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _creation_identity(
+    *, requested_lane: Optional[str], specialist: Optional[str]
+) -> Optional[ji.JobIdentity]:
+    """Resolve a canonical new-write identity while preserving legacy callers."""
+    if requested_lane is None:
+        return None
+    identity = ji.resolve_requested_lane(requested_lane)
+    if specialist is not None and specialist != identity.specialist:
+        raise ji.UnsupportedJobLane(
+            "requested lane and specialist name different executors"
+        )
+    return identity
+
+
 def create_job(
     conn: sqlite3.Connection,
     *,
     name: str,
     goal: str,
+    requested_lane: Optional[str] = None,
     specialist: Optional[str] = None,
     routing_reason: Optional[str] = None,
     correlations: Optional[Iterable[str]] = None,
@@ -1350,6 +1389,10 @@ def create_job(
         raise ValueError("job name must not be empty")
     if goal is None or goal == "":
         raise ValueError("job goal must not be empty")
+    identity = _creation_identity(
+        requested_lane=requested_lane,
+        specialist=specialist,
+    )
 
     with write_txn(conn):
         return _create_job_locked(
@@ -1357,6 +1400,7 @@ def create_job(
             name=clean_name,
             goal=goal,
             specialist=specialist,
+            identity=identity,
             routing_reason=routing_reason,
             correlations=correlations,
             skills=skills,
@@ -1370,6 +1414,7 @@ def _create_job_locked(
     name: str,
     goal: str,
     specialist: Optional[str],
+    identity: Optional[ji.JobIdentity],
     routing_reason: Optional[str],
     correlations: Optional[Iterable[str]],
     now: Optional[int] = None,
@@ -1396,6 +1441,10 @@ def _create_job_locked(
 
     declared = None if skills is None else list(jskills.parse_declared_skills(skills))
     skills_json = None if declared is None else json.dumps(declared, ensure_ascii=False)
+    requested_lane = None if identity is None else identity.requested_lane
+    executor = None if identity is None else identity.executor
+    persisted_specialist = specialist if identity is None else identity.specialist
+    model = None if identity is None else identity.model
 
     # Allocate through the durable monotonic sequence, never MAX(number)+1: a
     # deleted Job row must not free its number for reuse. Atomic with the INSERT
@@ -1406,11 +1455,25 @@ def _create_job_locked(
     ).fetchone()["last"]
     conn.execute(
         "INSERT INTO jobs "
-        "(id, number, name, goal, status, step, specialist, routing_reason, "
-        " created_at, updated_at, last_heartbeat_at, revision, skills) "
-        "VALUES (?, ?, ?, ?, 'working', 'routing', ?, ?, ?, ?, NULL, 1, ?)",
-        (jid, number, name, goal, specialist, routing_reason, now, now,
-         skills_json),
+        "(id, number, name, goal, status, step, requested_lane, executor, "
+        " specialist, model, routing_reason, created_at, updated_at, "
+        " last_heartbeat_at, revision, skills) "
+        "VALUES (?, ?, ?, ?, 'working', 'routing', ?, ?, ?, ?, ?, ?, ?, "
+        " NULL, 1, ?)",
+        (
+            jid,
+            number,
+            name,
+            goal,
+            requested_lane,
+            executor,
+            persisted_specialist,
+            model,
+            routing_reason,
+            now,
+            now,
+            skills_json,
+        ),
     )
     for kanban_id in corr:
         conn.execute(
@@ -1446,7 +1509,10 @@ def _create_job_locked(
         data={
             "number": number,
             "name": name,
-            "specialist": specialist,
+            "requested_lane": requested_lane,
+            "executor": executor,
+            "specialist": persisted_specialist,
+            "model": model,
             "routing_reason": routing_reason,
             "skills": declared,
         },
@@ -1638,12 +1704,22 @@ def reassign_specialist(
     reason: str,
     idempotency_key: Optional[str] = None,
 ) -> Job:
-    """Move an unclaimed Job to another lane with durable evidence."""
+    """Atomically move an unclaimed Job to a canonical supported lane."""
 
-    if specialist is not None:
-        if not isinstance(specialist, str) or not specialist.strip():
-            raise ValueError("specialist must be a non-empty name or None")
-        specialist = specialist.strip()
+    if not isinstance(specialist, str) or not specialist.strip():
+        raise ji.UnsupportedJobLane(
+            "reassignment must name claude-builder or codex-builder"
+        )
+    specialist = specialist.strip()
+    # ``gpt-builder`` is accepted only as a historical input alias.  The target
+    # written below is always the canonical Codex identity.
+    target_identity = ji.effective_identity({"specialist": specialist})
+    target = {
+        "requested_lane": target_identity.requested_lane,
+        "executor": target_identity.executor,
+        "specialist": target_identity.specialist,
+        "model": target_identity.model,
+    }
     if not str(reason or "").strip():
         raise ValueError("reassigning a Job's lane requires a reason")
 
@@ -1658,7 +1734,13 @@ def reassign_specialist(
             raise InvalidTransition(
                 f"job {job.label} is finished; its lane is a matter of record now"
             )
-        if job.specialist == specialist:
+        before = {
+            "requested_lane": job.requested_lane,
+            "executor": job.executor,
+            "specialist": job.specialist,
+            "model": job.model,
+        }
+        if before == target:
             return job
         running = conn.execute(
             "SELECT id FROM job_attempts WHERE job_id = ? AND status = 'running'",
@@ -1678,15 +1760,22 @@ def reassign_specialist(
                 "claim before moving the Job to another lane"
             )
         conn.execute(
-            "UPDATE jobs SET specialist = ?, updated_at = ?, revision = revision + 1 "
-            "WHERE id = ?",
-            (specialist, now, job.id),
+            "UPDATE jobs SET requested_lane = ?, executor = ?, specialist = ?, "
+            "model = ?, updated_at = ?, revision = revision + 1 WHERE id = ?",
+            (
+                target_identity.requested_lane,
+                target_identity.executor,
+                target_identity.specialist,
+                target_identity.model,
+                now,
+                job.id,
+            ),
         )
         _append_event_locked(
             conn,
             job.id,
             "job_reassigned",
-            data={"from": job.specialist, "to": specialist, "reason": reason},
+            data={"from": before, "to": target, "reason": reason},
             idempotency_key=idempotency_key,
             now=now,
         )
@@ -5246,6 +5335,7 @@ def create_or_get_job(
     source_key: str,
     name: str,
     goal: str,
+    requested_lane: Optional[str] = None,
     specialist: Optional[str] = None,
     routing_reason: Optional[str] = None,
     correlations: Optional[Iterable[str]] = None,
@@ -5274,6 +5364,10 @@ def create_or_get_job(
         raise ValueError("job name must not be empty")
     if goal is None or goal == "":
         raise ValueError("job goal must not be empty")
+    identity = _creation_identity(
+        requested_lane=requested_lane,
+        specialist=specialist,
+    )
     now = _now() if now is None else int(now)
 
     with write_txn(conn):
@@ -5287,6 +5381,11 @@ def create_or_get_job(
             conflict = job is not None and (
                 job.name != clean_name or job.goal != goal
             )
+            if job is not None and identity is not None:
+                try:
+                    conflict = conflict or ji.effective_identity(job) != identity
+                except ji.UnsupportedJobLane:
+                    conflict = True
             return IntakeResult(job_id=jid, created=False, conflict=conflict)
 
         jid = _create_job_locked(
@@ -5294,6 +5393,7 @@ def create_or_get_job(
             name=clean_name,
             goal=goal,
             specialist=specialist,
+            identity=identity,
             routing_reason=routing_reason,
             correlations=correlations,
             now=now,

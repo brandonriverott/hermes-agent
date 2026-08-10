@@ -48,12 +48,18 @@ def _run(argv, capsys=None):
     return rc, cap.out, cap.err
 
 
-def _job(home, name="Ship it", goal="do the thing", specialist=None):
+def _job(home, name="Ship it", goal="do the thing", lane="claude"):
     gf = home / "goal.txt"
     gf.write_text(goal)
-    argv = ["create", name, "--goal-file", str(gf), "--json"]
-    if specialist:
-        argv += ["--specialist", specialist]
+    argv = [
+        "create",
+        name,
+        "--goal-file",
+        str(gf),
+        "--lane",
+        lane,
+        "--json",
+    ]
     _run(argv)
     with jdb.connect_closing() as conn:
         return jdb.list_jobs(conn)[-1]
@@ -63,6 +69,7 @@ def _claim(home, job, token_path=None, lease=600):
     token_path = token_path or (home / "token")
     rc, _, _ = _run(
         ["claim", "--worker", "w1", "--job", str(job.number),
+         "--specialist", job.specialist,
          "--lease-seconds", str(lease), "--token-out", str(token_path)]
     )
     assert rc == 0

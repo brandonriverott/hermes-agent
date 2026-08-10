@@ -68,7 +68,7 @@ def test_create_stores_goal_file_verbatim(home, capsys):
     gf = _goal_file(home)
     rc, out, _ = _run(
         ["create", "Ship the thing", "--goal-file", str(gf),
-         "--specialist", "claude-builder", "--routing-reason", "repo scope"],
+         "--lane", "claude", "--routing-reason", "repo scope"],
         capsys,
     )
     assert rc == 0
@@ -80,7 +80,10 @@ def test_create_stores_goal_file_verbatim(home, capsys):
         # Byte-for-byte: CRLF, tabs, and Unicode all survive intact.
         assert job.goal.encode("utf-8") == GOAL_BYTES
         assert job.name == "Ship the thing"
+        assert job.requested_lane == "claude"
+        assert job.executor == "claude"
         assert job.specialist == "claude-builder"
+        assert job.model == "claude-opus-5"
         assert job.routing_reason == "repo scope"
         assert job.status == "working" and job.step == "routing"
 
@@ -89,14 +92,36 @@ def test_create_requires_goal_file_not_positional(home):
     """A long goal cannot be smuggled in as a shell argument in V1."""
     # Missing --goal-file is an argparse error.
     with pytest.raises(SystemExit):
-        _run(["create", "Just a name"])
+        _run(["create", "Just a name", "--lane", "claude"])
     # An extra positional (the "goal") is rejected — only <name> is positional.
     with pytest.raises(SystemExit):
-        _run(["create", "name", "the whole long goal text here"])
+        _run(["create", "name", "the whole long goal text here", "--lane", "claude"])
+
+
+def test_create_requires_a_supported_explicit_lane(home):
+    goal = str(_goal_file(home, b"g"))
+    with pytest.raises(SystemExit):
+        _run(["create", "Missing lane", "--goal-file", goal])
+    with pytest.raises(SystemExit):
+        _run(["create", "Retired KAT", "--goal-file", goal, "--lane", "kat"])
+    with pytest.raises(SystemExit):
+        _run(
+            [
+                "create",
+                "Unrestricted specialist",
+                "--goal-file",
+                goal,
+                "--specialist",
+                "kat-builder",
+            ]
+        )
 
 
 def test_create_missing_goal_file_reports_error(home, capsys):
-    rc, _, err = _run(["create", "X", "--goal-file", str(home / "nope.txt")], capsys)
+    rc, _, err = _run(
+        ["create", "X", "--goal-file", str(home / "nope.txt"), "--lane", "claude"],
+        capsys,
+    )
     assert rc == 2
     assert "goal file not found" in err
 
@@ -105,6 +130,7 @@ def test_create_records_correlations(home, capsys):
     gf = _goal_file(home, b"port this")
     rc, _, _ = _run(
         ["create", "Backlog", "--goal-file", str(gf),
+         "--lane", "codex",
          "--correlation", "card-1", "--correlation", "card-2"],
         capsys,
     )
@@ -119,8 +145,10 @@ def test_create_records_correlations(home, capsys):
 
 
 def test_list_and_status_filter(home, capsys):
-    _run(["create", "A", "--goal-file", str(_goal_file(home, b"a"))], capsys)
-    _run(["create", "B", "--goal-file", str(_goal_file(home, b"b"))], capsys)
+    _run(["create", "A", "--goal-file", str(_goal_file(home, b"a")),
+          "--lane", "claude"], capsys)
+    _run(["create", "B", "--goal-file", str(_goal_file(home, b"b")),
+          "--lane", "claude"], capsys)
     with jdb.connect_closing() as conn:
         jdb.transition(conn, 2, status="needs_you", step="waiting_for_decision")
 
@@ -134,7 +162,8 @@ def test_list_and_status_filter(home, capsys):
 
 
 def test_show_resolves_id_number_and_label(home, capsys):
-    _run(["create", "Findable", "--goal-file", str(_goal_file(home, b"g"))], capsys)
+    _run(["create", "Findable", "--goal-file", str(_goal_file(home, b"g")),
+          "--lane", "claude"], capsys)
     with jdb.connect_closing() as conn:
         jid = jdb.get_job(conn, 1).id
 
@@ -154,7 +183,8 @@ def test_show_resolves_id_number_and_label(home, capsys):
 
 
 def test_transition_via_cli(home, capsys):
-    _run(["create", "T", "--goal-file", str(_goal_file(home, b"g"))], capsys)
+    _run(["create", "T", "--goal-file", str(_goal_file(home, b"g")),
+          "--lane", "claude"], capsys)
     rc, out, _ = _run(
         ["transition", "1", "--status", "finished", "--step", "failed",
          "--reason", "done"],
@@ -166,7 +196,8 @@ def test_transition_via_cli(home, capsys):
 
 
 def test_transition_invalid_reports_nonzero(home, capsys):
-    _run(["create", "T", "--goal-file", str(_goal_file(home, b"g"))], capsys)
+    _run(["create", "T", "--goal-file", str(_goal_file(home, b"g")),
+          "--lane", "claude"], capsys)
     _run(["transition", "1", "--status", "finished", "--step", "failed"], capsys)
     rc, _, err = _run(["transition", "1", "--status", "working", "--step", "building"], capsys)
     assert rc == 2
@@ -174,7 +205,8 @@ def test_transition_invalid_reports_nonzero(home, capsys):
 
 
 def test_heartbeat_via_cli(home, capsys):
-    _run(["create", "T", "--goal-file", str(_goal_file(home, b"g"))], capsys)
+    _run(["create", "T", "--goal-file", str(_goal_file(home, b"g")),
+          "--lane", "claude"], capsys)
     rc, out, _ = _run(["heartbeat", "1", "--at", "1234"], capsys)
     assert rc == 0
     with jdb.connect_closing() as conn:
@@ -182,7 +214,8 @@ def test_heartbeat_via_cli(home, capsys):
 
 
 def test_events_via_cli(home, capsys):
-    _run(["create", "T", "--goal-file", str(_goal_file(home, b"g"))], capsys)
+    _run(["create", "T", "--goal-file", str(_goal_file(home, b"g")),
+          "--lane", "claude"], capsys)
     _run(["heartbeat", "1", "--at", "5"], capsys)
     rc, out, _ = _run(["events", "1"], capsys)
     assert rc == 0
@@ -196,7 +229,10 @@ def test_events_via_cli(home, capsys):
 
 def test_json_is_deterministic_and_leaks_no_env(home, capsys):
     gf = _goal_file(home)
-    rc, out, _ = _run(["create", "Ship", "--goal-file", str(gf), "--json"], capsys)
+    rc, out, _ = _run(
+        ["create", "Ship", "--goal-file", str(gf), "--lane", "claude", "--json"],
+        capsys,
+    )
     assert rc == 0
     loaded = json.loads(out)
     # Canonical sorted form == the raw output (proves deterministic formatting).
@@ -210,7 +246,8 @@ def test_json_is_deterministic_and_leaks_no_env(home, capsys):
 
 
 def test_show_json_matches_store(home, capsys):
-    _run(["create", "J", "--goal-file", str(_goal_file(home, b"g"))], capsys)
+    _run(["create", "J", "--goal-file", str(_goal_file(home, b"g")),
+          "--lane", "claude"], capsys)
     rc, out, _ = _run(["show", "1", "--json"], capsys)
     assert rc == 0
     loaded = json.loads(out)
@@ -247,10 +284,15 @@ import os
 import stat
 
 
-def _mk_job(home, capsys, name="A", goal=b"g", specialist=None):
-    argv = ["create", name, "--goal-file", str(_goal_file(home, goal))]
-    if specialist:
-        argv += ["--specialist", specialist]
+def _mk_job(home, capsys, name="A", goal=b"g", lane="claude"):
+    argv = [
+        "create",
+        name,
+        "--goal-file",
+        str(_goal_file(home, goal)),
+        "--lane",
+        lane,
+    ]
     _run(argv, capsys)
 
 
@@ -258,7 +300,8 @@ def test_claim_writes_token_to_file_never_stdout(home, capsys):
     _mk_job(home, capsys)
     tok = home / "tok"
     rc, out, err = _run(
-        ["claim", "--worker", "w1", "--lease-seconds", "60",
+        ["claim", "--worker", "w1", "--specialist", "claude-builder",
+         "--lease-seconds", "60",
          "--token-out", str(tok), "--json"],
         capsys,
     )
@@ -279,7 +322,8 @@ def test_claim_writes_token_to_file_never_stdout(home, capsys):
 def test_claim_nothing_eligible_reports_not_claimed(home, capsys):
     tok = home / "tok"
     rc, out, _ = _run(
-        ["claim", "--worker", "w1", "--lease-seconds", "60",
+        ["claim", "--worker", "w1", "--specialist", "claude-builder",
+         "--lease-seconds", "60",
          "--token-out", str(tok), "--json"],
         capsys,
     )
@@ -291,7 +335,8 @@ def test_claim_nothing_eligible_reports_not_claimed(home, capsys):
 def test_attempt_start_finish_via_cli(home, capsys):
     _mk_job(home, capsys)
     tok = home / "tok"
-    _run(["claim", "--worker", "w1", "--lease-seconds", "60",
+    _run(["claim", "--worker", "w1", "--specialist", "claude-builder",
+          "--lease-seconds", "60",
           "--token-out", str(tok), "--json"], capsys)
 
     rc, out, _ = _run(
@@ -333,7 +378,7 @@ def test_cli_attempt_history_reads_back_in_ordinal_order(home, capsys, monkeypat
     ids = iter(["a_z_first", "a_a_last"])
     monkeypatch.setattr(jdb, "_new_attempt_id", lambda: next(ids))
 
-    _mk_job(home, capsys, specialist="claude-builder")
+    _mk_job(home, capsys)
     reported = []
 
     tok = home / "tok"
@@ -372,7 +417,8 @@ def test_attempt_finish_terminal_failure_via_cli(home, capsys):
     """finished/failed is reachable only via the explicit flag."""
     _mk_job(home, capsys)
     tok = home / "tok"
-    _run(["claim", "--worker", "w1", "--lease-seconds", "60",
+    _run(["claim", "--worker", "w1", "--specialist", "claude-builder",
+          "--lease-seconds", "60",
           "--token-out", str(tok), "--json"], capsys)
     rc, out, _ = _run(
         ["attempt-start", "1", "--claim-token-file", str(tok), "--json"], capsys
@@ -392,7 +438,8 @@ def test_attempt_finish_terminal_failure_via_cli(home, capsys):
 def test_attempt_finish_conflicting_replay_fails_closed_via_cli(home, capsys):
     _mk_job(home, capsys)
     tok = home / "tok"
-    _run(["claim", "--worker", "w1", "--lease-seconds", "60",
+    _run(["claim", "--worker", "w1", "--specialist", "claude-builder",
+          "--lease-seconds", "60",
           "--token-out", str(tok), "--json"], capsys)
     rc, out, _ = _run(
         ["attempt-start", "1", "--claim-token-file", str(tok), "--json"], capsys
@@ -420,7 +467,8 @@ def test_attempt_start_rejects_inline_token_arg(home, capsys):
 def test_attempt_finish_wrong_token_file_fails_closed(home, capsys):
     _mk_job(home, capsys)
     tok = home / "tok"
-    _run(["claim", "--worker", "w1", "--lease-seconds", "60",
+    _run(["claim", "--worker", "w1", "--specialist", "claude-builder",
+          "--lease-seconds", "60",
           "--token-out", str(tok), "--json"], capsys)
     rc, out, _ = _run(
         ["attempt-start", "1", "--claim-token-file", str(tok), "--json"], capsys
@@ -441,7 +489,8 @@ def test_attempt_finish_wrong_token_file_fails_closed(home, capsys):
 def test_claim_heartbeat_via_cli(home, capsys):
     _mk_job(home, capsys)
     tok = home / "tok"
-    _run(["claim", "--worker", "w1", "--lease-seconds", "60", "--at", "1000",
+    _run(["claim", "--worker", "w1", "--specialist", "claude-builder",
+          "--lease-seconds", "60", "--at", "1000",
           "--token-out", str(tok), "--json"], capsys)
     rc, out, _ = _run(
         ["claim-heartbeat", "1", "--claim-token-file", str(tok),
@@ -455,7 +504,8 @@ def test_claim_heartbeat_via_cli(home, capsys):
 def test_recover_expired_via_cli(home, capsys):
     _mk_job(home, capsys)
     tok = home / "tok"
-    _run(["claim", "--worker", "w1", "--lease-seconds", "60", "--at", "1000",
+    _run(["claim", "--worker", "w1", "--specialist", "claude-builder",
+          "--lease-seconds", "60", "--at", "1000",
           "--token-out", str(tok), "--json"], capsys)
     rc, out, _ = _run(["recover-expired", "--at", "5000", "--json"], capsys)
     assert rc == 0
@@ -468,7 +518,7 @@ def test_intake_via_cli_is_idempotent(home, capsys):
     gf = _goal_file(home, b"run the thing")
     rc, out, _ = _run(
         ["intake", "Scheduled", "--source-type", "cron", "--source-key", "d1",
-         "--goal-file", str(gf), "--json"],
+         "--goal-file", str(gf), "--lane", "claude", "--json"],
         capsys,
     )
     assert rc == 0
@@ -477,7 +527,7 @@ def test_intake_via_cli_is_idempotent(home, capsys):
 
     rc, out, _ = _run(
         ["intake", "Scheduled", "--source-type", "cron", "--source-key", "d1",
-         "--goal-file", str(gf), "--json"],
+         "--goal-file", str(gf), "--lane", "claude", "--json"],
         capsys,
     )
     second = json.loads(out)
@@ -491,7 +541,8 @@ def test_intake_via_cli_is_idempotent(home, capsys):
 def _claimed_attempt(home, capsys, tok):
     """Claim job 1 into ``tok`` and start an attempt; return the attempt id."""
     _mk_job(home, capsys)
-    _run(["claim", "--worker", "w1", "--lease-seconds", "60",
+    _run(["claim", "--worker", "w1", "--specialist", "claude-builder",
+          "--lease-seconds", "60",
           "--token-out", str(tok), "--json"], capsys)
     _, out, _ = _run(
         ["attempt-start", "1", "--claim-token-file", str(tok), "--json"], capsys
@@ -559,7 +610,8 @@ def test_token_write_refuses_to_follow_a_symlink(home, capsys):
     link = home / "tok"
     link.symlink_to(target)
     rc, _, err = _run(
-        ["claim", "--worker", "w1", "--lease-seconds", "60",
+        ["claim", "--worker", "w1", "--specialist", "claude-builder",
+         "--lease-seconds", "60",
          "--token-out", str(link), "--json"],
         capsys,
     )
@@ -574,7 +626,8 @@ def test_token_write_refuses_to_overwrite_an_existing_file(home, capsys):
     tok = home / "tok"
     tok.write_text("decoy")
     rc, _, err = _run(
-        ["claim", "--worker", "w1", "--lease-seconds", "60",
+        ["claim", "--worker", "w1", "--specialist", "claude-builder",
+         "--lease-seconds", "60",
          "--token-out", str(tok), "--json"],
         capsys,
     )
@@ -588,7 +641,8 @@ def test_claim_is_released_when_the_token_file_cannot_be_written(home, capsys):
     blocked = home / "blocked"
     blocked.mkdir()  # os.open() for writing fails with EISDIR
     rc, _, err = _run(
-        ["claim", "--worker", "w1", "--lease-seconds", "60",
+        ["claim", "--worker", "w1", "--specialist", "claude-builder",
+         "--lease-seconds", "60",
          "--token-out", str(blocked), "--json"],
         capsys,
     )
@@ -601,7 +655,8 @@ def test_claim_is_released_when_the_token_file_cannot_be_written(home, capsys):
     # And the Job is immediately claimable again.
     ok = home / "tok2"
     rc, out, _ = _run(
-        ["claim", "--worker", "w2", "--lease-seconds", "60",
+        ["claim", "--worker", "w2", "--specialist", "claude-builder",
+         "--lease-seconds", "60",
          "--token-out", str(ok), "--json"],
         capsys,
     )
@@ -611,7 +666,8 @@ def test_claim_is_released_when_the_token_file_cannot_be_written(home, capsys):
 def test_token_never_surfaces_in_show_or_events(home, capsys):
     _mk_job(home, capsys)
     tok = home / "tok"
-    _run(["claim", "--worker", "w1", "--lease-seconds", "60",
+    _run(["claim", "--worker", "w1", "--specialist", "claude-builder",
+          "--lease-seconds", "60",
           "--token-out", str(tok), "--json"], capsys)
     token = tok.read_text().strip()
 

@@ -21,36 +21,36 @@ from hermes_cli import jobs_exec as jx
 # ---------------------------------------------------------------------------
 
 
-def test_route_unassigned_job_goes_to_the_claude_builder():
-    d = jx.route(specialist=None)
-    assert d.specialist == "claude-builder"
-    assert d.model == "claude-opus-5"
-    assert d.effort == "max"
-    assert d.executable is True
-    assert d.reason
+def test_route_requires_an_explicit_specialist_without_a_claude_default():
+    with pytest.raises(jx.UnsupportedRouting):
+        jx.route(specialist=None)
 
 
-def test_route_named_claude_builder_lands_on_the_same_lane_as_unassigned():
-    named = jx.route(specialist="claude-builder")
-    unassigned = jx.route(specialist=None)
-    assert (named.specialist, named.model, named.effort, named.executable) == (
-        unassigned.specialist,
-        unassigned.model,
-        unassigned.effort,
-        unassigned.executable,
-    )
-    # The lane is the same; the explanation is not, and should not be.
-    assert named.reason != unassigned.reason
+def test_route_named_claude_builder_is_executable():
+    decision = jx.route(specialist="claude-builder")
+    assert (
+        decision.specialist,
+        decision.model,
+        decision.effort,
+        decision.executable,
+    ) == ("claude-builder", "claude-opus-5", "max", True)
+    assert decision.reason
 
 
 def test_route_is_deterministic_across_calls():
-    assert jx.route(specialist=None) == jx.route(specialist=None)
+    assert jx.route(specialist="claude-builder") == jx.route(
+        specialist="claude-builder"
+    )
+    assert jx.route(specialist="codex-builder") == jx.route(
+        specialist="codex-builder"
+    )
     assert jx.route(specialist="gpt-builder") == jx.route(specialist="gpt-builder")
 
 
-def test_route_managed_gpt_is_represented_but_not_executable():
-    d = jx.route(specialist="gpt-builder")
-    assert d.specialist == "gpt-builder"
+@pytest.mark.parametrize("specialist", ["codex-builder", "gpt-builder"])
+def test_route_codex_and_legacy_gpt_alias_share_the_canonical_route(specialist):
+    d = jx.route(specialist=specialist)
+    assert d.specialist == "codex-builder"
     assert d.model == "gpt-5.6-sol"
     assert d.effort in jx.EFFORT_TIERS
     # Represented and tested, unreachable until its adapter exists.
@@ -70,7 +70,7 @@ def test_route_rejects_a_blank_specialist_rather_than_defaulting():
 
 
 def test_routing_decision_is_immutable():
-    d = jx.route(specialist=None)
+    d = jx.route(specialist="claude-builder")
     with pytest.raises(Exception):
         d.model = "something-else"  # type: ignore[misc]
 
@@ -194,18 +194,18 @@ def test_validate_execution_rejects_unknown_execution_keys():
 def test_execution_spec_must_match_the_routed_model():
     spec = jx.validate_execution(_meta(model="gpt-5.6-sol"))
     with pytest.raises(jx.UnsupportedRouting):
-        jx.require_agreement(jx.route(specialist=None), spec)
+        jx.require_agreement(jx.route(specialist="claude-builder"), spec)
 
 
 def test_execution_spec_matching_the_routed_model_agrees():
     spec = jx.validate_execution(_meta())
-    jx.require_agreement(jx.route(specialist=None), spec)  # no raise
+    jx.require_agreement(jx.route(specialist="claude-builder"), spec)  # no raise
 
 
 def test_agreement_refuses_a_specialist_with_no_adapter():
     spec = jx.validate_execution(_meta(model="gpt-5.6-sol", effort="high"))
     with pytest.raises(jx.UnsupportedRouting):
-        jx.require_agreement(jx.route(specialist="gpt-builder"), spec)
+        jx.require_agreement(jx.route(specialist="codex-builder"), spec)
 
 
 # ---------------------------------------------------------------------------

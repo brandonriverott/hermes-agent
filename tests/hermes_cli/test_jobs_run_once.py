@@ -112,7 +112,7 @@ def _execution(repo_path, base, **overrides):
     return {"execution": execution}
 
 
-def _make_job(name="Ship it", specialist=None):
+def _make_job(name="Ship it", specialist="claude-builder"):
     with jdb.connect_closing() as conn:
         jid = jdb.create_job(conn, name=name, goal="do the work", specialist=specialist)
         return jdb.get_job(conn, jid)
@@ -120,6 +120,7 @@ def _make_job(name="Ship it", specialist=None):
 
 def _run_once(tmp_path, repo_path, base, worker=None, **kwargs):
     kwargs.setdefault("worker_id", "runner-1")
+    kwargs.setdefault("specialist", "claude-builder")
     kwargs.setdefault("wall_clock_seconds", 60)
     kwargs.setdefault("heartbeat_seconds", 60)
     kwargs.setdefault("now", T0)
@@ -369,7 +370,8 @@ def _abandon(job, lease=60, now=T0):
     """Claim and start an attempt, then walk away — a killed worker."""
     with jdb.connect_closing() as conn:
         claim = jdb.claim_job(
-            conn, worker="dead-runner", job=job.number, lease_seconds=lease, now=now
+            conn, worker="dead-runner", job=job.number,
+            specialist=job.specialist, lease_seconds=lease, now=now,
         )
         jdb.start_attempt(conn, job.id, claim_token=claim.claim_token, now=now)
 
@@ -486,6 +488,15 @@ def test_a_specialist_with_no_adapter_fails_closed(home, tmp_path, repo):
         tmp_path, path, base, specialist="gpt-builder",
         execution=_execution(path, base, model="gpt-5.6-sol", effort="high"),
     )
+    _assert_clean_refusal(job, res, "unsupported_routing")
+
+
+def test_an_unassigned_legacy_job_has_no_implicit_claude_route(
+    home, tmp_path, repo
+):
+    path, base = repo
+    job = _make_job(specialist=None)
+    res = _run_once(tmp_path, path, base, specialist=None)
     _assert_clean_refusal(job, res, "unsupported_routing")
 
 
@@ -647,6 +658,7 @@ def test_run_once_cli_drives_the_same_seam(home, tmp_path, repo, capsys):
         "--workspace-root", str(tmp_path / "ws"),
         "--execution-file", str(ef),
         "--worker-id", "cli-runner",
+        "--specialist", "claude-builder",
         "--wall-clock-seconds", "60",
         "--json",
     ])
@@ -729,6 +741,7 @@ def test_a_setup_failure_after_the_attempt_starts_reports_the_real_attempt(
         worker_command=_worker(tmp_path),
         workspace_root=blocked,
         worker_id="runner-1",
+        specialist="claude-builder",
         execution=_execution(path, base),
         wall_clock_seconds=60,
         heartbeat_seconds=60,
@@ -762,7 +775,8 @@ def test_every_terminal_attempt_including_a_recovered_one_has_one_final_receipt(
     job = _make_job()
     with jdb.connect_closing() as conn:
         claim = jdb.claim_job(
-            conn, worker="died", job=job.number, lease_seconds=60, now=T0
+            conn, worker="died", job=job.number,
+            specialist=job.specialist, lease_seconds=60, now=T0,
         )
         abandoned = jdb.start_attempt(
             conn, job.id, claim_token=claim.claim_token,
@@ -794,7 +808,8 @@ def test_a_public_caller_cannot_pre_seed_a_final_receipt(home, tmp_path, repo):
     job = _make_job()
     with jdb.connect_closing() as conn:
         claim = jdb.claim_job(
-            conn, worker="hostile", job=job.number, lease_seconds=600, now=T0
+            conn, worker="hostile", job=job.number,
+            specialist=job.specialist, lease_seconds=600, now=T0,
         )
         aid = jdb.start_attempt(
             conn, job.id, claim_token=claim.claim_token,
@@ -1055,6 +1070,7 @@ def test_run_once_cli_replays_a_settled_request(home, tmp_path, repo, capsys):
         "run-once", "--worker", " ".join(worker),
         "--workspace-root", str(tmp_path / "ws"), "--execution-file", str(ef),
         "--worker-id", "cli", "--request-id", "cli-req-1",
+        "--specialist", "claude-builder",
         "--wall-clock-seconds", "60", "--json",
     ]
     assert _cli(argv) == 0
@@ -1263,7 +1279,8 @@ def _claimed_attempt(job, request_id, *, worker="hostile-runner", now=T0):
             conn, request_id, owner=worker, lease_seconds=600, now=now
         )
         claim = jdb.claim_job(
-            conn, worker=worker, job=job.number, lease_seconds=600, now=now
+            conn, worker=worker, job=job.number,
+            specialist=job.specialist, lease_seconds=600, now=now,
         )
         aid = jdb.start_attempt(
             conn, job.id, claim_token=claim.claim_token,

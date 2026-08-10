@@ -11,7 +11,7 @@ model-tool schema cost. It shares no code and no database with Kanban.
 
 V1 commands::
 
-    hermes jobs create <name> --goal-file <path> [--specialist <name>]
+    hermes jobs create <name> --goal-file <path> --lane claude|codex
                               [--routing-reason <text>] [--skills <name>] [--json]
     hermes jobs list [--status working|needs_you|finished] [--json]
     hermes jobs show <id-or-number> [--json]
@@ -35,6 +35,7 @@ from pathlib import Path
 
 from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_exec as jx
+from hermes_cli import jobs_identity as ji
 from hermes_cli import jobs_run as jrun
 
 
@@ -68,7 +69,12 @@ def build_parser(
         metavar="PATH",
         help="Path to a UTF-8 file whose contents become the verbatim goal",
     )
-    p_create.add_argument("--specialist", default=None, help="Assigned specialist")
+    p_create.add_argument(
+        "--lane",
+        required=True,
+        choices=ji.REQUESTED_LANES,
+        help="Requested executor lane",
+    )
     p_create.add_argument(
         "--routing-reason", default=None, help="Why this specialist was chosen"
     )
@@ -321,7 +327,12 @@ def build_parser(
         "--goal-file", required=True, metavar="PATH",
         help="Path to a UTF-8 file whose contents become the verbatim goal",
     )
-    p_in.add_argument("--specialist", default=None)
+    p_in.add_argument(
+        "--lane",
+        required=True,
+        choices=ji.REQUESTED_LANES,
+        help="Requested executor lane",
+    )
     p_in.add_argument("--routing-reason", default=None)
     p_in.add_argument(
         "--correlation", action="append", default=None, metavar="KANBAN_ID",
@@ -445,7 +456,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 conn,
                 name=args.name,
                 goal=goal,
-                specialist=args.specialist,
+                requested_lane=args.lane,
                 routing_reason=args.routing_reason,
                 correlations=args.correlation,
                 skills=args.skills,
@@ -788,7 +799,7 @@ def _cmd_intake(args: argparse.Namespace) -> int:
                 source_key=args.source_key,
                 name=args.name,
                 goal=goal,
-                specialist=args.specialist,
+                requested_lane=args.lane,
                 routing_reason=args.routing_reason,
                 correlations=args.correlation,
             )

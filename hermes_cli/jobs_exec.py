@@ -10,7 +10,7 @@ function that cannot touch the world cannot half-apply a decision.
 Four contracts live here:
 
 - :func:`route` — ``specialist -> (specialist, model, effort, reason)``. Claude
-  Opus 5 is the only *executable* target in this slice; the managed GPT-5.6 Sol
+  Opus 5 is the only *executable* target in this slice; the managed Codex
   decision is represented and tested but marked non-executable until its adapter
   exists, so an unbuilt lane fails closed instead of silently running on Claude.
 - :func:`validate_execution` — the ``metadata.execution`` sub-contract. The
@@ -38,16 +38,11 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from hermes_cli import jobs_db as jdb
+from hermes_cli import jobs_identity as ji
 
 # ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
-
-CLAUDE_SPECIALIST = "claude-builder"
-GPT_SPECIALIST = "gpt-builder"
-
-CLAUDE_MODEL = "claude-opus-5"
-GPT_MODEL = "gpt-5.6-sol"
 
 # ``max`` exists on ``claude --effort`` only; the managed gateway tops out at
 # ``xhigh`` (see the V3 recon). Both live in one tuple because this is the set a
@@ -87,46 +82,37 @@ class RoutingDecision:
 def route(*, specialist: Optional[str]) -> RoutingDecision:
     """Decide the execution lane for a Job. Pure, total, and deterministic.
 
-    ``specialist=None`` is unassigned routing work and lands on the Claude
-    builder — the one lane with an adapter. A blank string is *not* the same
-    thing: it is a malformed assignment, and guessing on top of malformed data
-    is how a Job silently runs somewhere nobody chose.
+    The specialist must be explicit.  ``gpt-builder`` remains a read-only alias
+    for historical rows and normalizes to ``codex-builder``; neither an absent
+    nor malformed specialist silently lands on Claude.
 
     ponytail: the Job's step is deliberately not an input. Nothing in this slice
     routes differently for ``correcting`` vs ``building``; the reviewer lane that
     would is a later slice. A parameter that cannot change the answer is a
     parameter that lies about how the decision is made.
     """
-    if specialist is None:
-        return RoutingDecision(
-            specialist=CLAUDE_SPECIALIST,
-            model=CLAUDE_MODEL,
-            effort="max",
-            reason="unassigned job routed to the only lane with an adapter",
-            executable=True,
-        )
     if not isinstance(specialist, str) or not specialist.strip():
         raise UnsupportedRouting(
-            "specialist must be a non-empty name or None (unassigned)"
+            "specialist must explicitly name claude-builder or codex-builder"
         )
     name = specialist.strip()
-    if name == CLAUDE_SPECIALIST:
+    if name == ji.CLAUDE_SPECIALIST:
         return RoutingDecision(
-            specialist=CLAUDE_SPECIALIST,
-            model=CLAUDE_MODEL,
+            specialist=ji.CLAUDE_SPECIALIST,
+            model=ji.CLAUDE_MODEL,
             effort="max",
             reason="job assigned to the Claude builder",
             executable=True,
         )
-    if name == GPT_SPECIALIST:
+    if name in (ji.CODEX_SPECIALIST, ji.LEGACY_GPT_SPECIALIST):
+        reason = "job assigned to the Codex builder"
+        if name == ji.LEGACY_GPT_SPECIALIST:
+            reason += " through the historical gpt-builder alias"
         return RoutingDecision(
-            specialist=GPT_SPECIALIST,
-            model=GPT_MODEL,
+            specialist=ji.CODEX_SPECIALIST,
+            model=ji.CODEX_MODEL,
             effort="high",
-            reason=(
-                "job assigned to the managed GPT builder, whose adapter is not "
-                "built in this slice"
-            ),
+            reason=f"{reason}; its adapter is not built in this slice",
             executable=False,
         )
     raise UnsupportedRouting(f"no execution lane for specialist {specialist!r}")
