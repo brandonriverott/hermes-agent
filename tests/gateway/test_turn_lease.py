@@ -182,19 +182,22 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
 
     runner = _bootstrap(monkeypatch, tmp_path)
-    runner._turn_leases = SessionTurnLeaseRegistry()
+    lease_timeout = TurnLeaseTimeoutError(
+        "sess-dedup",
+        owner_key="agent:main:telegram:group:-1001:12345",
+        generation=1,
+        wait_seconds=0.02,
+    )
+    runner._turn_leases = MagicMock()
+    runner._turn_leases.acquire = AsyncMock(side_effect=lease_timeout)
     # This test owns the outer-dispatch/lease seam, not AsyncSessionStore's
-    # thread-pool scheduling. Keep session lookup in-process so a saturated
-    # suite-wide executor cannot spend the entire assertion budget before the
-    # 20 ms lease timeout is even reached.
+    # thread-pool scheduling. Keep session lookup in-process; the facade must
+    # identify its backing store or the property deliberately replaces it.
     runner._async_session_store = MagicMock()
+    runner._async_session_store._store = runner.session_store
     runner._async_session_store.get_or_create_session = AsyncMock(
         return_value=runner.session_store.get_or_create_session.return_value
     )
-    holder = await runner._turn_leases.acquire(
-        "sess-dedup", owner_key="holder-key", generation=1, timeout=1
-    )
-    assert holder is not None
     monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "5")
     monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
 
@@ -207,14 +210,17 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner._run_agent = pytest.fail
     runner._post_turn_goal_continuation = AsyncMock()
 
-    try:
-        response = await asyncio.wait_for(runner._handle_message(_event()), timeout=1)
-    finally:
-        assert runner._turn_leases.release(holder) is True
+    response = await runner._handle_message(_event())
 
     assert isinstance(response, str)
     assert "not processed" in response.lower()
     assert "resend" in response.lower()
+    runner._turn_leases.acquire.assert_awaited_once_with(
+        "sess-dedup",
+        owner_key="agent:main:telegram:group:-1001:12345",
+        generation=1,
+        timeout=0.02,
+    )
     runner.session_store.load_transcript.assert_not_called()
     runner._clear_session_env.assert_called_once_with(session_env_tokens)
     runner._post_turn_goal_continuation.assert_not_awaited()
