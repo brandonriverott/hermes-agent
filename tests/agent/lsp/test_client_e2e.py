@@ -32,6 +32,34 @@ def _client(workspace: Path, script: str = "clean") -> LSPClient:
 
 
 @pytest.mark.asyncio
+async def test_cleanup_waits_for_clean_exit_before_signalling(tmp_path: Path):
+    """A protocol-compliant server gets the grace period before SIGTERM."""
+
+    class CleanExitProcess:
+        returncode = None
+
+        async def wait(self):
+            await asyncio.sleep(0)
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            raise AssertionError("clean exit was interrupted with SIGTERM")
+
+        def kill(self):
+            raise AssertionError("clean exit was interrupted with SIGKILL")
+
+    client = _client(tmp_path)
+    process = CleanExitProcess()
+    client._proc = process
+
+    await client._cleanup_process()
+
+    assert process.returncode == 0
+    assert client._proc is None
+
+
+@pytest.mark.asyncio
 async def test_client_lifecycle_clean(tmp_path: Path):
     """Full lifecycle: spawn, initialize, open, get clean diagnostics, shutdown."""
     f = tmp_path / "x.py"
@@ -70,7 +98,6 @@ async def test_client_receives_published_errors(tmp_path: Path):
         assert "synthetic error" in d["message"]
     finally:
         await client.shutdown()
-
 
 
 

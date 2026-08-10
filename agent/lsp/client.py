@@ -80,7 +80,7 @@ DIAGNOSTICS_DOCUMENT_WAIT = 5.0
 DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
 PUSH_DEBOUNCE = 0.15
-SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
+SHUTDOWN_GRACE = 1.0  # seconds allowed at each shutdown escalation step
 
 # Retry policy for transient ContentModified errors.
 MAX_CONTENT_MODIFIED_RETRIES = 3
@@ -492,15 +492,23 @@ class LSPClient:
             return
         if proc.returncode is None:
             try:
-                proc.terminate()
+                # ``shutdown`` + ``exit`` asks a compliant LSP server to stop
+                # itself. Give that protocol exit time to be reaped before
+                # sending a signal; immediately calling terminate() can race a
+                # child that has exited but whose returncode callback has not
+                # run yet, and can target a reparented/reused PID under load.
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
                 except asyncio.TimeoutError:
+                    proc.terminate()
                     try:
-                        proc.kill()
-                        await proc.wait()
-                    except ProcessLookupError:
-                        pass
+                        await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+                    except asyncio.TimeoutError:
+                        try:
+                            proc.kill()
+                            await proc.wait()
+                        except ProcessLookupError:
+                            pass
             except ProcessLookupError:
                 pass
 
