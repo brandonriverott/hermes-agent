@@ -389,6 +389,7 @@ CREATE TABLE IF NOT EXISTS job_notifications (
     delivery_attempts INTEGER NOT NULL DEFAULT 0,
     last_error        TEXT,
     delivered_at      INTEGER,
+    blocked_reason    TEXT,
     UNIQUE (job_id, job_revision, milestone)
 );
 
@@ -964,6 +965,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # from the row alone. No released build ever wrote that column.)
     add_column_if_missing(
         conn, "job_attempts", "terminal_failure", "terminal_failure INTEGER"
+    )
+    # Gateway delivery can park a row in a visible, durable blocked state
+    # (e.g. an unknown platform) instead of silently retrying it forever.
+    add_column_if_missing(
+        conn, "job_notifications", "blocked_reason", "blocked_reason TEXT"
     )
     # A response stored before these existed cannot be re-sealed from the row
     # alone, so it arrives NULL and :func:`_validated_response_locked` refuses

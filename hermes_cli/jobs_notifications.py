@@ -74,6 +74,7 @@ class NotificationRecord:
     delivery_attempts: int
     last_error: Optional[str]
     delivered_at: Optional[int]
+    blocked_reason: Optional[str] = None
 
 
 def milestone_for_state(
@@ -126,6 +127,7 @@ def _record(row: sqlite3.Row) -> NotificationRecord:
         delivery_attempts=int(row["delivery_attempts"]),
         last_error=row["last_error"],
         delivered_at=row["delivered_at"],
+        blocked_reason=row["blocked_reason"],
     )
 
 
@@ -227,6 +229,7 @@ def claim_due(
             "SELECT * FROM job_notifications n "
             "WHERE n.next_attempt_at <= ? "
             "AND n.delivered_at IS NULL "
+            "AND n.blocked_reason IS NULL "
             "AND (n.claim_expires_at IS NULL OR n.claim_expires_at <= ?) "
             "AND NOT EXISTS ("
             "  SELECT 1 FROM job_notifications earlier "
@@ -337,6 +340,49 @@ def acknowledge(
         return _fetch(conn, notification_id)
 
 
+def block_notification(
+    conn: sqlite3.Connection,
+    notification_id: str,
+    *,
+    owner: str,
+    reason: str,
+    now: Optional[int] = None,
+) -> NotificationRecord:
+    """Park a row in a durable, visible blocked state.
+
+    The row keeps its intent and payload (``list_notifications`` still
+    surfaces it, so health/status commands can report it) but is never
+    claimable again: :func:`claim_due` excludes ``blocked_reason IS NOT
+    NULL`` rows.  ``reason`` is a bounded, safe, human-readable string
+    (never credentials or secrets).  Only the current claim owner may
+    block a row, so a lost claim fences the writer the same way
+    :func:`acknowledge` does.
+    """
+    if not owner:
+        raise ValueError("claim owner must not be empty")
+    if not reason:
+        raise ValueError("blocked reason must not be empty")
+    if len(reason) > MAX_ERROR_CHARS:
+        raise ValueError("blocked reason exceeds size bound")
+    now = int(now) if now is not None else _now()
+    from hermes_cli.sqlite_util import write_txn
+
+    with write_txn(conn):
+        cursor = conn.execute(
+            "UPDATE job_notifications "
+            "SET blocked_reason = ?, claim_owner = NULL, claim_expires_at = NULL, "
+            "    last_error = ? "
+            "WHERE notification_id = ? AND claim_owner = ? "
+            "AND delivered_at IS NULL",
+            (reason, f"blocked: {reason}", notification_id, owner),
+        )
+        if cursor.rowcount == 0:
+            raise NotificationClaimError(
+                f"notification {notification_id!r} is not owned by {owner!r}"
+            )
+        return _fetch(conn, notification_id)
+
+
 def _now() -> int:
     import time
 
@@ -359,6 +405,7 @@ __all__ = [
     "NotificationClaimError",
     "NotificationRecord",
     "acknowledge",
+    "block_notification",
     "claim_due",
     "enqueue_locked",
     "list_notifications",
