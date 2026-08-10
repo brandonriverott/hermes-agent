@@ -153,6 +153,10 @@ def test_parallel_files_receive_distinct_pytest_temp_roots(tmp_path: Path) -> No
     ]
     assert all(roots), proc.stdout
     assert len(set(roots)) == 2, roots
+    if sys.platform == "darwin":
+        # Leave enough of macOS's 104-byte AF_UNIX budget for pytest's
+        # per-user/session/test-name suffix and a conventional socket path.
+        assert all(len(str(Path(root).resolve())) <= 32 for root in roots), roots
     assert all(not Path(root).exists() for root in roots)
 
 

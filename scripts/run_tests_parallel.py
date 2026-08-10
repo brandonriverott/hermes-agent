@@ -352,7 +352,10 @@ def _run_one_file_once(
     # subprocesses replace and resolve that symlink concurrently; on macOS the
     # loser can raise EINVAL after every test passed. Give each subprocess its
     # own root so session cleanup has a single owner.
-    pytest_temproot = Path(tempfile.mkdtemp(prefix="hermes-pytest-"))
+    # Keep the root deliberately short. pytest adds user/session/test-name
+    # components below it, and macOS limits AF_UNIX paths to 104 bytes; a
+    # descriptive prefix can make otherwise valid socket tests unbindable.
+    pytest_temproot = Path(tempfile.mkdtemp(prefix="pt-"))
     child_env = os.environ.copy()
     child_env["PYTEST_DEBUG_TEMPROOT"] = str(pytest_temproot)
 
