@@ -1,0 +1,53 @@
+{
+  "$id": "https://hermes.nousresearch.com/schemas/jobs-codex-result.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Jobs Codex attempt result (v1)",
+  "description": "Bounded, provider-neutral result fields Codex exec may emit. The adapter independently observes git/artifact bytes rather than trusting self-reported fields.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "succeeded",
+        "failed"
+      ]
+    },
+    "failure_class": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        null,
+        "implementation",
+        "infrastructure",
+        "timeout",
+        "safety",
+        "cancelled"
+      ]
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 512
+    },
+    "commit": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Self-reported candidate commit; the adapter reads git directly."
+    }
+  },
+  "dependentRequired": {
+    "failure_class": [
+      "reason"
+    ]
+  }
+}

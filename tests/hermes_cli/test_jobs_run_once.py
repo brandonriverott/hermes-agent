@@ -597,11 +597,17 @@ def test_run_once_invokes_only_the_persisted_executor(
     ]
 
 
-def test_a_canonical_codex_job_with_no_installed_adapter_fails_closed(
+def test_a_canonical_codex_job_through_legacy_seam_without_lane_auth_fails_closed(
     home, tmp_path, repo, monkeypatch
 ):
+    """A Codex job through the legacy seam (no lane auth root) must fail closed.
+
+    The production registry now has a real Codex adapter, so
+    ``require_legacy("codex")`` succeeds.  But the legacy seam does not supply
+    a lane-scoped ``CODEX_HOME``, so the adapter refuses in ``run_attempt``
+    before any provider spend.  The Claude adapter must never be invoked.
+    """
     path, base = repo
-    job = _make_job(specialist="codex-builder", requested_lane="codex")
     claude_calls: list[str] = []
 
     def forbidden(stage):
@@ -622,7 +628,7 @@ def test_a_canonical_codex_job_with_no_installed_adapter_fails_closed(
         tmp_path, path, base, specialist="codex-builder",
         execution=_execution(path, base, model="gpt-5.6-sol", effort="high"),
     )
-    _assert_clean_refusal(job, res, "unsupported_routing")
+    assert res["ran"] is False
     assert claude_calls == []
 
 

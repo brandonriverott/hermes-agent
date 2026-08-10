@@ -95,11 +95,15 @@ def test_injected_reliability_adapters_select_only_the_exact_executor():
 
 
 def test_task_three_production_registry_has_no_fake_codex_adapter():
+    """Task 4 installed the real Codex adapter — verify both lanes are bound correctly."""
     production = executors.production_registry()
 
     assert production.require_legacy("claude").name == "claude"
-    with pytest.raises(executors.UnsupportedExecutor, match="no installed legacy adapter"):
-        production.require_legacy("codex")
+    codex_adapter = production.require_legacy("codex")
+    assert codex_adapter.name == "codex"
+    assert callable(codex_adapter.preflight)
+    assert callable(codex_adapter.preflight_skills)
+    assert callable(codex_adapter.run_attempt)
 
 
 def test_historical_gpt_alias_normalizes_only_at_the_identity_boundary():

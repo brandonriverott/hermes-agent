@@ -140,13 +140,15 @@ registry = ExecutorRegistry(
 
 
 def production_registry() -> ExecutorRegistry:
-    """Install only adapters that exist in this release slice.
+    """Install the adapters that exist in this release slice.
 
-    Task 4 will install Codex.  Until then the Codex identity is recognized but
-    every attempt to obtain its callable raises :class:`UnsupportedExecutor`.
+    Both Claude and Codex are registered with their explicit legacy adapters.
+    No provider substitution: a Codex call cannot land on the Claude adapter
+    and vice versa. Every identity is resolved before any provider call.
     """
 
     from hermes_cli import jobs_adapter_claude as claude
+    from hermes_cli import jobs_adapter_codex as codex
 
     return registry.with_legacy_adapters(
         {
@@ -155,6 +157,12 @@ def production_registry() -> ExecutorRegistry:
                 preflight=claude.preflight,
                 preflight_skills=claude.preflight_skills,
                 run_attempt=claude.run_claude_attempt,
-            )
+            ),
+            ji.CODEX_EXECUTOR: LegacyExecutorAdapter(
+                name=ji.CODEX_EXECUTOR,
+                preflight=codex.preflight,
+                preflight_skills=codex.preflight_skills,
+                run_attempt=codex.run_codex_attempt,
+            ),
         }
     )
