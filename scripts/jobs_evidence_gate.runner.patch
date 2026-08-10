@@ -1,0 +1,184 @@
+--- a/pc-jobs-worker.sh
++++ b/pc-jobs-worker.sh
+@@ -38,6 +38,22 @@
+ JOBS_ROOT="${JOBS_ROOT:-$HOME/jobs}"   # Mac fallback overrides this
+ export PATH="$HOME/.local/bin:$PATH"
+ 
++# The evidence gate is deployed BESIDE this script, never inside the worktree.
++# A builder holds Write and Bash over everything under $job_dir/wt, so a gate
++# that lived there would be a gate the candidate could edit. Source of truth is
++# scripts/jobs_evidence_gate.py in hermes-agent; it deploys here with this file
++# and under the same byte-identical Mac/PC rule.
++GATE="${JOBS_GATE:-$HOME/.local/bin/jobs_evidence_gate.py}"
++
++# Bind one receipt to this job, this attempt, and the commit that is actually
++# checked out now. HEAD is read AFTER the seat has run: VULCAN and THEMIS both
++# hold Bash, so either can move it, and evidence gathered at a commit that is
++# not the candidate must never settle the candidate.
++gate_stamp() { # gate_stamp <receipt> <tests|review> <attempt>
++  python3 "$GATE" stamp --file "$1" --kind "$2" --job "$key" \
++    --attempt "$3" --commit "$(git rev-parse HEAD 2>/dev/null)" --base "$BASE"
++}
++
+ mode="${1:-}"; key="${2:-}"
+ [ -n "$mode" ] && [ -n "$key" ] || { echo "usage: $0 spawn|inner|status <key> ..." >&2; exit 2; }
+ job_dir="$JOBS_ROOT/$key"
+@@ -264,8 +280,8 @@
+   return 1
+ }
+ 
+-run_tests() { # run_tests ; writes tests.json under VULCAN's rules
+-  local out="$job_dir/tests.json" soul=""
++run_tests() { # run_tests <attempt> ; writes tests.json under VULCAN's rules
++  local attempt="$1" out="$job_dir/tests.json" soul=""
+   if ! verify_souls; then
+     printf '{"tests": [], "skipped": [{"cmd": "all", "reason": "reviewer prompt tampered during build"}], "verdict_hint": "nothing_runnable"}\n' > "$job_dir/tests.json"
+     return 1
+@@ -342,6 +358,7 @@
+     json.dump(d, f)
+ os.replace(tmp, sys.argv[2])
+ PYEOF
++  gate_stamp "$out" tests "$attempt"
+ }
+ 
+ run_review() { # run_review <round> ; THEMIS judges on the diff + VULCAN's evidence
+@@ -397,6 +414,7 @@
+ json.dump(d, open(sys.argv[2], "w"))
+ print(d["verdict"])
+ PYEOF
++  gate_stamp "$out" review "$round"
+ }
+ 
+ case "$mode" in
+@@ -413,6 +431,7 @@
+     if [ -f "$job_dir/done.json" ]; then echo "ALREADY_DONE"; exit 0; fi
+     if tmux has-session -t "jobs-$key" 2>/dev/null; then echo "ALREADY_RUNNING"; exit 0; fi
+     [ -f "$job_dir/goal.md" ] || { echo "NO_GOAL (scp goal.md first)" >&2; exit 1; }
++    [ -f "$GATE" ] || { echo "NO_GATE $GATE (deploy jobs_evidence_gate.py first)" >&2; exit 1; }
+     [ -d "$repo_dir/.git" ] || { echo "NO_REPO $repo_dir" >&2; exit 1; }
+     git -C "$repo_dir" cat-file -e "$base^{commit}" 2>/dev/null \
+       || { echo "NO_BASE $base (push it to me first)" >&2; exit 1; }
+@@ -482,7 +501,10 @@
+ 
+     # A settled build wrote its own answer. Anything else ended without one,
+     # and silence is the failure mode this whole layer exists to prevent.
+-    if [ ! -f "$job_dir/done.json" ]; then
++    # gate.json, not done.json: $job_dir is writable by the builder, so a
++    # done.json here proves only that something wrote a file. The gate is the
++    # only thing that writes gate.json, and it writes it before done.json.
++    if [ ! -f "$job_dir/gate.json" ]; then
+       case "$inner_rc" in
+         124|137) v="DEADLINE_EXCEEDED" ;;
+         *)       v="SUPERVISOR_LOST_THE_BUILD" ;;
+@@ -504,8 +526,9 @@
+     # hash + lock the reviewer prompts BEFORE any builder runs. No souls, no
+     # review, no build: an unreviewable run must not look like a reviewed one.
+     if ! seal_souls; then
+-      printf '{"outcome":"failed","claude_exit":0,"commit":"","branch":"jobs/%s","review_verdict":"REVIEWER_PROMPTS_MISSING","review_rounds":0,"findings":0,"effort":"%s"}\n' \
+-        "$key" "$EFFORT" | atomic_json "$job_dir/done.json"
++      python3 "$GATE" settle --job-dir "$job_dir" --job "$key" \
++        --branch "jobs/$key" --base "$BASE" --commit "" \
++        --build-exit 0 --rounds 0 --attempt 0 --effort "$EFFORT" --souls-ok 0
+       exit 1
+     fi
+ 
+@@ -519,12 +542,12 @@
+     head_now="$(git rev-parse HEAD 2>/dev/null)"
+     [ -n "$head_now" ] && [ "$head_now" != "$BASE" ] && commit="$head_now"
+ 
+-    verdict="NOT_REVIEWED"; rounds=0; findings=0
++    rounds=0; attempt=0
+     # Every stage's exit status is carried, not discarded. A crashed tester,
+     # reviewer or correction run used to leave no trace in the outcome at all.
+     test_rc=1; review_rc=1; correction_rc=0
+     if [ "$build_exit" -eq 0 ] && [ -n "$commit" ]; then
+-      test_rc=0; run_tests || test_rc=$?   # VULCAN gathers evidence first
++      test_rc=0; run_tests 0 || test_rc=$?   # VULCAN gathers evidence first
+       discard_tester_residue
+       # Not `run_review | tail -1`: a pipeline reports the exit status of tail,
+       # which always succeeds, so the reviewer's own failure was unreadable.
+@@ -547,55 +570,13 @@
+         commit_work "review correction" >/dev/null
+         head_now="$(git rev-parse HEAD 2>/dev/null)"
+         [ -n "$head_now" ] && [ "$head_now" != "$pre_correction" ] && commit="$head_now"
+-        test_rc=0; run_tests || test_rc=$?   # fresh evidence — the diff changed
++        test_rc=0; run_tests 1 || test_rc=$?   # fresh evidence — the diff changed
+         discard_tester_residue
+         review_out="$(run_review 1)"; review_rc=$?
+-        verdict="$(printf '%s\n' "$review_out" | tail -1)"
+         rounds=2
+       fi
+-      last_review="$job_dir/review-$((rounds-1)).json"
+-      findings=$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1])).get('findings',[])))" "$last_review" 2>/dev/null || echo 0)
+-    fi
+-
+-    # The truth table. There is exactly one row that says succeeded: the build,
+-    # the correction, the tester and the reviewer all exited clean, THEMIS said
+-    # PASS, and VULCAN's evidence says every check it ran passed. Every other
+-    # combination parks for Brandon (the bridge renders needs_attention as a
+-    # failed attempt, so nothing here can quietly read as shipped).
+-    #
+-    # 2026-08-08 audit P0.5, the finding that made this file a release gate:
+-    # the deployed PC copy mapped `hint=failures` + PASS straight to succeeded.
+-    # Job #50 is the receipt — two failing checks and a real review finding,
+-    # recorded as outcome=succeeded. The 2026-08-07 reasoning behind that line
+-    # was sound (a pre-existing red suite should not bounce good work into
+-    # correction loops at full provider cost) but the remedy was not: it fixed
+-    # a cost problem by lying about a test result. Failing tests now park. That
+-    # ends the loop *and* keeps the report true — Brandon decides whether the
+-    # red is his repo's or this diff's, which was always the only honest place
+-    # for that call to be made.
+-    outcome="failed"
+-    if [ "$build_exit" -eq 0 ] && [ "$correction_rc" -eq 0 ] \
+-       && [ "$test_rc" -eq 0 ] && [ "$review_rc" -eq 0 ]; then
+-      case "$verdict" in
+-        PASS)
+-          hint="$(python3 -c "import json;print(json.load(open('$job_dir/tests.json')).get('verdict_hint',''))" 2>/dev/null || echo "")"
+-          case "$hint" in
+-            clean)    outcome="succeeded" ;;
+-            failures) outcome="needs_attention"; verdict="PASS_WITH_FAILING_TESTS" ;;
+-            *)        outcome="needs_attention"; verdict="PASS_WITHOUT_TEST_EVIDENCE" ;;
+-          esac
+-          ;;
+-        NEEDS_CHANGES|REVIEW_ERROR|NOT_REVIEWED) outcome="needs_attention" ;;
+-      esac
+-    elif [ "$build_exit" -eq 0 ]; then
+-      # The build itself was fine; something downstream of it broke. Say which,
+-      # rather than reporting a bare "failed" nobody can act on.
+-      outcome="needs_attention"
+-      [ "$correction_rc" -ne 0 ] && verdict="CORRECTION_PROCESS_FAILED"
+-      [ "$test_rc" -ne 0 ] && verdict="TESTER_PROCESS_FAILED"
+-      [ "$review_rc" -ne 0 ] && verdict="REVIEWER_PROCESS_FAILED"
++      attempt=$((rounds - 1))
+     fi
+-    [ "$build_exit" -eq 97 ] && verdict="KAT_ENDPOINT_DOWN"
+ 
+     # Pin the job branch to the FINAL worktree HEAD. Builders with Bash can
+     # detach HEAD mid-build (live bug, job #23 2026-08-05: the commit landed on
+@@ -604,9 +585,23 @@
+     # branch IS the custody handle — it must equal the worktree's final HEAD.
+     git branch -f "jobs/$key" HEAD 2>/dev/null || true
+ 
+-    printf '{"outcome":"%s","claude_exit":%d,"commit":"%s","branch":"jobs/%s","review_verdict":"%s","review_rounds":%d,"findings":%d,"effort":"%s"}\n' \
+-      "$outcome" "$build_exit" "$commit" "$key" "$verdict" "$rounds" "$findings" "$EFFORT" \
+-      | atomic_json "$job_dir/done.json"
++    # The truth table moved into the gate. It is the only thing that writes
++    # done.json now, and it will not write "succeeded" without receipts that
++    # name this job, this attempt and this commit. The reviewer's verdict is
++    # one input among several; it cannot outvote a red check or a missing one.
++    #
++    # 2026-08-08 audit P0.5 is why this is no longer inline shell: the deployed
++    # PC copy mapped `hint=failures` + PASS straight to succeeded, and job #50
++    # is the receipt — two failing checks and a real review finding, recorded
++    # as outcome=succeeded. A truth table that lives in one tested file cannot
++    # drift 84 lines away from the other copy of itself.
++    python3 "$GATE" settle --job-dir "$job_dir" --job "$key" \
++      --branch "jobs/$key" --base "$BASE" --commit "$commit" \
++      --attempt "$attempt" --rounds "$rounds" \
++      --build-exit "$build_exit" --correction-exit "$correction_rc" \
++      --test-exit "$test_rc" --review-exit "$review_rc" \
++      --effort "$EFFORT" --souls-ok 1
++
+     exit 0
+     ;;
+ 
