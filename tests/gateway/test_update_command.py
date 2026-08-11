@@ -416,6 +416,105 @@ class TestSendUpdateNotification:
         assert not (hermes_home / ".update_pending.claimed.json").exists()
 
     @pytest.mark.asyncio
+    async def test_repeated_missing_adapter_checks_log_once_and_keep_retrying(
+        self, tmp_path, caplog
+    ):
+        """An unchanged unavailable adapter must not emit one log per poll."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "homeassistant", "chat_id": "living-room",
+        }))
+        (hermes_home / ".update_output.txt").write_text("Done")
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home), \
+             caplog.at_level("INFO", logger="gateway.run"):
+            first = await runner._send_update_notification()
+            second = await runner._send_update_notification()
+
+        unavailable = [
+            record for record in caplog.records
+            if "homeassistant adapter not connected yet" in record.getMessage()
+        ]
+        assert [first, second] == [False, False]
+        assert len(unavailable) == 1
+        assert pending_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_connected_to_disconnected_logs_one_warning(self, tmp_path, caplog):
+        """Losing an adapter after it was available produces one warning."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        def write_finished_update(output):
+            (hermes_home / ".update_pending.json").write_text(json.dumps({
+                "platform": "homeassistant", "chat_id": "living-room",
+            }))
+            (hermes_home / ".update_output.txt").write_text(output)
+            (hermes_home / ".update_exit_code").write_text("0")
+
+        adapter = AsyncMock()
+        runner.adapters = {Platform.HOMEASSISTANT: adapter}
+        write_finished_update("First update")
+        with patch("gateway.run._hermes_home", hermes_home):
+            delivered = await runner._send_update_notification()
+
+        runner.adapters = {}
+        write_finished_update("Second update")
+        caplog.clear()
+        with patch("gateway.run._hermes_home", hermes_home), \
+             caplog.at_level("WARNING", logger="gateway.run"):
+            deferred = await runner._send_update_notification()
+
+        warnings = [
+            record for record in caplog.records
+            if "homeassistant adapter not connected yet" in record.getMessage()
+        ]
+        assert delivered is True
+        assert deferred is False
+        assert len(warnings) == 1
+        assert warnings[0].levelname == "WARNING"
+
+    @pytest.mark.asyncio
+    async def test_disconnected_to_connected_logs_recovery_and_retries(
+        self, tmp_path, caplog
+    ):
+        """A deferred notification retries and reports adapter recovery once."""
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        pending_path = hermes_home / ".update_pending.json"
+        pending_path.write_text(json.dumps({
+            "platform": "homeassistant", "chat_id": "living-room",
+        }))
+        (hermes_home / ".update_output.txt").write_text("Update complete")
+        (hermes_home / ".update_exit_code").write_text("0")
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            deferred = await runner._send_update_notification()
+
+        adapter = AsyncMock()
+        runner.adapters = {Platform.HOMEASSISTANT: adapter}
+        caplog.clear()
+        with patch("gateway.run._hermes_home", hermes_home), \
+             caplog.at_level("INFO", logger="gateway.run"):
+            delivered = await runner._send_update_notification()
+
+        recoveries = [
+            record for record in caplog.records
+            if "homeassistant adapter reconnected" in record.getMessage()
+        ]
+        assert deferred is False
+        assert delivered is True
+        assert len(recoveries) == 1
+        adapter.send.assert_called_once()
+        assert not pending_path.exists()
+
+    @pytest.mark.asyncio
     async def test_deferred_notification_delivers_after_reconnect(self, tmp_path):
         """A deferred completion is delivered once the platform reconnects.
 

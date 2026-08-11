@@ -21661,6 +21661,28 @@ class GatewayRunner(
             if _up_timeout_state is not None:
                 _up_timeout_state.persistent.update_prompt_pending = False
 
+    def _log_update_notification_adapter_state(
+        self, platform: str, *, connected: bool
+    ) -> None:
+        """Log only meaningful adapter transitions during update delivery."""
+        states = self.__dict__.setdefault(
+            "_update_notification_adapter_states", {}
+        )
+        previous = states.get(platform)
+        if previous is connected:
+            return
+        states[platform] = connected
+        if not connected:
+            logger.warning(
+                "Update notification deferred: %s adapter not connected yet",
+                platform,
+            )
+        elif previous is False:
+            logger.info(
+                "Update notification delivery resumed: %s adapter reconnected",
+                platform,
+            )
+
     async def _send_update_notification(self) -> bool:
         """If an update finished, notify the user.
 
@@ -21716,6 +21738,10 @@ class GatewayRunner(
             # Resolve adapter
             platform = Platform(platform_str)
             adapter = self.adapters.get(platform)
+            if chat_id:
+                self._log_update_notification_adapter_state(
+                    platform_str, connected=adapter is not None
+                )
 
             if not adapter and chat_id:
                 # The update finished, but the target platform has not
@@ -21726,10 +21752,6 @@ class GatewayRunner(
                 # update succeeded or timed out. Preserve the markers instead so
                 # a later retry (the watcher poll loop, or the next gateway
                 # startup) can deliver the result once the adapter is back.
-                logger.info(
-                    "Update notification deferred: %s adapter not connected yet",
-                    platform_str,
-                )
                 cleanup = False
                 active_pending_path = pending_path
                 claimed_path.replace(pending_path)
