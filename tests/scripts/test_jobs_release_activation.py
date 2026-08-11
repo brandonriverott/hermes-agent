@@ -8,6 +8,7 @@ directory, cron, gateway restart, Tailscale connection, or real activation.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -42,11 +43,14 @@ def _make_source(tmp_path: Path) -> Path:
     return root
 
 
-def _run(script: Path, *args: str, expect: int = 0) -> subprocess.CompletedProcess:
+def _run(
+    script: Path, *args: str, expect: int = 0, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     res = subprocess.run(
         [sys.executable, str(script), *args],
         capture_output=True,
         text=True,
+        env=env,
     )
     assert res.returncode == expect, (
         f"exit {res.returncode} != {expect}\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}"
@@ -216,3 +220,75 @@ def test_rollback_script_refuses_root_mismatch(tmp_path):
     )
     receipt = next((out / "activation-receipts").glob("mac-*.json"))
     _run(ROLLBACK, "--root", str(pc), "--receipt", str(receipt), expect=2)
+
+
+def test_live_profile_requires_preflight_then_applies_only_declared_root(tmp_path):
+    from hermes_cli import jobs_release
+
+    src = _make_source(tmp_path)
+    release_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=src, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    home = tmp_path / "home"
+    home.mkdir()
+    out = tmp_path / "out"
+    preflight = tmp_path / "mac-preflight.json"
+    env = {**os.environ, "HOME": str(home)}
+
+    prepared = _run(
+        ACTIVATE,
+        "--source-root", str(src),
+        "--output-root", str(out),
+        "--live-profile", "mac",
+        "--write-live-preflight", str(preflight),
+        env=env,
+    )
+    assert "live preflight: ok" in prepared.stdout
+    assert preflight.is_file()
+
+    applied = _run(
+        ACTIVATE,
+        "--source-root", str(src),
+        "--output-root", str(out),
+        "--live-profile", "mac",
+        "--expected-release-sha", release_sha,
+        "--acknowledge-live-activation",
+        jobs_release.live_acknowledgement("mac", release_sha),
+        "--preflight", str(preflight),
+        "--apply",
+        env=env,
+    )
+    assert "mode: live-apply" in applied.stdout
+    target = jobs_release.live_target_root(home, "mac", release_sha)
+    assert target.is_dir()
+    assert all((target / rel).is_file() for rel in _release_relpaths())
+    receipts = list(jobs_release.live_receipt_dir(home).glob("mac-*.json"))
+    assert len(receipts) == 1
+
+
+def test_live_profile_refuses_missing_authority_and_arbitrary_root(tmp_path):
+    src = _make_source(tmp_path)
+    out = tmp_path / "out"
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {**os.environ, "HOME": str(home)}
+    arbitrary = home / ".hermes" / "plugins" / "jobs"
+
+    _run(
+        ACTIVATE,
+        "--source-root", str(src),
+        "--output-root", str(out),
+        "--root", str(arbitrary),
+        "--apply",
+        expect=2,
+        env=env,
+    )
+    _run(
+        ACTIVATE,
+        "--source-root", str(src),
+        "--output-root", str(out),
+        "--live-profile", "pc",
+        "--apply",
+        expect=2,
+        env=env,
+    )

@@ -6,10 +6,9 @@ records exactly what WOULD happen. --apply performs the install on the given
 simulated target roots with a backup of every replaced file and writes an
 activation receipt that the rollback tool can restore from.
 
-Refusals: dirty source tree, missing manifest files, digest mismatch, target
-drift, and any live Hermes root (~/.hermes / ~/.local). Real activation is a
-Task 11 decision; this tool never touches a live Hermes directory, cron,
-gateway restart, or Tailscale connection.
+Live activation remains unavailable by default. It requires an exact mac/pc
+profile, release-SHA acknowledgement, and a matching preflight document.
+This tool never restarts services, changes cron, or opens a Tailscale connection.
 """
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ def main(argv=None) -> int:
                         help="clean git source tree to bundle")
     parser.add_argument("--output-root", required=True, type=Path,
                         help="where releases and activation receipts are written")
-    parser.add_argument("--root", required=True, type=Path,
+    parser.add_argument("--root", type=Path,
                         help="Mac target root (simulated in tests)")
     parser.add_argument("--pc-root", type=Path,
                         help="PC target root (simulated in tests)")
@@ -52,16 +51,101 @@ def main(argv=None) -> int:
                         help="mutate target roots; default is dry-run")
     parser.add_argument("--receipt-out", type=Path,
                         help="receipt directory (default <output-root>/activation-receipts)")
+    parser.add_argument("--live-profile", choices=sorted(jobs_release.LIVE_PROFILES),
+                        help="exact live target profile; derives target paths from HOME")
+    parser.add_argument("--expected-release-sha",
+                        help="exact 40-character SHA required for live apply")
+    parser.add_argument("--acknowledge-live-activation",
+                        help="exact ACTIVATE-JOBS-LIVE:<profile>:<sha> acknowledgement")
+    parser.add_argument("--preflight", type=Path,
+                        help="live preflight evidence to authorize apply")
+    parser.add_argument("--write-live-preflight", type=Path,
+                        help="write read-only live preflight evidence and stop")
     args = parser.parse_args(argv)
 
-    receipt_dir = args.receipt_out or (args.output_root / jobs_release.RECEIPT_SUBDIR)
     try:
+        bundle_dir, manifest = jobs_release.build_bundle(args.source_root, args.output_root)
+        jobs_release.verify_bundle(bundle_dir)
+
+        if args.live_profile:
+            if args.root is not None or args.pc_root is not None:
+                raise jobs_release.ReleaseRefused(
+                    "live profile refuses arbitrary --root/--pc-root"
+                )
+            home = Path.home().resolve()
+            profile = args.live_profile
+            release_sha = manifest["release_sha"]
+            root = jobs_release.live_target_root(home, profile, release_sha)
+            backup_dir = jobs_release.live_backup_dir(home, profile, release_sha)
+            receipt_dir = jobs_release.live_receipt_dir(home)
+            if args.receipt_out is not None and args.receipt_out.resolve() != receipt_dir:
+                raise jobs_release.ReleaseRefused(
+                    "live profile refuses undeclared receipt directory"
+                )
+            if args.write_live_preflight is not None:
+                if args.apply:
+                    raise jobs_release.ReleaseRefused(
+                        "preflight creation is read-only and refuses --apply"
+                    )
+                jobs_release.write_live_preflight(
+                    args.write_live_preflight,
+                    bundle_dir,
+                    profile=profile,
+                    home_dir=home,
+                    backup_dir=backup_dir,
+                    receipt_dir=receipt_dir,
+                )
+                print(f"release_sha: {release_sha}")
+                print(f"bundle_digest: {manifest['bundle_digest']}")
+                print(f"target: {root}")
+                print(f"backup: {backup_dir}")
+                print(f"receipt-dir: {receipt_dir}")
+                print(f"live preflight: ok ({args.write_live_preflight.resolve()})")
+                return 0
+            if not args.apply:
+                raise jobs_release.ReleaseRefused(
+                    "live profile requires --write-live-preflight or gated --apply"
+                )
+            if not args.expected_release_sha or not args.preflight:
+                raise jobs_release.ReleaseRefused(
+                    "live apply requires expected release SHA and preflight"
+                )
+            authorization = jobs_release.authorize_live_activation(
+                bundle_dir,
+                profile=profile,
+                expected_release_sha=args.expected_release_sha,
+                acknowledgement=args.acknowledge_live_activation or "",
+                preflight_path=args.preflight,
+                home_dir=home,
+                backup_dir=backup_dir,
+                receipt_dir=receipt_dir,
+            )
+            live_receipt = jobs_release.install_release(
+                root,
+                bundle_dir,
+                dry_run=False,
+                backup_dir=backup_dir,
+                host_kind=profile,
+                home_dir=home,
+                live_authorization=authorization,
+            )
+            receipt_path = _write_receipt(live_receipt, receipt_dir)
+            print(f"release_sha: {release_sha}")
+            print(f"bundle_digest: {manifest['bundle_digest']}")
+            print(f"bundle: {bundle_dir}")
+            print("mode: live-apply")
+            print(f"receipt: {receipt_path}")
+            print("status: ok")
+            return 0
+
+        if args.root is None:
+            raise jobs_release.ReleaseRefused(
+                "simulated activation requires --root"
+            )
         jobs_release.refuse_live_root(args.root)
         if args.pc_root is not None:
             jobs_release.refuse_live_root(args.pc_root)
-
-        bundle_dir, manifest = jobs_release.build_bundle(args.source_root, args.output_root)
-        jobs_release.verify_bundle(bundle_dir)
+        receipt_dir = args.receipt_out or (args.output_root / jobs_release.RECEIPT_SUBDIR)
         mode = "apply" if args.apply else "dry-run"
 
         mac_receipt = jobs_release.install_release(

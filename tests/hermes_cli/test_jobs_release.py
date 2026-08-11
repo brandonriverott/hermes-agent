@@ -92,7 +92,7 @@ def test_build_refuses_missing_source_file(tmp_path):
         jobs_release.build_bundle(src, tmp_path / "out", files=FILES)
 
 
-def test_build_creates_versioned_immutable_bundle(tmp_path):
+def test_build_creates_versioned_immutable_bundle(tmp_path, monkeypatch):
     src = _make_source(tmp_path)
     head = _git("rev-parse", "HEAD", cwd=src)
     out = tmp_path / "out"
@@ -117,10 +117,27 @@ def test_build_creates_versioned_immutable_bundle(tmp_path):
     assert len(manifest["bundle_digest"]) == 64
 
     # Rebuilding from the same clean source yields the same release SHA.
+    monkeypatch.setattr(jobs_release, "_utcnow_iso", lambda: "2099-01-01T00:00:00+00:00")
     out2 = tmp_path / "out2"
     bundle2, manifest2 = jobs_release.build_bundle(src, out2, files=FILES)
     assert bundle2.name == bundle.name
     assert manifest2["release_sha"] == head
+    assert manifest2["created_at"] != manifest["created_at"]
+    assert manifest2["bundle_digest"] == manifest["bundle_digest"]
+
+
+def test_release_file_set_contains_every_rollout_runtime_seam():
+    required = {
+        "gateway/jobs_notifications.py",
+        "gateway/run.py",
+        "hermes_cli/data/jobs-codex-result.v1.schema.json",
+        "hermes_cli/jobs.py",
+        "hermes_cli/jobs_release.py",
+        "hermes_cli/plugins.py",
+        "plugins/jobs/__init__.py",
+        "plugins/jobs/plugin.yaml",
+    }
+    assert required <= set(jobs_release.RELEASE_FILES)
 
 
 # ── bundle verification: missing manifest / missing files / digest mismatch ──
@@ -346,3 +363,107 @@ def test_refuse_live_root(tmp_path):
     scratch = tmp_path / "scratch" / "mac"
     scratch.mkdir(parents=True)
     jobs_release.refuse_live_root(scratch, home_dir=home)  # must not raise
+
+
+def test_live_activation_requires_exact_profile_sha_ack_and_preflight(tmp_path):
+    _, _, bundle, manifest = _build(tmp_path)
+    home = tmp_path / "home"
+    backup = jobs_release.live_backup_dir(home, "mac", manifest["release_sha"])
+    receipts = jobs_release.live_receipt_dir(home)
+    preflight = tmp_path / "preflight-mac.json"
+    root = jobs_release.live_target_root(home, "mac", manifest["release_sha"])
+
+    jobs_release.write_live_preflight(
+        preflight,
+        bundle,
+        profile="mac",
+        home_dir=home,
+        backup_dir=backup,
+        receipt_dir=receipts,
+    )
+    authorization = jobs_release.authorize_live_activation(
+        bundle,
+        profile="mac",
+        expected_release_sha=manifest["release_sha"],
+        acknowledgement=jobs_release.live_acknowledgement(
+            "mac", manifest["release_sha"]
+        ),
+        preflight_path=preflight,
+        home_dir=home,
+        backup_dir=backup,
+        receipt_dir=receipts,
+    )
+
+    receipt = jobs_release.install_release(
+        root,
+        bundle,
+        dry_run=False,
+        backup_dir=backup,
+        host_kind="mac",
+        home_dir=home,
+        live_authorization=authorization,
+    )
+    assert receipt["live_profile"] == "mac"
+    assert receipt["bundle_digest"] == manifest["bundle_digest"]
+    assert Path(receipt["root"]) == root
+
+
+@pytest.mark.parametrize(
+    ("profile", "sha", "ack", "preflight_name", "match"),
+    [
+        ("unknown", "manifest", "valid", "valid", "profile"),
+        ("mac", "wrong", "valid", "valid", "release SHA"),
+        ("mac", "manifest", "wrong", "valid", "acknowledgement"),
+        ("mac", "manifest", "valid", "missing", "preflight"),
+    ],
+)
+def test_live_activation_refuses_incomplete_or_mismatched_authority(
+    tmp_path, profile, sha, ack, preflight_name, match
+):
+    _, _, bundle, manifest = _build(tmp_path)
+    home = tmp_path / "home"
+    backup = jobs_release.live_backup_dir(home, "mac", manifest["release_sha"])
+    receipts = jobs_release.live_receipt_dir(home)
+    preflight = tmp_path / "preflight.json"
+    jobs_release.write_live_preflight(
+        preflight,
+        bundle,
+        profile="mac",
+        home_dir=home,
+        backup_dir=backup,
+        receipt_dir=receipts,
+    )
+    expected_sha = manifest["release_sha"] if sha == "manifest" else "0" * 40
+    acknowledgement = (
+        jobs_release.live_acknowledgement("mac", manifest["release_sha"])
+        if ack == "valid"
+        else "yes"
+    )
+    chosen_preflight = preflight if preflight_name == "valid" else tmp_path / "missing.json"
+
+    with pytest.raises(ReleaseRefused, match=match):
+        jobs_release.authorize_live_activation(
+            bundle,
+            profile=profile,
+            expected_release_sha=expected_sha,
+            acknowledgement=acknowledgement,
+            preflight_path=chosen_preflight,
+            home_dir=home,
+            backup_dir=backup,
+            receipt_dir=receipts,
+        )
+
+
+def test_live_root_install_refuses_without_authorization(tmp_path):
+    _, _, bundle, manifest = _build(tmp_path)
+    home = tmp_path / "home"
+    root = jobs_release.live_target_root(home, "pc", manifest["release_sha"])
+    with pytest.raises(ReleaseRefused, match="live"):
+        jobs_release.install_release(
+            root,
+            bundle,
+            dry_run=False,
+            backup_dir=tmp_path / "backup",
+            host_kind="pc",
+            home_dir=home,
+        )

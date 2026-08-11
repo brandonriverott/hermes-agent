@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -42,13 +43,18 @@ RECEIPT_SUBDIR = "activation-receipts"
 BACKUP_DIRNAME = ".jobs-release-backup"
 KIND = "jobs-release-activation"
 ROLLBACK_KIND = "jobs-release-rollback"
+LIVE_PREFLIGHT_KIND = "jobs-release-live-preflight"
+LIVE_PROFILES = frozenset({"mac", "pc"})
 
 # Explicit Jobs plugin/runtime/policy file set (repo-root relative).
 # Deliberately not a glob: an immutable release must be reproducible and
 # reviewable, and broad recursive targets are forbidden.
 RELEASE_FILES: tuple[str, ...] = (
     "gateway/jobs_notifications.py",
+    "gateway/run.py",
+    "hermes_cli/data/jobs-codex-result.v1.schema.json",
     "hermes_cli/data/jobs-lanes.v1.json",
+    "hermes_cli/jobs.py",
     "hermes_cli/jobs_adapter_claude.py",
     "hermes_cli/jobs_adapter_codex.py",
     "hermes_cli/jobs_contract.py",
@@ -70,6 +76,9 @@ RELEASE_FILES: tuple[str, ...] = (
     "hermes_cli/jobs_runtime.py",
     "hermes_cli/jobs_skills.py",
     "hermes_cli/jobs_tool.py",
+    "hermes_cli/plugins.py",
+    "plugins/jobs/__init__.py",
+    "plugins/jobs/plugin.yaml",
     "scripts/jobs-release-activate.py",
     "scripts/jobs-release-rollback.py",
     "scripts/jobs-runtime-parity.py",
@@ -85,6 +94,17 @@ class ReleaseError(ValueError):
 
 class ReleaseRefused(ReleaseError):
     """A safe refusal: dirty source, drift, mismatch, or live root."""
+
+
+@dataclass(frozen=True)
+class LiveActivationAuthorization:
+    profile: str
+    release_sha: str
+    bundle_digest: str
+    root: Path
+    backup_dir: Path
+    receipt_dir: Path
+    preflight_path: Path
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────
@@ -122,9 +142,19 @@ def sha256_file(path: Path) -> str:
 
 def _canonical_digest(manifest: dict) -> str:
     clone = dict(manifest)
-    clone.pop("bundle_digest", None)
+    clone.pop("manifest_digest", None)
     payload = json.dumps(clone, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _content_digest(manifest: dict) -> str:
+    payload = {
+        "schema_version": manifest.get("schema_version"),
+        "release_sha": manifest.get("release_sha"),
+        "files": manifest.get("files"),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # ── source gating ─────────────────────────────────────────────────────────────
@@ -212,8 +242,10 @@ def build_bundle(
         "source": str(source_root),
         "files": entries,
         "bundle_digest": "",
+        "manifest_digest": "",
     }
-    manifest["bundle_digest"] = _canonical_digest(manifest)
+    manifest["bundle_digest"] = _content_digest(manifest)
+    manifest["manifest_digest"] = _canonical_digest(manifest)
     _write_json(bundle / MANIFEST_NAME, manifest)
     return bundle, manifest
 
@@ -255,8 +287,10 @@ def verify_bundle(bundle_dir: Path) -> dict:
         raise ReleaseRefused("missing manifest files in bundle: " + ", ".join(missing))
     if mismatched:
         raise ReleaseRefused("digest mismatch in bundle: " + ", ".join(mismatched))
-    if _canonical_digest(manifest) != manifest.get("bundle_digest"):
+    if _content_digest(manifest) != manifest.get("bundle_digest"):
         raise ReleaseRefused("bundle digest mismatch in manifest")
+    if _canonical_digest(manifest) != manifest.get("manifest_digest"):
+        raise ReleaseRefused("manifest digest mismatch")
     return manifest
 
 
@@ -293,6 +327,8 @@ def install_release(
     dry_run: bool = True,
     backup_dir: Path | None = None,
     host_kind: str = "mac",
+    home_dir: Path | None = None,
+    live_authorization: LiveActivationAuthorization | None = None,
 ) -> dict:
     """Install (or dry-run) a verified bundle into a target root.
 
@@ -307,6 +343,20 @@ def install_release(
     root = root.resolve()
     bundle_dir = bundle_dir.resolve()
     manifest = verify_bundle(bundle_dir)
+    if live_authorization is None:
+        refuse_live_root(root, home_dir=home_dir)
+    else:
+        expected_root = live_target_root(
+            home_dir or Path.home(), live_authorization.profile, manifest["release_sha"]
+        )
+        if live_authorization.root != root or root != expected_root:
+            raise ReleaseRefused("live activation target root mismatch")
+        if live_authorization.release_sha != manifest["release_sha"]:
+            raise ReleaseRefused("live activation release SHA mismatch")
+        if live_authorization.bundle_digest != manifest["bundle_digest"]:
+            raise ReleaseRefused("live activation bundle digest mismatch")
+        if backup_dir is None or backup_dir.resolve() != live_authorization.backup_dir:
+            raise ReleaseRefused("live activation backup directory mismatch")
     if dry_run:
         install_check(root, bundle_dir)  # refuse drift in validation mode
 
@@ -349,6 +399,8 @@ def install_release(
         "dry_run": bool(dry_run),
         "release_sha": manifest["release_sha"],
         "host_kind": host_kind,
+        "live_profile": live_authorization.profile if live_authorization else None,
+        "bundle_digest": manifest["bundle_digest"],
         "root": str(root),
         "created_at": _utcnow_iso(),
         "bundle_dir": str(bundle_dir),
@@ -405,6 +457,139 @@ def refuse_live_root(root: Path, home_dir: Path | None = None) -> None:
     for live in (home / ".hermes", home / ".local"):
         if root == live or root.is_relative_to(live):
             raise ReleaseRefused(f"refusing live Hermes root: {root}")
+
+
+def _require_live_profile(profile: str) -> None:
+    if profile not in LIVE_PROFILES:
+        raise ReleaseRefused("unknown live target profile")
+
+
+def live_target_root(home_dir: Path, profile: str, release_sha: str) -> Path:
+    """Return the sole versioned runtime root allowed for a live profile."""
+    _require_live_profile(profile)
+    if len(release_sha) != 40 or any(c not in "0123456789abcdef" for c in release_sha):
+        raise ReleaseRefused("invalid release SHA")
+    return (home_dir.resolve() / ".hermes" / "releases" / f"hermes-agent-{release_sha}").resolve()
+
+
+def live_backup_dir(home_dir: Path, profile: str, release_sha: str) -> Path:
+    _require_live_profile(profile)
+    return (
+        home_dir.resolve()
+        / ".hermes"
+        / "backups"
+        / "jobs-releases"
+        / release_sha
+        / profile
+    ).resolve()
+
+
+def live_receipt_dir(home_dir: Path) -> Path:
+    return (
+        home_dir.resolve() / ".hermes" / "activation-receipts" / "jobs-releases"
+    ).resolve()
+
+
+def live_acknowledgement(profile: str, release_sha: str) -> str:
+    _require_live_profile(profile)
+    return f"ACTIVATE-JOBS-LIVE:{profile}:{release_sha}"
+
+
+def _preflight_digest(preflight: dict) -> str:
+    clone = dict(preflight)
+    clone.pop("preflight_digest", None)
+    payload = json.dumps(clone, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def write_live_preflight(
+    path: Path,
+    bundle_dir: Path,
+    *,
+    profile: str,
+    home_dir: Path,
+    backup_dir: Path,
+    receipt_dir: Path,
+) -> dict:
+    """Write read-only evidence binding one profile to one verified bundle."""
+    _require_live_profile(profile)
+    manifest = verify_bundle(bundle_dir)
+    release_sha = manifest["release_sha"]
+    expected_backup = live_backup_dir(home_dir, profile, release_sha)
+    expected_receipts = live_receipt_dir(home_dir)
+    if backup_dir.resolve() != expected_backup:
+        raise ReleaseRefused("live activation backup directory is not declared")
+    if receipt_dir.resolve() != expected_receipts:
+        raise ReleaseRefused("live activation receipt directory is not declared")
+    preflight = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": LIVE_PREFLIGHT_KIND,
+        "profile": profile,
+        "release_sha": release_sha,
+        "bundle_digest": manifest["bundle_digest"],
+        "root": str(live_target_root(home_dir, profile, release_sha)),
+        "backup_dir": str(expected_backup),
+        "receipt_dir": str(expected_receipts),
+        "created_at": _utcnow_iso(),
+        "preflight_digest": "",
+    }
+    preflight["preflight_digest"] = _preflight_digest(preflight)
+    _write_json(path.resolve(), preflight)
+    return preflight
+
+
+def authorize_live_activation(
+    bundle_dir: Path,
+    *,
+    profile: str,
+    expected_release_sha: str,
+    acknowledgement: str,
+    preflight_path: Path,
+    home_dir: Path,
+    backup_dir: Path,
+    receipt_dir: Path,
+) -> LiveActivationAuthorization:
+    """Validate the explicit, profile-bound authority required for live apply."""
+    _require_live_profile(profile)
+    manifest = verify_bundle(bundle_dir)
+    release_sha = manifest["release_sha"]
+    if expected_release_sha != release_sha:
+        raise ReleaseRefused("live activation release SHA mismatch")
+    if acknowledgement != live_acknowledgement(profile, release_sha):
+        raise ReleaseRefused("live activation acknowledgement mismatch")
+    if not preflight_path.is_file():
+        raise ReleaseRefused("live activation preflight is missing")
+    try:
+        preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ReleaseRefused("live activation preflight is malformed") from exc
+    expected = {
+        "kind": LIVE_PREFLIGHT_KIND,
+        "profile": profile,
+        "release_sha": release_sha,
+        "bundle_digest": manifest["bundle_digest"],
+        "root": str(live_target_root(home_dir, profile, release_sha)),
+        "backup_dir": str(live_backup_dir(home_dir, profile, release_sha)),
+        "receipt_dir": str(live_receipt_dir(home_dir)),
+    }
+    if _preflight_digest(preflight) != preflight.get("preflight_digest"):
+        raise ReleaseRefused("live activation preflight digest mismatch")
+    for field, value in expected.items():
+        if preflight.get(field) != value:
+            raise ReleaseRefused(f"live activation preflight {field} mismatch")
+    if backup_dir.resolve() != Path(expected["backup_dir"]):
+        raise ReleaseRefused("live activation backup directory mismatch")
+    if receipt_dir.resolve() != Path(expected["receipt_dir"]):
+        raise ReleaseRefused("live activation receipt directory mismatch")
+    return LiveActivationAuthorization(
+        profile=profile,
+        release_sha=release_sha,
+        bundle_digest=manifest["bundle_digest"],
+        root=Path(expected["root"]),
+        backup_dir=Path(expected["backup_dir"]),
+        receipt_dir=Path(expected["receipt_dir"]),
+        preflight_path=preflight_path.resolve(),
+    )
 
 
 # ── rollback: restore exactly the recorded targets ───────────────────────────

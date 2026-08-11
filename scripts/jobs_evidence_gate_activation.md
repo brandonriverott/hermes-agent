@@ -178,8 +178,10 @@ Artifact format (`<output-root>/releases/<release-sha>/jobs-release-v1/`):
 - `manifest.json` — `schema_version`, `release_sha` (full git HEAD of the
   source tree), `created_at` / `created_by` (creation metadata), `source`
   (absolute source root), `files` (exact list with `relpath`, SHA-256
-  `sha256`, `size` per file), and `bundle_digest` (SHA-256 over the canonical
-  manifest content);
+  `sha256`, `size` per file), `bundle_digest` (stable SHA-256 over release SHA
+  plus the canonical file list), and `manifest_digest` (integrity digest over
+  metadata and content identity). Rebuilding the same SHA at a later time
+  preserves `bundle_digest`;
 - `files/<relpath>` — byte-identical copies of every release file.
 
 Refusals (all of them safe, none silent):
@@ -192,10 +194,10 @@ Refusals (all of them safe, none silent):
 - **target drift** — in the dry-run validation gate, install check, parity,
   and rollback: a target whose bytes differ from the expected state is
   refused, never clobbered;
-- **live Hermes root** — `~/.hermes` / `~/.local` targets are refused until
-  real activation is explicitly decided (Task 11). Dry-run is the default;
-  `--apply` is the only way to mutate a target, and it always backs up every
-  replaced file and writes an activation receipt first.
+- **live Hermes root** — refused by default. The only exception is a known
+  `mac` or `pc` profile bound to the exact release SHA, stable bundle digest,
+  declared versioned target, backup/receipt directories, preflight evidence,
+  and literal acknowledgement. There is no generic force flag.
 
 Build, dry-run activate (default; refuses drift, writes nothing):
 
@@ -215,6 +217,31 @@ python scripts/jobs-release-activate.py \
   --source-root . \
   --output-root ~/jobs-releases \
   --root <mac-root> --pc-root <pc-root> \
+  --apply
+```
+
+Prepare one read-only live-profile preflight (run locally on each target):
+
+```sh
+python scripts/jobs-release-activate.py \
+  --source-root . \
+  --output-root <scratch-release-root> \
+  --live-profile mac \
+  --write-live-preflight <scratch-preflight.json>
+```
+
+After an explicit Task 11 GO, apply exactly that preflight. Replace `mac` with
+`pc` on the PC; the target is derived as
+`~/.hermes/releases/hermes-agent-<full-release-sha>` and cannot be overridden:
+
+```sh
+python scripts/jobs-release-activate.py \
+  --source-root . \
+  --output-root <scratch-release-root> \
+  --live-profile mac \
+  --expected-release-sha <full-release-sha> \
+  --acknowledge-live-activation ACTIVATE-JOBS-LIVE:mac:<full-release-sha> \
+  --preflight <scratch-preflight.json> \
   --apply
 ```
 
@@ -245,4 +272,3 @@ Real activation must not proceed when any critical Jobs/gateway test is
 skipped — a skip is an unproven activation boundary, not a green result. If a
 live canary fails after activation, roll back immediately with the command
 above and retain the rollback evidence.
-
