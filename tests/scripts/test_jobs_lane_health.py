@@ -54,6 +54,18 @@ def test_linux_memory_fallback_keeps_health_check_dependency_free(tmp_path, monk
     assert result.reason_code == "OK"
 
 
+def test_git_probe_does_not_require_immutable_runtime_to_be_a_git_checkout(
+    tmp_path, monkeypatch
+):
+    module = _health_module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+
+    result = module._probe_git({"PATH": os.environ["PATH"]})
+
+    assert result.passed is True
+    assert result.reason_code == "OK"
+
+
 def _provision_test_lane(root: Path, lane_id: str) -> Path:
     lane = next(
         item for item in jobs_lanes.load_lane_registry().lanes if item.id == lane_id

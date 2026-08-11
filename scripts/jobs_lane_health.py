@@ -372,13 +372,13 @@ def _probe_git(environment: dict[str, str]) -> jobs_lanes.ProbeResult:
     if executable is None:
         return _probe(False, "GIT_NOT_FOUND", failure_class="INFRA_FAILURE")
     completed = _run_private(
-        [executable, "worktree", "list", "--porcelain"],
+        [executable, "--version"],
         environment=environment,
         cwd=REPO_ROOT,
     )
     if completed is None or completed.returncode != 0:
-        return _probe(False, "GIT_WORKTREE_UNAVAILABLE", failure_class="INFRA_FAILURE")
-    return _probe(True, "OK", safe_detail={"worktree_capable": True})
+        return _probe(False, "GIT_UNAVAILABLE", failure_class="INFRA_FAILURE")
+    return _probe(True, "OK", safe_detail={"git_available": True})
 
 
 def _probe_host(host_id: str) -> jobs_lanes.ProbeResult:
