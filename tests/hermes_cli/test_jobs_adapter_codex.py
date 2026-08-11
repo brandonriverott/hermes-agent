@@ -212,6 +212,19 @@ def test_codex_launch_contract_includes_exact_flag_set(repo, tmp_path, monkeypat
     assert schema_path.endswith("jobs-codex-result.v1.schema.json")
 
 
+def test_codex_output_schema_agrees_with_shared_outcome_contract():
+    schema_path = (
+        Path(codex.__file__).resolve().parent
+        / "data"
+        / "jobs-codex-result.v1.schema.json"
+    )
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+    assert schema["required"] == ["outcome"]
+    assert schema["properties"]["outcome"]["enum"] == ["succeeded", "failed"]
+    assert "status" not in schema["properties"]
+
+
 def test_codex_prompt_bytes_arrive_on_stdin_not_argv(repo, tmp_path, monkeypatch):
     path, base = repo
     workspace = tmp_path / "ws"
