@@ -199,6 +199,24 @@ def test_list_and_status_filter(home, capsys):
     assert "Job #2" in out and "Job #1" not in out
 
 
+def test_unclaimed_job_is_presented_as_waiting_not_working(home, capsys):
+    _run([
+        "create", "Waiting", "--goal-file", str(_goal_file(home, b"wait")),
+        "--lane", "claude",
+    ], capsys)
+
+    rc, out, _ = _run(["list"], capsys)
+    assert rc == 0
+    assert "waiting" in out and "for_worker" in out
+    assert "working" not in out and "routing" not in out
+
+    rc, out, _ = _run(["show", "1", "--json"], capsys)
+    assert rc == 0
+    payload = json.loads(out)
+    assert payload["display_status"] == "waiting"
+    assert payload["display_step"] == "for_worker"
+
+
 def test_show_resolves_id_number_and_label(home, capsys):
     _run(["create", "Findable", "--goal-file", str(_goal_file(home, b"g")),
           "--lane", "claude"], capsys)

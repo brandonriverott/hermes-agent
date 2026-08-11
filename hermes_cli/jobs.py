@@ -422,11 +422,27 @@ def _emit_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2))
 
 
+def _display_state(status: str, step: str) -> tuple[str, str]:
+    # ponytail: preserve the durable DB value; make the user-facing state honest.
+    if status == "working" and step == "routing":
+        return "waiting", "for_worker"
+    return status, step
+
+
+def _job_view(job: jdb.Job) -> dict:
+    payload = job.to_dict()
+    payload["display_status"], payload["display_step"] = _display_state(
+        job.status, job.step
+    )
+    return payload
+
+
 def _print_job(job: jdb.Job) -> None:
+    status, step = _display_state(job.status, job.step)
     print(f"{job.label}  [{job.id}]")
     print(f"  name:       {job.name}")
-    print(f"  status:     {job.status}")
-    print(f"  step:       {job.step}")
+    print(f"  status:     {status}")
+    print(f"  step:       {step}")
     if job.specialist:
         print(f"  specialist: {job.specialist}")
     if job.routing_reason:
@@ -491,7 +507,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return 2
 
     if args.json:
-        _emit_json(job.to_dict())
+        _emit_json(_job_view(job))
     else:
         print(f"Created {job.label} ({job.id})")
         _print_job(job)
@@ -502,13 +518,14 @@ def _cmd_list(args: argparse.Namespace) -> int:
     with jdb.connect_closing() as conn:
         jobs = jdb.list_jobs(conn, status=getattr(args, "status", None))
     if args.json:
-        _emit_json([j.to_dict() for j in jobs])
+        _emit_json([_job_view(j) for j in jobs])
         return 0
     if not jobs:
         print("No jobs yet. Create one with `hermes jobs create <name> --goal-file <path>`.")
         return 0
     for j in jobs:
-        print(f"{j.label:<9} {j.status:<10} {j.step:<20} {j.name}")
+        status, step = _display_state(j.status, j.step)
+        print(f"{j.label:<9} {status:<10} {step:<20} {j.name}")
     return 0
 
 
@@ -518,7 +535,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         if job is None:
             return 1
         if args.json:
-            _emit_json(job.to_dict())
+            _emit_json(_job_view(job))
         else:
             _print_job(job)
     return 0
@@ -976,9 +993,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
             conn, job.id, now=now, stale_threshold=args.stale_threshold
         )
     if args.json:
+        proj["display_status"], proj["display_step"] = _display_state(
+            proj["status"], proj["step"]
+        )
         _emit_json(proj)
     else:
-        print(f"{proj['label']}  {proj['status']}/{proj['step']}"
+        status, step = _display_state(proj["status"], proj["step"])
+        print(f"{proj['label']}  {status}/{step}"
               f"{'  STALE' if proj['stale'] else ''}")
     return 0
 
