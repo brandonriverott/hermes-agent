@@ -33,6 +33,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from hermes_cli import jobs_adapter_claude as adapter
+from hermes_cli import jobs_assurance as assurance
 from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_dispatch as dispatch
 from hermes_cli import jobs_executors
@@ -58,7 +59,45 @@ def _digest(value: bytes) -> str:
     return receipts.digest_bytes(value)
 
 
+def _passing_outcome(context, _execution):
+    contract = assurance.AssuranceContract.from_mapping(context.assurance_contract)
+    return assurance.verify_outcome(
+        contract,
+        assurance.OutcomeEvidence.from_mapping({
+            "critical_user_journey": contract.critical_user_journey,
+            "verdict": "PASS",
+            "environment": "isolated integration worktree",
+            "checks_run": list(contract.verification_steps),
+            "observed_behavior": "requested change reached the exact origin",
+            "artifact_digests": [_digest(b"verified exact-origin delivery")],
+            "observed_at": 1786233600,
+        }),
+    )
+
+
+def _not_applicable_closure(_context, _execution):
+    return assurance.KnowledgeClosureReceipt.from_mapping({
+        "disposition": "NOT_APPLICABLE",
+        "canonical_note_path": None,
+        "retrieval_confirmed": False,
+        "steward_receipt_digest": _digest(b"no durable knowledge change"),
+    })
+
+
 JOB_NAME = "codex-origin-e2e"
+ASSURANCE = {
+    "critical_user_journey": "requested change reaches the exact origin",
+    "success_metric": "verified change and one exact-origin completion",
+    "outcome_mode": "integration",
+    "verification_steps": ["run the full provider and delivery flow"],
+    "max_attempts": 3,
+    "wall_clock_budget_seconds": 3600,
+    "risk_domains": ["none"],
+    "consumers": [],
+    "egress_paths": [],
+    "rollback_behavior": "discard the test repository",
+    "knowledge_closure_required": False,
+}
 
 
 class CodexOriginRig:
@@ -144,6 +183,7 @@ class CodexOriginRig:
             "goal": "Keep this body exactly.\n\nTRAILING=true\n",
             "repo_path": str(self.repo),
             "lane": lane,
+            "assurance": ASSURANCE,
         }
         args.update(updates)
         result = json.loads(jobs_tool.jobs_create_handler(args))
@@ -245,6 +285,8 @@ class CodexOriginRig:
                 if activation_callback is None
                 else activation_callback
             ),
+            outcome_gate=_passing_outcome,
+            closure_gate=_not_applicable_closure,
             observed_at="2026-08-10T00:00:00Z",
             now=self.clock,
             lease_seconds=60,
