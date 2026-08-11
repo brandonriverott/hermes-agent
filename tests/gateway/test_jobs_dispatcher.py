@@ -113,6 +113,33 @@ def test_invalid_legacy_job_does_not_block_later_valid_job(tmp_path):
     assert [item["job_id"] for item in seen] == [valid]
 
 
+def test_canary_job_filter_never_claims_older_working_jobs(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    db_path = tmp_path / "jobs.db"
+    conn = jdb.connect(db_path)
+    goal = (
+        f"REPO_PATH={repo}\nBASE_COMMIT={'c' * 40}\nMODEL=gpt-5.6-sol\n"
+        "MAX_TURNS=120\n\ncanary"
+    )
+    older = jdb.create_job(conn, name="older", requested_lane="codex", goal=goal)
+    canary = jdb.create_job(conn, name="canary", requested_lane="codex", goal=goal)
+    conn.close()
+    monkeypatch.setenv("HERMES_JOBS_CANARY_ID", canary)
+    seen = []
+
+    jobs_dispatcher.dispatch_due_job_once(
+        jobs_path=db_path,
+        lane_root=tmp_path / "lanes",
+        now=100,
+        dispatcher=lambda **kwargs: seen.append(kwargs) or {"job_id": kwargs["job_id"]},
+        health_collector=lambda **kwargs: _health(100),
+    )
+
+    assert canary != older
+    assert [item["job_id"] for item in seen] == [canary]
+
+
 def test_remote_health_is_policy_bound_and_requires_all_pc_seats(tmp_path):
     registry = jobs_lanes.load_lane_registry()
     lanes = []

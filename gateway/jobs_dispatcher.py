@@ -144,11 +144,14 @@ def dispatch_due_job_once(
     dispatch = dispatcher or jobs_runtime.dispatch_job_once
     instant = int(time.time()) if now is None else int(now)
     root = Path(lane_root)
+    canary_job_id = os.environ.get("HERMES_JOBS_CANARY_ID", "").strip()
     conn = jdb.connect(jobs_path)
     try:
         jdb.recover_expired_claims(conn, now=instant)
         health = tuple(health_collector(lane_root=root, now=instant))
         for job in jdb.list_jobs(conn, status="working"):
+            if canary_job_id and job.id != canary_job_id:
+                continue
             if (
                 job.step not in jdb.EXECUTABLE_STEPS
                 or job.claimed_by is not None
