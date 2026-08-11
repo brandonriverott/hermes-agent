@@ -146,6 +146,19 @@ def _valid_args(repo: Path, **updates) -> dict:
         "goal": "Keep this body exactly.\n\nTRAILING=true\n",
         "repo_path": str(repo),
         "lane": "codex",
+        "assurance": {
+            "critical_user_journey": "operator observes the requested result",
+            "success_metric": "critical journey passes",
+            "outcome_mode": "integration",
+            "verification_steps": ["exercise critical journey"],
+            "max_attempts": 3,
+            "wall_clock_budget_seconds": 3600,
+            "risk_domains": ["none"],
+            "consumers": [],
+            "egress_paths": [],
+            "rollback_behavior": "not applicable",
+            "knowledge_closure_required": False,
+        },
     }
     args.update(updates)
     return args
@@ -171,9 +184,10 @@ def test_bundled_plugin_registers_exact_schema_without_eager_jobs_stack(
     assert create.schema["parameters"]["required"] == [
         "name",
         "goal",
-        "repo_path",
-        "lane",
-    ]
+            "repo_path",
+            "lane",
+            "assurance",
+        ]
     assert create.schema["parameters"]["properties"]["lane"]["enum"] == [
         "claude",
         "codex",

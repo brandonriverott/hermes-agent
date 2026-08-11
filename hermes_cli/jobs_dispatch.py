@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import jobs_db as jdb
+from hermes_cli import jobs_assurance
 from hermes_cli import jobs_execution
 from hermes_cli import jobs_executors
 from hermes_cli import jobs_graph as graph
@@ -243,6 +244,7 @@ class DispatchContext:
     lane_root: Optional[Path] = None
     effort: str = "max"
     max_turns: int = 120
+    assurance_contract: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -282,6 +284,14 @@ Gate = Callable[
 ]
 ActivationGate = Callable[
     [DispatchContext, jobs_run.GateEvidence], ActivationDecision
+]
+OutcomeGate = Callable[
+    [DispatchContext, jobs_execution.ReliabilityExecution],
+    jobs_assurance.OutcomeDecision,
+]
+ClosureGate = Callable[
+    [DispatchContext, jobs_execution.ReliabilityExecution],
+    jobs_assurance.KnowledgeClosureReceipt,
 ]
 
 
@@ -503,6 +513,8 @@ def dispatch_once(
     lease_seconds: int = 1800,
     failure_journal_path: Optional[Path] = None,
     lane_decision: Optional[jobs_lanes.LaneDecision] = None,
+    outcome_gate: OutcomeGate | None = None,
+    closure_gate: ClosureGate | None = None,
 ) -> DispatchResult:
     """Run one evidence-authorized dispatch without provider assumptions.
 
@@ -549,6 +561,7 @@ def dispatch_once(
         model=spec.model,
         observed_at=observed_at,
         expected_job_revision=job.revision,
+        assurance_contract=job.assurance_contract,
     )
     preflight = harness.preflight_and_record(conn, snapshot, probes, signer)
     if preflight.status != "PASS":
@@ -560,6 +573,8 @@ def dispatch_once(
             state=None,
             failure_class=preflight.failure_class,
         )
+    if outcome_gate is None or closure_gate is None:
+        raise ValueError("outcome and knowledge-closure gates are required")
 
     placement_id: Optional[str] = None
     if lane_decision is None:
@@ -671,6 +686,7 @@ def dispatch_once(
         lane_root=None if spec.lane_root is None else Path(spec.lane_root),
         effort=spec.effort,
         max_turns=spec.max_turns,
+        assurance_contract=job.assurance_contract,
     )
     sequence = 0
 
@@ -729,6 +745,8 @@ def dispatch_once(
         evidence_digest: str,
         commit: str,
         force_blocked: bool = False,
+        response_change_digest: str | None = None,
+        result_delta_digest: str | None = None,
     ) -> DispatchResult:
         decision = jobs_loop.classify_failure(signal)
         reported_reason = decision.reason_code
@@ -746,18 +764,38 @@ def dispatch_once(
             history_rows = jdb.list_retry_evidence(
                 conn, job.id, chain_id=chain_id
             )
-            retry = jobs_loop.decide_retry(
-                [
-                    jobs_loop.RetryRecord(
-                        ordinal=int(row["ordinal"]),
-                        evidence_digest=str(row["evidence_digest"]),
-                        decision=str(row["decision"]),
-                    )
-                    for row in history_rows
-                ],
-                evidence_digest=evidence_digest,
-                failure_class=decision.failure_class,
+            contract = jobs_assurance.AssuranceContract.from_mapping(
+                context.assurance_contract
             )
+            first_started = int(attempts[0]["started_at"] or now)
+            continuation = jobs_assurance.decide_continuation(
+                contract,
+                attempts_started=int(attempt["ordinal"]),
+                elapsed_seconds=max(0, int(now) - first_started),
+            )
+            if continuation.action == "STOP":
+                retry = jobs_loop.RetryDecision(
+                    "BLOCKED", continuation.reason_code, 0
+                )
+            else:
+                retry = jobs_loop.decide_retry(
+                    [
+                        jobs_loop.RetryRecord(
+                            ordinal=int(row["ordinal"]),
+                            evidence_digest=str(row["evidence_digest"]),
+                            decision=str(row["decision"]),
+                        )
+                        for row in history_rows
+                    ],
+                    evidence_digest=evidence_digest,
+                    failure_class=decision.failure_class,
+                    prior_failure_digest=evidence_digest,
+                    response_change_digest=response_change_digest,
+                    result_delta_digest=result_delta_digest,
+                    policy=jobs_loop.RetryPolicy(
+                        max_attempts=contract.max_attempts
+                    ),
+                )
             stored = jdb.record_retry_decision(
                 conn,
                 jdb.RetryEvidenceWrite(
@@ -767,6 +805,9 @@ def dispatch_once(
                     parent_attempt_id=attempt["parent_attempt_id"],
                     ordinal=int(attempt["ordinal"]),
                     evidence_digest=evidence_digest,
+                    prior_failure_digest=evidence_digest,
+                    response_change_digest=response_change_digest,
+                    result_delta_digest=result_delta_digest,
                     decision=retry.action,
                     reason_code=retry.reason_code,
                     created_at=int(now) + sequence + 1,
@@ -943,6 +984,8 @@ def dispatch_once(
                 }
             ),
             commit=candidate,
+            response_change_digest=execution.response_change_digest,
+            result_delta_digest=execution.result_delta_digest,
         )
     if _SHA_RE.fullmatch(candidate) is None or candidate == spec.base_commit:
         return fail(
@@ -1109,6 +1152,51 @@ def dispatch_once(
         commit=candidate,
     )
 
+    contract = jobs_assurance.AssuranceContract.from_mapping(
+        context.assurance_contract
+    )
+    advance(
+        "OUTCOME_VERIFYING",
+        {"outcome_contract": contract.digest},
+        commit=candidate,
+    )
+    try:
+        outcome = outcome_gate(context, execution)
+    except Exception as exc:  # noqa: BLE001 - verification must fail closed
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="OUTCOME_VERIFIER_FAILED", safety_gate=True
+            ),
+            evidence_digest=_digest(
+                {"stage": "outcome", "exception": type(exc).__name__}
+            ),
+            commit=candidate,
+            force_blocked=True,
+        )
+    if not isinstance(outcome, jobs_assurance.OutcomeDecision):
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="OUTCOME_EVIDENCE_INVALID", safety_gate=True
+            ),
+            evidence_digest=_digest({"stage": "outcome", "result": "invalid"}),
+            commit=candidate,
+            force_blocked=True,
+        )
+    if outcome.status != "PASS":
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code=outcome.reason_code, safety_gate=True
+            ),
+            evidence_digest=outcome.evidence_digest,
+            commit=candidate,
+            force_blocked=True,
+        )
+    advance(
+        "OUTCOME_VERIFIED",
+        {"critical_journey_result": outcome.evidence_digest},
+        commit=candidate,
+    )
+
     if placement_id is not None:
         sequence += 1
         jdb.transition_lane_placement(
@@ -1162,11 +1250,36 @@ def dispatch_once(
             commit=candidate,
             force_blocked=True,
         )
+    try:
+        closure = closure_gate(context, execution)
+    except Exception as exc:  # noqa: BLE001 - closure must fail closed
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="KNOWLEDGE_CLOSURE_FAILED", safety_gate=True
+            ),
+            evidence_digest=_digest(
+                {"stage": "knowledge_closure", "exception": type(exc).__name__}
+            ),
+            commit=candidate,
+            force_blocked=True,
+        )
+    if not isinstance(closure, jobs_assurance.KnowledgeClosureReceipt) or not closure.closed:
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="KNOWLEDGE_CLOSURE_INVALID", safety_gate=True
+            ),
+            evidence_digest=_digest(
+                {"stage": "knowledge_closure", "result": "invalid"}
+            ),
+            commit=candidate,
+            force_blocked=True,
+        )
     advance(
         "COMPLETED",
         {
             "activation_gate": activation.activation_gate_digest,
             "completion_receipt": activation.completion_receipt_digest,
+            "knowledge_closure": closure.digest,
         },
         commit=candidate,
     )
@@ -1183,12 +1296,14 @@ def dispatch_once(
 
 __all__ = [
     "ActivationDecision",
+    "ClosureGate",
     "DispatchContext",
     "DispatchResult",
     "DispatchSpec",
     "LaneCleanupResult",
     "LegacyExecutionHeader",
     "LegacyMetadataError",
+    "OutcomeGate",
     "dispatch_once",
     "cleanup_lane_attempt",
     "parse_legacy_execution_header",

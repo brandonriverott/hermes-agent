@@ -22,6 +22,40 @@ from hermes_cli import jobs_runtime
 from hermes_cli import jobs_lanes
 
 
+def _assurance_contract():
+    return {
+        "critical_user_journey": "Open result.txt and observe done",
+        "success_metric": "result.txt contains done",
+        "outcome_mode": "integration",
+        "verification_steps": ["read result.txt"],
+        "max_attempts": 3,
+        "wall_clock_budget_seconds": 3600,
+        "risk_domains": ["none"],
+        "consumers": [],
+        "egress_paths": [],
+        "rollback_behavior": "not applicable",
+        "knowledge_closure_required": False,
+    }
+
+
+def _review_result():
+    return {
+        "verdict": "PASS",
+        "findings": [],
+        "checks_run": ["diff", "read result.txt"],
+        "outcome_evidence": {
+            "critical_user_journey": "Open result.txt and observe done",
+            "verdict": "PASS",
+            "environment": "isolated candidate worktree",
+            "checks_run": ["read result.txt"],
+            "observed_behavior": "result.txt contained done",
+            "artifact_digests": ["sha256:" + "a" * 64],
+            "observed_at": 1786233600,
+        },
+        "knowledge_closure": None,
+    }
+
+
 @pytest.mark.parametrize(
     "filename",
     ["jobs-build-result.v1.schema.json", "jobs-review-result.v1.schema.json"],
@@ -93,6 +127,7 @@ def _context(tmp_path: Path, provider: str) -> dispatch.DispatchContext:
         model=identity.model,
         effort="high" if provider == "codex" else "max",
         max_turns=120,
+        assurance_contract=_assurance_contract(),
     )
 
 
@@ -135,7 +170,7 @@ def test_reliability_adapter_preserves_provider_and_materializes_evidence(
             status="succeeded",
             commit=commit,
             tests=({"cmd": "focused", "result": "pass", "evidence": "1 passed"},),
-            review={"verdict": "PASS", "findings": [], "checks_run": ["diff"]},
+            review=_review_result(),
             executor_exit_digest="sha256:" + "1" * 64,
             output_capture_digest="sha256:" + "2" * 64,
         )
@@ -159,6 +194,10 @@ def test_reliability_adapter_preserves_provider_and_materializes_evidence(
     assert gate.identity_verified is True
     completion = jobs_reliability.production_completion_gate(context, gate)
     assert completion.status == "PASS"
+    outcome = jobs_reliability.production_outcome_gate(context, execution)
+    assert outcome.status == "PASS"
+    closure = jobs_reliability.production_knowledge_closure_gate(context, execution)
+    assert closure.disposition == "NOT_APPLICABLE"
 
 
 def test_provider_mismatch_refuses_before_phase_runner(tmp_path):
@@ -204,7 +243,7 @@ def test_local_phase_runner_uses_two_fresh_same_provider_sessions(
                 ],
             }
         else:
-            payload = {"verdict": "PASS", "findings": [], "checks_run": ["diff"]}
+            payload = _review_result()
         target = stdout_path
         if provider == "codex":
             marker = "--output-last-message"
@@ -314,6 +353,29 @@ def test_runtime_production_preflight_refuses_non_idle_health(tmp_path):
     assert (result.status, result.code) == ("BLOCKED", "AUTH_REQUIRED")
 
 
+def test_runtime_preflight_requires_exact_executor_version(tmp_path):
+    context = _context(tmp_path, "codex")
+    health = jobs_lanes.LaneHealth(
+        lane_id="codex-mac-1",
+        state="IDLE",
+        status="PASS",
+        failure_class=None,
+        reason_code="OK",
+        observed_at=100,
+        expires_at=220,
+        executor_version="",
+        available_capacity=1,
+        safe_detail={},
+    )
+    probes = jobs_runtime.production_preflight_probes(
+        lane_root=context.lane_root, lane_health=health
+    )
+
+    result = probes.tool_routing(("codex-mac-1", "codex", "gpt-5.6-sol"))
+
+    assert (result.status, result.code) == ("BLOCKED", "TOOL_ROUTING_INVALID")
+
+
 def test_ssh_runner_uses_exact_remote_runtime_and_preserves_provider(tmp_path):
     context = replace(_context(tmp_path, "codex"), lane_id="codex-pc-1")
     calls = []
@@ -321,7 +383,7 @@ def test_ssh_runner_uses_exact_remote_runtime_and_preserves_provider(tmp_path):
         status="succeeded",
         commit="c" * 40,
         tests=({"cmd": "focused", "result": "pass", "evidence": "1 passed"},),
-        review={"verdict": "PASS", "findings": [], "checks_run": ["diff"]},
+        review=_review_result(),
         executor_exit_digest="sha256:" + "3" * 64,
         output_capture_digest="sha256:" + "4" * 64,
     )

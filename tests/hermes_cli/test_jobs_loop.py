@@ -6,6 +6,14 @@ import pytest
 from hermes_cli import jobs_loop as loop
 
 
+def _progress(seed: str):
+    return {
+        "prior_failure_digest": "sha256:" + "a" * 64,
+        "response_change_digest": "sha256:" + ("b" if seed == "1" else "c") * 64,
+        "result_delta_digest": "sha256:" + ("d" if seed == "1" else "e") * 64,
+    }
+
+
 @pytest.mark.parametrize(
     ("signal", "expected"),
     [
@@ -53,7 +61,10 @@ def test_identical_evidence_is_not_retried():
         )
     ]
     decision = loop.decide_retry(
-        history, evidence_digest="sha256:same", failure_class="PROVIDER"
+        history,
+        evidence_digest="sha256:same",
+        failure_class="PROVIDER",
+        **_progress("1"),
     )
     assert (decision.action, decision.reason_code) == (
         "BLOCKED",
@@ -69,22 +80,26 @@ def test_fourth_execution_is_blocked():
         for i in (1, 2, 3)
     ]
     decision = loop.decide_retry(
-        history, evidence_digest="sha256:4", failure_class="PROVIDER"
+        history,
+        evidence_digest="sha256:4",
+        failure_class="PROVIDER",
+        **_progress("1"),
     )
     assert (decision.action, decision.reason_code) == ("BLOCKED", "RETRY_LIMIT")
 
 
 def test_retry_backoff_is_bounded_and_task_correction_is_immediate():
     first = loop.decide_retry(
-        [], evidence_digest="sha256:1", failure_class="PROVIDER"
+        [], evidence_digest="sha256:1", failure_class="PROVIDER", **_progress("1")
     )
     second = loop.decide_retry(
         [loop.RetryRecord(1, "sha256:1", "RETRY")],
         evidence_digest="sha256:2",
         failure_class="INFRA_FAILURE",
+        **_progress("2"),
     )
     task = loop.decide_retry(
-        [], evidence_digest="sha256:task", failure_class="TASK_FAILURE"
+        [], evidence_digest="sha256:task", failure_class="TASK_FAILURE", **_progress("1")
     )
     assert (first.action, first.backoff_seconds) == ("RETRY", 30)
     assert (second.action, second.backoff_seconds) == ("RETRY", 60)
@@ -97,6 +112,17 @@ def test_authentication_and_safety_never_retry(failure_class):
         [], evidence_digest="sha256:new", failure_class=failure_class
     )
     assert (decision.action, decision.backoff_seconds) == ("HUMAN_ACTION", 0)
+
+
+def test_retry_without_changed_response_and_new_result_is_blocked():
+    decision = loop.decide_retry(
+        [], evidence_digest="sha256:new", failure_class="PROVIDER"
+    )
+
+    assert (decision.action, decision.reason_code) == (
+        "BLOCKED",
+        "RETRY_MISSING_PRIOR_FAILURE",
+    )
 
 
 def test_readback_mismatch_blocks_verification(tmp_path):

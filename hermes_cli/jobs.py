@@ -37,6 +37,7 @@ from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_exec as jx
 from hermes_cli import jobs_identity as ji
 from hermes_cli import jobs_run as jrun
+from hermes_cli import jobs_scorecard
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +69,12 @@ def build_parser(
         required=True,
         metavar="PATH",
         help="Path to a UTF-8 file whose contents become the verbatim goal",
+    )
+    p_create.add_argument(
+        "--assurance-file",
+        required=True,
+        metavar="PATH",
+        help="Strict JSON definition-of-done, outcome, risk, and budget contract",
     )
     p_create.add_argument(
         "--lane",
@@ -328,6 +335,10 @@ def build_parser(
         help="Path to a UTF-8 file whose contents become the verbatim goal",
     )
     p_in.add_argument(
+        "--assurance-file", required=True, metavar="PATH",
+        help="Strict JSON definition-of-done, outcome, risk, and budget contract",
+    )
+    p_in.add_argument(
         "--lane",
         required=True,
         choices=ji.REQUESTED_LANES,
@@ -339,6 +350,14 @@ def build_parser(
         help="Historical Kanban card id (repeatable)",
     )
     p_in.add_argument("--json", action="store_true", help="Emit JSON")
+
+    p_score = sub.add_parser(
+        "scorecard", help="Read-only weekly Workflow Reliability Scorecard"
+    )
+    p_score.add_argument("--since", type=int, default=None, metavar="EPOCH")
+    p_score.add_argument("--until", type=int, default=None, metavar="EPOCH")
+    p_score.add_argument("--guard-threshold", type=int, default=2, metavar="N")
+    p_score.add_argument("--json", action="store_true", help="Emit JSON")
 
     parser.set_defaults(_jobs_parser=parser)
     return parser
@@ -378,6 +397,7 @@ def jobs_command(args: argparse.Namespace) -> int:
         "claim-heartbeat": _cmd_claim_heartbeat,
         "recover-expired": _cmd_recover_expired,
         "intake": _cmd_intake,
+        "scorecard": _cmd_scorecard,
         "receipt-add": _cmd_receipt_add,
         "receipts": _cmd_receipts,
         "attempts": _cmd_attempts,
@@ -451,6 +471,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return 2
 
     try:
+        assurance_contract = _read_json_file(
+            args.assurance_file, "assurance contract"
+        )
         with jdb.connect_closing() as conn:
             jid = jdb.create_job(
                 conn,
@@ -460,9 +483,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 routing_reason=args.routing_reason,
                 correlations=args.correlation,
                 skills=args.skills,
+                assurance_contract=assurance_contract,
             )
             job = jdb.get_job(conn, jid)
-    except ValueError as exc:
+    except (ValueError, _CliError) as exc:
         print(f"jobs: {exc}", file=sys.stderr)
         return 2
 
@@ -792,6 +816,9 @@ def _cmd_intake(args: argparse.Namespace) -> int:
         return 2
 
     try:
+        assurance_contract = _read_json_file(
+            args.assurance_file, "assurance contract"
+        )
         with jdb.connect_closing() as conn:
             result = jdb.create_or_get_job(
                 conn,
@@ -802,9 +829,10 @@ def _cmd_intake(args: argparse.Namespace) -> int:
                 requested_lane=args.lane,
                 routing_reason=args.routing_reason,
                 correlations=args.correlation,
+                assurance_contract=assurance_contract,
             )
             job_dict = jdb.get_job(conn, result.job_id).to_dict()
-    except ValueError as exc:
+    except (ValueError, _CliError) as exc:
         print(f"jobs: {exc}", file=sys.stderr)
         return 2
 
@@ -819,6 +847,38 @@ def _cmd_intake(args: argparse.Namespace) -> int:
     else:
         state = "created" if result.created else ("conflict" if result.conflict else "existing")
         print(f"Intake {state}: {job_dict['label']} ({job_dict['id']})")
+    return 0
+
+
+def _cmd_scorecard(args: argparse.Namespace) -> int:
+    period_end = int(time.time()) if args.until is None else int(args.until)
+    period_start = period_end - 7 * 24 * 60 * 60 if args.since is None else int(args.since)
+    try:
+        conn = jdb.connect_readonly()
+        try:
+            report = jobs_scorecard.scorecard_from_connection(
+                conn,
+                period_start=period_start,
+                period_end=period_end,
+                guard_threshold=args.guard_threshold,
+            )
+        finally:
+            conn.close()
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"jobs: {exc}", file=sys.stderr)
+        return 2
+    payload = report.to_mapping()
+    if args.json:
+        _emit_json(payload)
+    else:
+        print(
+            "Workflow reliability: "
+            f"{report.outcomes_verified}/{report.jobs_settled} settled jobs verified; "
+            f"false-complete={report.false_complete}, "
+            f"retry-without-progress={report.retry_without_progress}, "
+            f"missing-evidence={report.missing_evidence}, "
+            f"post-green-failures={report.post_green_failures}"
+        )
     return 0
 
 

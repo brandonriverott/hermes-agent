@@ -23,7 +23,7 @@ _CONTEXT_KEYS = {
     "job_id", "job_number", "job_name", "goal", "attempt_id", "ordinal",
     "repository", "base_commit", "branch", "worktree", "lane_root",
     "requested_lane", "lane_id", "executor", "specialist", "model", "effort",
-    "max_turns",
+    "max_turns", "assurance_contract",
 }
 
 

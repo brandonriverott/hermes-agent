@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli import jobs_assurance
 from hermes_cli import jobs_execution
 from hermes_cli import jobs_exec
 from hermes_cli import jobs_receipts
@@ -42,6 +43,8 @@ class PhaseResult:
     failure_reason_code: Optional[str] = None
     http_status: Optional[int] = None
     safety_gate: bool = False
+    response_change_digest: Optional[str] = None
+    result_delta_digest: Optional[str] = None
 
 
 PhaseRunner = Callable[[str, object], PhaseResult]
@@ -253,11 +256,24 @@ def _build_prompt(context: object) -> bytes:
 
 
 def _review_prompt(context: object, commit: str) -> bytes:
+    contract = jobs_assurance.AssuranceContract.from_mapping(
+        getattr(context, "assurance_contract", None)
+    )
     return (
         "Independently review the candidate diff against its approved base. "
-        "Do not modify files. Return PASS only when there are no unresolved "
-        "correctness, security, evidence, or maintainability findings.\n"
+        "Do not modify files and do not rely on the builder summary as evidence. "
+        "Run the named critical-user-journey checks yourself in the candidate "
+        "environment and capture artifact digests. Return UNABLE_TO_VERIFY when "
+        "the required evidence cannot be independently obtained. Return PASS only "
+        "when there are no unresolved correctness, security, evidence, user-outcome, "
+        "or maintainability findings. For money, permissions, or state risks, "
+        "explicitly verify every named consumer and egress path and assess the "
+        "declared rollback behavior. knowledge_closure must be null unless an "
+        "actual Vault Steward disposition receipt is available.\n"
         f"BASE={getattr(context, 'base_commit')}\nCANDIDATE={commit}\n"
+        "ASSURANCE_CONTRACT="
+        + json.dumps(contract.to_mapping(), sort_keys=True, separators=(",", ":"))
+        + "\n"
     ).encode("utf-8")
 
 
@@ -509,6 +525,9 @@ class SSHProviderPhaseRunner:
                 "model": str(getattr(context, "model")),
                 "effort": str(getattr(context, "effort")),
                 "max_turns": int(getattr(context, "max_turns")),
+                "assurance_contract": dict(
+                    getattr(context, "assurance_contract")
+                ),
             },
         }
         script = self.runtime_root / "scripts" / "jobs_remote_worker.py"
@@ -538,6 +557,8 @@ class SSHProviderPhaseRunner:
                 "failure_reason_code",
                 "http_status",
                 "safety_gate",
+                "response_change_digest",
+                "result_delta_digest",
             }:
                 raise ValueError("shape")
             return PhaseResult(
@@ -558,6 +579,16 @@ class SSHProviderPhaseRunner:
                     raw["http_status"] if isinstance(raw["http_status"], int) else None
                 ),
                 safety_gate=raw["safety_gate"] is True,
+                response_change_digest=(
+                    raw["response_change_digest"]
+                    if isinstance(raw["response_change_digest"], str)
+                    else None
+                ),
+                result_delta_digest=(
+                    raw["result_delta_digest"]
+                    if isinstance(raw["result_delta_digest"], str)
+                    else None
+                ),
             )
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise jobs_execution.AdapterError(
@@ -695,13 +726,29 @@ class ProductionReliabilityAdapter:
                 failure_reason_code=result.failure_reason_code,
                 http_status=result.http_status,
                 safety_gate=result.safety_gate,
+                response_change_digest=result.response_change_digest,
+                result_delta_digest=result.result_delta_digest,
             )
         if _SHA_RE.fullmatch(commit) is None:
             raise jobs_execution.AdapterError("provider candidate commit is malformed")
         if not result.tests:
             raise jobs_execution.AdapterError("provider supplied no test evidence")
-        if result.review.get("verdict") not in {"PASS", "NEEDS_CHANGES"}:
-            raise jobs_execution.AdapterError("provider review verdict is invalid")
+        try:
+            jobs_assurance.validate_review_result(result.review)
+            jobs_assurance.OutcomeEvidence.from_mapping(
+                result.review.get("outcome_evidence")
+            )
+            closure_value = result.review.get("knowledge_closure")
+            if closure_value is not None:
+                jobs_assurance.KnowledgeClosureReceipt.from_mapping(closure_value)
+        except (
+            ValueError,
+            jobs_assurance.InvalidOutcomeEvidence,
+            jobs_assurance.InvalidClosureReceipt,
+        ) as exc:
+            raise jobs_execution.AdapterError(
+                "provider review evidence is invalid"
+            ) from exc
 
         evidence_dir = Path(lane_root) / "receipts" / str(
             getattr(context, "attempt_id")
@@ -814,6 +861,78 @@ def production_completion_gate(context: object, gate: object):
     )
 
 
+def _review_receipt(context: object) -> dict:
+    lane_root = getattr(context, "lane_root", None)
+    if lane_root is None:
+        raise jobs_execution.AdapterError("outcome gate lacks lane identity")
+    evidence_dir = Path(lane_root) / "receipts" / str(
+        getattr(context, "attempt_id")
+    )
+    review_attempt = max(0, int(getattr(context, "ordinal")) - 1)
+    path = evidence_dir / f"review-{review_attempt}.json"
+    if path.is_symlink():
+        raise jobs_execution.AdapterError("review receipt must not be a symlink")
+    review = _read_json(path)
+    if review is None:
+        raise jobs_execution.AdapterError("review receipt is unavailable")
+    return review
+
+
+def production_outcome_gate(context: object, _execution: object):
+    """Verify the named user journey from the independent reviewer receipt."""
+
+    contract = jobs_assurance.AssuranceContract.from_mapping(
+        getattr(context, "assurance_contract", None)
+    )
+    review = _review_receipt(context)
+    validated_review = jobs_assurance.validate_review_result(review)
+    evidence = jobs_assurance.OutcomeEvidence.from_mapping(
+        review.get("outcome_evidence")
+    )
+    decision = jobs_assurance.verify_outcome(contract, evidence)
+    if not validated_review.authorizes_completion and decision.status == "PASS":
+        return jobs_assurance.OutcomeDecision(
+            "BLOCKED", "REVIEW_NOT_PASSING", evidence.digest
+        )
+    return decision
+
+
+def production_knowledge_closure_gate(context: object, _execution: object):
+    """Require a Vault Steward closure receipt when durable knowledge changed."""
+
+    contract = jobs_assurance.AssuranceContract.from_mapping(
+        getattr(context, "assurance_contract", None)
+    )
+    review = _review_receipt(context)
+    closure_value = review.get("knowledge_closure")
+    if contract.knowledge_closure_required:
+        if closure_value is None:
+            raise jobs_execution.AdapterError(
+                "required Vault Steward closure receipt is missing"
+            )
+        return jobs_assurance.KnowledgeClosureReceipt.from_mapping(closure_value)
+    if closure_value is not None:
+        return jobs_assurance.KnowledgeClosureReceipt.from_mapping(closure_value)
+    digest = jobs_receipts.digest_bytes(
+        jobs_receipts.canonical_json_bytes(
+            {
+                "job_id": str(getattr(context, "job_id")),
+                "attempt_id": str(getattr(context, "attempt_id")),
+                "contract_digest": contract.digest,
+                "disposition": "NOT_APPLICABLE",
+            }
+        )
+    )
+    return jobs_assurance.KnowledgeClosureReceipt.from_mapping(
+        {
+            "disposition": "NOT_APPLICABLE",
+            "canonical_note_path": None,
+            "retrieval_confirmed": False,
+            "steward_receipt_digest": digest,
+        }
+    )
+
+
 __all__ = [
     "LocalProviderPhaseRunner",
     "FleetProviderPhaseRunner",
@@ -825,4 +944,6 @@ __all__ = [
     "production_remote_preflight",
     "production_completion_gate",
     "production_gate",
+    "production_knowledge_closure_gate",
+    "production_outcome_gate",
 ]

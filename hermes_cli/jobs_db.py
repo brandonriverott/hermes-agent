@@ -220,7 +220,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- table choose"; an empty array is an opinion and means "attach nothing".
     -- Names only — whether one resolves to a file on this machine is a runtime
     -- question, and a Job outlives the machine it was created on.
-    skills            TEXT
+    skills            TEXT,
+    assurance_contract TEXT
 );
 
 CREATE TABLE IF NOT EXISTS job_events (
@@ -457,6 +458,9 @@ CREATE TABLE IF NOT EXISTS job_retry_evidence (
     parent_attempt_id     TEXT REFERENCES job_attempts(id),
     ordinal               INTEGER NOT NULL,
     evidence_digest       TEXT NOT NULL,
+    prior_failure_digest  TEXT,
+    response_change_digest TEXT,
+    result_delta_digest   TEXT,
     decision              TEXT NOT NULL,
     reason_code           TEXT NOT NULL,
     created_at            INTEGER NOT NULL,
@@ -582,6 +586,19 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
     except Exception:
         conn.close()
         raise
+    return conn
+
+
+def connect_readonly(db_path: Optional[Path] = None) -> sqlite3.Connection:
+    """Open an existing Jobs database without schema or state mutations."""
+
+    path = db_path if db_path is not None else jobs_db_path()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA query_only=ON")
     return conn
 
 
@@ -956,6 +973,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # is exactly the truth about them: nobody declared any skills, so the default
     # rules table decides for them the same way it does for a new Job.
     add_column_if_missing(conn, "jobs", "skills", "skills TEXT")
+    add_column_if_missing(
+        conn, "jobs", "assurance_contract", "assurance_contract TEXT"
+    )
+    add_column_if_missing(
+        conn, "job_retry_evidence", "prior_failure_digest", "prior_failure_digest TEXT"
+    )
+    add_column_if_missing(
+        conn, "job_retry_evidence", "response_change_digest", "response_change_digest TEXT"
+    )
+    add_column_if_missing(
+        conn, "job_retry_evidence", "result_delta_digest", "result_delta_digest TEXT"
+    )
     add_column_if_missing(conn, "job_attempts", "ordinal", "ordinal INTEGER")
     # Nullable on purpose. A blanket ``DEFAULT 0`` here would *falsify* every
     # settled row a pre-column V2 build finished with an explicit give-up, so
@@ -1154,6 +1183,9 @@ class RetryEvidenceWrite:
     parent_attempt_id: Optional[str]
     ordinal: int
     evidence_digest: str
+    prior_failure_digest: Optional[str]
+    response_change_digest: Optional[str]
+    result_delta_digest: Optional[str]
     decision: str
     reason_code: str
     created_at: int
@@ -1183,6 +1215,7 @@ class Job:
     # ``None`` is unset (the default rules table may choose); ``[]`` is an
     # explicit "attach nothing". The two are not interchangeable.
     skills: Optional[List[str]] = None
+    assurance_contract: Optional[dict] = None
     correlations: List[str] = field(default_factory=list)
 
     @property
@@ -1216,6 +1249,11 @@ class Job:
             "lease_expires_at": self.lease_expires_at,
             "current_attempt_id": self.current_attempt_id,
             "skills": None if self.skills is None else list(self.skills),
+            "assurance_contract": (
+                None
+                if self.assurance_contract is None
+                else dict(self.assurance_contract)
+            ),
             "correlations": list(self.correlations),
         }
 
@@ -1240,6 +1278,19 @@ def _decode_skills(row: sqlite3.Row) -> Optional[List[str]]:
     return [s for s in parsed if isinstance(s, str) and s]
 
 
+def _decode_assurance_contract(row: sqlite3.Row) -> Optional[dict]:
+    if "assurance_contract" not in row.keys() or row["assurance_contract"] is None:
+        return None
+    try:
+        from hermes_cli import jobs_assurance
+
+        return jobs_assurance.AssuranceContract.from_mapping(
+            json.loads(row["assurance_contract"])
+        ).to_mapping()
+    except (ValueError, TypeError):
+        return None
+
+
 def _job_from_row(row: sqlite3.Row) -> Job:
     return Job(
         id=row["id"],
@@ -1262,6 +1313,7 @@ def _job_from_row(row: sqlite3.Row) -> Job:
         lease_expires_at=row["lease_expires_at"],
         current_attempt_id=row["current_attempt_id"],
         skills=_decode_skills(row),
+        assurance_contract=_decode_assurance_contract(row),
     )
 
 
@@ -1408,6 +1460,7 @@ def create_job(
     correlations: Optional[Iterable[str]] = None,
     skills=None,
     origin: Optional[Mapping[str, object]] = None,
+    assurance_contract: Optional[Mapping[str, object]] = None,
 ) -> str:
     """Create a Job and return its opaque ``j_`` id.
 
@@ -1442,6 +1495,7 @@ def create_job(
             correlations=correlations,
             skills=skills,
             origin=origin,
+            assurance_contract=assurance_contract,
         )
 
 
@@ -1456,6 +1510,7 @@ def _create_job_locked(
     now: Optional[int] = None,
     skills=None,
     origin: Optional[Mapping[str, object]] = None,
+    assurance_contract: Optional[Mapping[str, object]] = None,
 ) -> str:
     """Insert one Job (and its ``job_created`` event). Caller holds the txn.
 
@@ -1477,6 +1532,23 @@ def _create_job_locked(
 
     declared = None if skills is None else list(jskills.parse_declared_skills(skills))
     skills_json = None if declared is None else json.dumps(declared, ensure_ascii=False)
+    from hermes_cli import jobs_assurance
+
+    assurance = (
+        None
+        if assurance_contract is None
+        else jobs_assurance.AssuranceContract.from_mapping(assurance_contract)
+    )
+    assurance_json = (
+        None
+        if assurance is None
+        else json.dumps(
+            assurance.to_mapping(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
     requested_lane = identity.requested_lane
     executor = identity.executor
     persisted_specialist = identity.specialist
@@ -1493,9 +1565,9 @@ def _create_job_locked(
         "INSERT INTO jobs "
         "(id, number, name, goal, status, step, requested_lane, executor, "
         " specialist, model, routing_reason, created_at, updated_at, "
-        " last_heartbeat_at, revision, skills) "
+        " last_heartbeat_at, revision, skills, assurance_contract) "
         "VALUES (?, ?, ?, ?, 'working', 'routing', ?, ?, ?, ?, ?, ?, ?, "
-        " NULL, 1, ?)",
+        " NULL, 1, ?, ?)",
         (
             jid,
             number,
@@ -1509,6 +1581,7 @@ def _create_job_locked(
             now,
             now,
             skills_json,
+            assurance_json,
         ),
     )
     for kanban_id in corr:
@@ -1555,20 +1628,23 @@ def _create_job_locked(
                 },
                 now=now,
             )
+    created_data = {
+        "number": number,
+        "name": name,
+        "requested_lane": requested_lane,
+        "executor": executor,
+        "specialist": persisted_specialist,
+        "model": model,
+        "routing_reason": routing_reason,
+        "skills": declared,
+    }
+    if assurance is not None:
+        created_data["assurance_contract_digest"] = assurance.digest
     _append_event_locked(
         conn,
         jid,
         "job_created",
-        data={
-            "number": number,
-            "name": name,
-            "requested_lane": requested_lane,
-            "executor": executor,
-            "specialist": persisted_specialist,
-            "model": model,
-            "routing_reason": routing_reason,
-            "skills": declared,
-        },
+        data=created_data,
         now=now,
     )
     return jid
@@ -3832,6 +3908,8 @@ def _graph_public_state_locked(
         "EVIDENCE_COLLECTING": ("working", "testing"),
         "REVIEWING": ("working", "reviewing"),
         "VERIFIED": ("working", "verifying"),
+        "OUTCOME_VERIFYING": ("working", "verifying"),
+        "OUTCOME_VERIFIED": ("working", "verifying"),
     }
     if request.target_state in nonterminal:
         status, step = nonterminal[request.target_state]
@@ -4110,6 +4188,9 @@ def _retry_evidence_to_dict(row: sqlite3.Row) -> dict:
         "parent_attempt_id": row["parent_attempt_id"],
         "ordinal": row["ordinal"],
         "evidence_digest": row["evidence_digest"],
+        "prior_failure_digest": row["prior_failure_digest"],
+        "response_change_digest": row["response_change_digest"],
+        "result_delta_digest": row["result_delta_digest"],
         "decision": row["decision"],
         "reason_code": row["reason_code"],
         "created_at": row["created_at"],
@@ -4132,10 +4213,27 @@ def record_retry_decision(
         raise ValueError("retry ordinal must be positive")
     if _RELIABILITY_DIGEST_RE.fullmatch(record.evidence_digest) is None:
         raise ValueError("retry evidence digest must be sha256:<64 lowercase hex>")
+    for label, value in (
+        ("prior failure", record.prior_failure_digest),
+        ("response change", record.response_change_digest),
+        ("result delta", record.result_delta_digest),
+    ):
+        if value is not None and _RELIABILITY_DIGEST_RE.fullmatch(value) is None:
+            raise ValueError(f"retry {label} digest must be sha256:<64 lowercase hex>")
     if record.decision not in {"RETRY", "BLOCKED", "HUMAN_ACTION"}:
         raise ValueError("invalid retry decision")
     if _RELIABILITY_REASON_RE.fullmatch(record.reason_code) is None:
         raise ValueError("invalid retry reason code")
+    if record.decision == "RETRY":
+        from hermes_cli import jobs_assurance
+
+        progress = jobs_assurance.assess_retry_progress(
+            prior_failure=record.prior_failure_digest,
+            response_change=record.response_change_digest,
+            result_delta=record.result_delta_digest,
+        )
+        if progress.action != "RETRY":
+            raise ValueError("retry decision lacks measurable progress evidence")
 
     with write_txn(conn):
         job = conn.execute(
@@ -4173,8 +4271,9 @@ def record_retry_decision(
             cursor = conn.execute(
                 "INSERT INTO job_retry_evidence "
                 "(job_id, chain_id, attempt_id, parent_attempt_id, ordinal, "
-                " evidence_digest, decision, reason_code, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " evidence_digest, prior_failure_digest, response_change_digest, "
+                " result_delta_digest, decision, reason_code, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.job_id,
                     record.chain_id,
@@ -4182,6 +4281,9 @@ def record_retry_decision(
                     record.parent_attempt_id,
                     record.ordinal,
                     record.evidence_digest,
+                    record.prior_failure_digest,
+                    record.response_change_digest,
+                    record.result_delta_digest,
                     record.decision,
                     record.reason_code,
                     record.created_at,
@@ -5423,6 +5525,7 @@ def create_or_get_job(
     specialist: Optional[str] = None,
     routing_reason: Optional[str] = None,
     correlations: Optional[Iterable[str]] = None,
+    assurance_contract: Optional[Mapping[str, object]] = None,
     now: Optional[int] = None,
 ) -> IntakeResult:
     """Create one Job for a source key, or return the existing one.
@@ -5452,6 +5555,13 @@ def create_or_get_job(
         requested_lane=requested_lane,
         specialist=specialist,
     )
+    from hermes_cli import jobs_assurance
+
+    assurance = (
+        None
+        if assurance_contract is None
+        else jobs_assurance.AssuranceContract.from_mapping(assurance_contract)
+    )
     now = _now() if now is None else int(now)
 
     with write_txn(conn):
@@ -5470,6 +5580,9 @@ def create_or_get_job(
                     conflict = conflict or ji.effective_identity(job) != identity
                 except ji.UnsupportedJobLane:
                     conflict = True
+                conflict = conflict or job.assurance_contract != (
+                    None if assurance is None else assurance.to_mapping()
+                )
             return IntakeResult(job_id=jid, created=False, conflict=conflict)
 
         jid = _create_job_locked(
@@ -5479,6 +5592,9 @@ def create_or_get_job(
             identity=identity,
             routing_reason=routing_reason,
             correlations=correlations,
+            assurance_contract=(
+                None if assurance is None else assurance.to_mapping()
+            ),
             now=now,
         )
         conn.execute(

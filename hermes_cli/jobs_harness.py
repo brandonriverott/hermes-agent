@@ -10,6 +10,7 @@ from typing import Callable, Literal, Mapping
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from hermes_cli import jobs_assurance
 from hermes_cli import jobs_db
 from hermes_cli import jobs_receipts
 from hermes_cli.jobs_receipts import JsonValue
@@ -23,6 +24,7 @@ CHECK_NAMES = (
     "tool_routing",
     "auth_check",
     "resource_budget",
+    "outcome_contract",
 )
 
 _DETAIL_KEYS = frozenset(
@@ -44,6 +46,7 @@ _DETAIL_KEYS = frozenset(
         "expires_at",
         "host",
         "status",
+        "contract_digest",
     }
 )
 _DETAIL_LIMIT = 4096
@@ -77,6 +80,7 @@ class PreflightProbes:
     tool_routing: Probe
     auth_check: Probe
     resource_budget: Probe
+    outcome_contract: Probe | None = None
 
     def with_result(self, name: str, result: ProbeResult) -> "PreflightProbes":
         if name not in CHECK_NAMES:
@@ -118,6 +122,7 @@ class PreflightSnapshot:
     model: str
     observed_at: str
     expected_job_revision: int
+    assurance_contract: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -156,7 +161,19 @@ def _probe_input(name: str, snapshot: PreflightSnapshot) -> object:
         return (snapshot.lane_id, snapshot.executor, snapshot.model)
     if name == "auth_check":
         return snapshot.lane_id
+    if name == "outcome_contract":
+        return snapshot.assurance_contract
     return snapshot.repository
+
+
+def _outcome_contract_probe(value: object) -> ProbeResult:
+    if value is None:
+        return ProbeResult("BLOCKED", "OUTCOME_CONTRACT_MISSING", {})
+    try:
+        contract = jobs_assurance.AssuranceContract.from_mapping(value)
+    except jobs_assurance.InvalidAssuranceContract:
+        return ProbeResult("BLOCKED", "OUTCOME_CONTRACT_INVALID", {})
+    return ProbeResult("PASS", "OK", {"contract_digest": contract.digest})
 
 
 def _contains_secret(value: object) -> bool:
@@ -238,7 +255,14 @@ def classify_preflight_failure(checks: tuple[CheckResult, ...]) -> str:
         return "SAFETY_GATE"
     if any(
         check.name
-        in {"file_paths", "permissions", "worktree", "tool_routing", "resource_budget"}
+        in {
+            "file_paths",
+            "permissions",
+            "worktree",
+            "tool_routing",
+            "resource_budget",
+            "outcome_contract",
+        }
         for check in blocked
     ):
         return "INFRA_FAILURE"
@@ -255,11 +279,15 @@ def _stable_id(prefix: str, value: object) -> str:
 def evaluate_preflight(
     snapshot: PreflightSnapshot, probes: PreflightProbes
 ) -> PreflightDecision:
-    """Evaluate all seven probes exactly once against one immutable snapshot."""
+    """Evaluate every probe exactly once against one immutable snapshot."""
 
     checks = []
     for name in CHECK_NAMES:
-        probe = getattr(probes, name)
+        probe = (
+            _outcome_contract_probe
+            if name == "outcome_contract"
+            else getattr(probes, name)
+        )
         try:
             raw_result = probe(_probe_input(name, snapshot))
         except Exception:

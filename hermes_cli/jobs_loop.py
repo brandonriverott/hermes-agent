@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
 
+from hermes_cli import jobs_assurance
 from hermes_cli import jobs_receipts
 from hermes_constants import get_hermes_home
 
@@ -166,6 +167,9 @@ def decide_retry(
     *,
     evidence_digest: str,
     failure_class: str,
+    prior_failure_digest: str | None = None,
+    response_change_digest: str | None = None,
+    result_delta_digest: str | None = None,
     policy: RetryPolicy = RetryPolicy(),
 ) -> RetryDecision:
     """Return a deterministic decision without mutating attempt state."""
@@ -182,6 +186,13 @@ def decide_retry(
         )
     if len(history) >= policy.max_attempts:
         return RetryDecision("BLOCKED", "RETRY_LIMIT", 0)
+    progress = jobs_assurance.assess_retry_progress(
+        prior_failure=prior_failure_digest,
+        response_change=response_change_digest,
+        result_delta=result_delta_digest,
+    )
+    if progress.action != "RETRY":
+        return RetryDecision("BLOCKED", progress.reason_code, 0)
     attempt_count = len(history) + 1
     if failure_class == "TASK_FAILURE":
         backoff = 0
