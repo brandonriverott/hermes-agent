@@ -53,6 +53,23 @@ _ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM")
 _MAX_PHASE_BYTES = 64 * 1024
 
 
+def _remote_repository(repository: Path) -> Path:
+    """Map a Mac worktree to its explicitly configured PC checkout."""
+    raw = os.environ.get("HERMES_JOBS_PC_REPO_MAP", "").strip()
+    if not raw:
+        return Path(repository)
+    try:
+        mapping = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise jobs_execution.AdapterError("remote repository mapping is invalid") from exc
+    if not isinstance(mapping, dict):
+        raise jobs_execution.AdapterError("remote repository mapping is invalid")
+    target = mapping.get(str(repository))
+    if not isinstance(target, str) or not Path(target).is_absolute():
+        raise jobs_execution.AdapterError("remote repository mapping is unavailable")
+    return Path(target)
+
+
 @dataclass(frozen=True)
 class ProcessResult:
     returncode: int
@@ -421,7 +438,7 @@ class SSHProviderPhaseRunner:
         payload = {
             "schema_version": 1,
             "provider": provider,
-            "repository": str(repository),
+            "repository": str(_remote_repository(repository)),
             "base_commit": base_commit,
             "branch": branch,
             "lane_root": str(self.lane_root / lane_id),
@@ -452,7 +469,9 @@ class SSHProviderPhaseRunner:
                 "goal": str(getattr(context, "goal")),
                 "attempt_id": str(getattr(context, "attempt_id")),
                 "ordinal": int(getattr(context, "ordinal")),
-                "repository": str(getattr(context, "repository")),
+                "repository": str(
+                    _remote_repository(Path(getattr(context, "repository")))
+                ),
                 "base_commit": str(getattr(context, "base_commit")),
                 "branch": str(getattr(context, "branch")),
                 "worktree": str(

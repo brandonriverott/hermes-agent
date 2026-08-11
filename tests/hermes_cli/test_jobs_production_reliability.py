@@ -374,3 +374,19 @@ def test_ssh_preflight_is_read_only_and_exact(tmp_path):
     payload = json.loads(kwargs["input"])
     assert payload["provider"] == "codex"
     assert payload["lane_root"] == "/home/brandon/jobs/lanes/codex-pc-1"
+
+
+def test_remote_repository_mapping_is_explicit_and_fail_closed(monkeypatch):
+    local = Path("/Users/brandon/project")
+    remote = Path("/home/brandon/project")
+    monkeypatch.setenv(
+        "HERMES_JOBS_PC_REPO_MAP", json.dumps({str(local): str(remote)})
+    )
+
+    assert jobs_reliability._remote_repository(local) == remote
+
+    monkeypatch.setenv(
+        "HERMES_JOBS_PC_REPO_MAP", json.dumps({"/Users/brandon/other": str(remote)})
+    )
+    with pytest.raises(jobs_execution.AdapterError, match="mapping"):
+        jobs_reliability._remote_repository(local)
