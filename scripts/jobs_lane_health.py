@@ -330,7 +330,11 @@ def _probe_resources(lane_dir: Path) -> jobs_lanes.ProbeResult:
         import psutil
 
         memory_available = int(psutil.virtual_memory().available)
-    except (ImportError, OSError, ValueError):
+    except ImportError:
+        memory_available = _linux_mem_available(Path("/proc/meminfo"))
+    except (OSError, ValueError):
+        memory_available = None
+    if memory_available is None:
         return _probe(False, "RESOURCE_PROBE_FAILED", failure_class="INFRA_FAILURE")
     if memory_available < _MIN_AVAILABLE_MEMORY_BYTES:
         return _probe(
@@ -347,6 +351,20 @@ def _probe_resources(lane_dir: Path) -> jobs_lanes.ProbeResult:
             "memory_available_bytes": memory_available,
         },
     )
+
+
+def _linux_mem_available(path: Path) -> int | None:
+    """Read Linux's kernel-reported available memory without optional psutil."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        for line in path.read_text(encoding="ascii").splitlines():
+            key, value, unit = line.split(maxsplit=2)
+            if key == "MemAvailable:" and unit == "kB":
+                return int(value) * 1024
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return None
 
 
 def _probe_git(environment: dict[str, str]) -> jobs_lanes.ProbeResult:

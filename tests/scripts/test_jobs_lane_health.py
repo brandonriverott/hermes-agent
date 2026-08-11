@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import builtins
+import importlib.util
 import json
 import os
 import stat
@@ -19,6 +21,37 @@ from hermes_cli import jobs_lanes, jobs_receipts
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "jobs_lane_health.py"
+
+
+def _health_module():
+    spec = importlib.util.spec_from_file_location("jobs_lane_health_test", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_linux_memory_fallback_keeps_health_check_dependency_free(tmp_path, monkeypatch):
+    module = _health_module()
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal: 99 kB\nMemAvailable: 1048576 kB\n", encoding="utf-8")
+    assert module._linux_mem_available(meminfo) == 1024 * 1024 * 1024
+
+    original_import = builtins.__import__
+
+    def _no_psutil(name, *args, **kwargs):
+        if name == "psutil":
+            raise ImportError("not installed")
+        return original_import(name, *args, **kwargs)
+
+    lane = tmp_path / "lane"
+    lane.mkdir()
+    monkeypatch.setattr(builtins, "__import__", _no_psutil)
+    monkeypatch.setattr(module, "_linux_mem_available", lambda _path: 1024 * 1024 * 1024)
+    result = module._probe_resources(lane)
+    assert result.passed is True
+    assert result.reason_code == "OK"
 
 
 def _provision_test_lane(root: Path, lane_id: str) -> Path:
