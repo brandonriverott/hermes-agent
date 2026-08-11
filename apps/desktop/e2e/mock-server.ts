@@ -38,6 +38,8 @@ verificationWritePath?: string
  * handle's `path` to let the test decide when the process exits.
  */
 backgroundReleasePath?: string
+/** Hold the first real Kanban worker response until releaseHeldStream is called. */
+holdKanbanWorker?: boolean
 }
 
 export interface MockServer {
@@ -119,6 +121,8 @@ let _correctionSwitchIndex = 0
 
 /** Per-server counter for the verify-on-stop script. */
 let _verificationStopIndex = 0
+/** Per-server counter for the real Kanban-worker fleet-monitor script. */
+let _kanbanWorkerIndex = 0
 
 /** User messages received by the mock, for E2E assertions on real submits. */
 const _receivedUserTexts: string[] = []
@@ -131,6 +135,7 @@ function resetScriptIndex(): void {
   _queueStopIndex = 0
   _correctionSwitchIndex = 0
   _verificationStopIndex = 0
+  _kanbanWorkerIndex = 0
   _receivedUserTexts.length = 0
 }
 
@@ -240,6 +245,22 @@ function sidebarCrossScript(releasePath?: string): ScriptedTurn[] {
 }
 
 const SIDEBAR_CROSS_SCRIPT: ScriptedTurn[] = sidebarCrossScript()
+
+function kanbanWorkerScript(): ScriptedTurn[] {
+  return [
+    {
+      text: 'The isolated worker proof is complete.',
+      toolCalls: [{
+        name: 'kanban_complete',
+        args: {
+          summary: 'Completed the real isolated Live Agents worker proof.',
+          metadata: { tests_run: ['desktop live-agents e2e'] },
+        },
+      }],
+    },
+    { text: 'The board handoff is recorded.' },
+  ]
+}
 
 const QUEUE_STOP_SCRIPT: ScriptedTurn[] = [
   {
@@ -420,6 +441,7 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
           const isCorrectionSwitchTrigger = messages.some(
             message => typeof message?.content === 'string' && message.content.includes(CORRECTION_SWITCH_TRIGGER),
           )
+          const isKanbanWorkerTrigger = Boolean(options.holdKanbanWorker && userText.startsWith('work kanban task '))
 
           if (includesBlockingClarifyTrigger(parsed.messages)) {
             if (stream) {
@@ -460,6 +482,29 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
               streamScriptedTurn(res, model, turn)
             } else {
               nonStreamingScriptedTurn(res, model, turn)
+            }
+            return
+          }
+
+          if (isKanbanWorkerTrigger) {
+            const script = kanbanWorkerScript()
+            const turn = script[_kanbanWorkerIndex] ?? script[script.length - 1]
+            const holdThisKanbanWorker = Boolean(options.holdKanbanWorker && _kanbanWorkerIndex === 0)
+            _kanbanWorkerIndex++
+            if (stream) {
+              streamScriptedTurn(res, model, turn, holdThisKanbanWorker ? () => {
+                heldCompletionCount++
+                resolveHeldStreamStarted?.()
+                return heldStreamReleased
+              } : undefined)
+            } else {
+              if (holdThisKanbanWorker) {
+                heldCompletionCount++
+                resolveHeldStreamStarted?.()
+                void heldStreamReleased.then(() => nonStreamingScriptedTurn(res, model, turn))
+              } else {
+                nonStreamingScriptedTurn(res, model, turn)
+              }
             }
             return
           }
@@ -657,6 +702,7 @@ function streamScriptedTurn(
   res: ServerResponse,
   model: string,
   turn: ScriptedTurn,
+  waitForRelease?: () => Promise<void>,
 ): void {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -717,6 +763,10 @@ function streamScriptedTurn(
     const word = i === 0 ? words[i] : ' ' + words[i]
     res.write(sseChunk(model, { content: word }))
     i++
+    if (waitForRelease && i === 1) {
+      waitForRelease().then(() => setTimeout(sendChunk, 20))
+      return
+    }
     setTimeout(sendChunk, 20)
   }
 

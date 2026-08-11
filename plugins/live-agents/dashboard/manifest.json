@@ -1,0 +1,8 @@
+{
+  "name": "live-agents",
+  "label": "Live Agents",
+  "description": "Privacy-safe fleet evidence and scoped controls for Hermes Desktop",
+  "icon": "Activity",
+  "version": "1.0.0",
+  "api": "plugin_api.py"
+}
