@@ -193,6 +193,18 @@ def _contained(path: Path, root: Path) -> bool:
     return resolved == base or base in resolved.parents
 
 
+def _provider_neutral_path(raw: str) -> str:
+    """Remove Claude-specific executable roots from a Codex worker PATH."""
+    parts = [
+        part
+        for part in raw.split(os.pathsep)
+        if part and "claude" not in part.casefold()
+    ]
+    if not parts:
+        raise AdapterError("no provider-neutral PATH is available to the worker")
+    return os.pathsep.join(parts)
+
+
 def _worker_env(
     *,
     codex_home: Path,
@@ -212,6 +224,7 @@ def _worker_env(
     env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
     if "PATH" not in env:
         raise AdapterError("no PATH is available to give the worker")
+    env["PATH"] = _provider_neutral_path(env["PATH"])
     for name, path in zip(_PRIVATE_ENV, private):
         if not _contained(path, root):
             raise AdapterError(

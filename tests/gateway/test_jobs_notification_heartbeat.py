@@ -42,7 +42,7 @@ def base():
     # A large real-ish timestamp so claim_due's next_attempt_at gate is
     # satisfied for rows created with the real clock; all heartbeat
     # assertions are relative offsets from this base.
-    return int(time.time())
+    return int(time.time()) + 60
 
 
 def _origin(**overrides):

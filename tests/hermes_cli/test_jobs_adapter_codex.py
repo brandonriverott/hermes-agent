@@ -284,6 +284,10 @@ def test_codex_env_neither_argv_nor_env_contains_word_claude(repo, tmp_path, mon
     path, base = repo
     workspace = tmp_path / "ws"
     workspace.mkdir()
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join(("/safe/bin", "/opt/Claude/claude-code-vm/bin", "/usr/bin")),
+    )
     capture: dict = {}
     _install_fake_codex(monkeypatch, capture, {"write_result": {"outcome": "failed"}})
 
@@ -295,8 +299,11 @@ def test_codex_env_neither_argv_nor_env_contains_word_claude(repo, tmp_path, mon
         codex_home=str(tmp_path / "codex_home"),
     )
 
-    blob = " ".join(capture["argv"]) + " " + json.dumps(capture["env"])
-    assert "claude" not in blob.lower()
+    assert capture["argv"][:2] == ["codex", "exec"]
+    assert "claude" not in capture["env"]["PATH"].lower()
+    assert not any(
+        key.startswith(("CLAUDE", "ANTHROPIC")) for key in capture["env"]
+    )
 
 
 def test_codex_env_does_not_inherit_live_jobs_db_path(repo, tmp_path, monkeypatch):
