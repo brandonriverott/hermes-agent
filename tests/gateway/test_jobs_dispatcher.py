@@ -71,6 +71,8 @@ def test_dispatch_one_uses_persisted_header_and_production_dependencies(
     assert call["executor_registry"] is None
     assert call["gate"] is None
     assert call["activation_gate"] is None
+    assert call["outcome_gate"] is None
+    assert call["closure_gate"] is None
     assert call["signer"] is None and call["verifier"] is None
 
 
