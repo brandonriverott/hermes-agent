@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import subprocess
+from dataclasses import asdict
 
 from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_lanes
@@ -64,7 +67,7 @@ def test_dispatch_one_uses_persisted_header_and_production_dependencies(
     call = calls[0]
     assert call["repo_path"] == repo
     assert call["base_commit"] == base
-    assert call["branch"] == f"jobs/{job_id}"
+    assert call["branch"] == f"jobs/{job_id}/attempt-0"
     assert call["executor_registry"] is None
     assert call["gate"] is None
     assert call["activation_gate"] is None
@@ -108,3 +111,60 @@ def test_invalid_legacy_job_does_not_block_later_valid_job(tmp_path):
         health_collector=lambda **kwargs: _health(100),
     )
     assert [item["job_id"] for item in seen] == [valid]
+
+
+def test_remote_health_is_policy_bound_and_requires_all_pc_seats(tmp_path):
+    registry = jobs_lanes.load_lane_registry()
+    lanes = []
+    for lane in registry.lanes:
+        if lane.host_id != "pc":
+            continue
+        lanes.append(
+            asdict(
+                jobs_lanes.LaneHealth(
+                    lane_id=lane.id,
+                    state="IDLE",
+                    status="PASS",
+                    failure_class=None,
+                    reason_code="OK",
+                    observed_at=100,
+                    expires_at=220,
+                    executor_version="1.0.0",
+                    available_capacity=1,
+                    safe_detail={},
+                )
+            )
+        )
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "policy_version": registry.policy_version,
+            "policy_digest": jobs_lanes.registry_digest(registry),
+            "observed_at": 100,
+            "lanes": lanes,
+        }
+    ).encode()
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr=b"")
+
+    health = jobs_dispatcher.collect_remote_lane_health(
+        now=100,
+        configuration=(
+            "gpu-pc",
+            Path("/home/brandon/.hermes/releases/hermes-agent-" + "c" * 40),
+            Path("/home/brandon/jobs/lanes"),
+        ),
+        subprocess_run=run,
+    )
+    assert len(health) == 6
+    assert calls[0][:4] == [
+        "ssh",
+        "gpu-pc",
+        "python3",
+        "/home/brandon/.hermes/releases/hermes-agent-"
+        + "c" * 40
+        + "/scripts/jobs_lane_health.py",
+    ]

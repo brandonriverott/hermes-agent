@@ -6,6 +6,8 @@ import asyncio
 import logging
 import os
 import platform
+import json
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +57,75 @@ def collect_local_lane_health(*, lane_root: Path, now: int):
     ]
 
 
+def remote_configuration() -> Optional[tuple[str, Path, Path]]:
+    host = os.environ.get("HERMES_JOBS_PC_HOST", "").strip()
+    runtime = os.environ.get("HERMES_JOBS_PC_RUNTIME_ROOT", "").strip()
+    lanes = os.environ.get("HERMES_JOBS_PC_LANE_ROOT", "").strip()
+    if not (host and runtime and lanes):
+        return None
+    if not Path(runtime).is_absolute() or not Path(lanes).is_absolute():
+        return None
+    return host, Path(runtime), Path(lanes)
+
+
+def collect_remote_lane_health(
+    *,
+    now: int,
+    configuration: tuple[str, Path, Path],
+    subprocess_run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+):
+    """Read the PC's immutable health report over argv-only Tailscale SSH."""
+
+    from hermes_cli import jobs_lanes
+
+    host, runtime, lanes = configuration
+    script = runtime / "scripts" / "jobs_lane_health.py"
+    try:
+        completed = subprocess_run(
+            [
+                "ssh", host, "python3", str(script), "--host", "pc", "--root",
+                str(lanes), "--json",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=45,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode not in {0, 2} or len(completed.stdout) > 128 * 1024:
+        return []
+    try:
+        raw = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    registry = jobs_lanes.load_lane_registry()
+    if (
+        not isinstance(raw, dict)
+        or raw.get("policy_version") != registry.policy_version
+        or raw.get("policy_digest") != jobs_lanes.registry_digest(registry)
+        or not isinstance(raw.get("lanes"), list)
+    ):
+        return []
+    allowed = {lane.id for lane in registry.lanes if lane.host_id == "pc"}
+    health = []
+    try:
+        for item in raw["lanes"]:
+            if not isinstance(item, dict) or item.get("lane_id") not in allowed:
+                return []
+            health.append(jobs_lanes.LaneHealth(**item))
+    except (TypeError, ValueError):
+        return []
+    return health if {item.lane_id for item in health} == allowed else []
+
+
+def collect_fleet_lane_health(*, lane_root: Path, now: int):
+    local = list(collect_local_lane_health(lane_root=lane_root, now=now))
+    remote = remote_configuration()
+    if remote is not None:
+        local.extend(collect_remote_lane_health(now=now, configuration=remote))
+    return local
+
+
 def dispatch_due_job_once(
     *,
     jobs_path=None,
@@ -62,7 +133,7 @@ def dispatch_due_job_once(
     now: Optional[int] = None,
     worker_id: str = "gateway-jobs-dispatcher",
     dispatcher: Optional[Callable[..., dict]] = None,
-    health_collector: Callable[..., Sequence[object]] = collect_local_lane_health,
+    health_collector: Callable[..., Sequence[object]] = collect_fleet_lane_health,
 ) -> Optional[dict]:
     """Dispatch the oldest valid unclaimed Job once, or return ``None``."""
 
@@ -88,12 +159,13 @@ def dispatch_due_job_once(
                 header = jobs_dispatch.parse_legacy_execution_header(job.goal)
             except jobs_dispatch.LegacyMetadataError:
                 continue
+            attempt_index = len(jdb.get_attempts(conn, job.id))
             return dispatch(
                 conn=conn,
                 job_id=job.id,
                 repo_path=Path(header.repo_path),
                 base_commit=header.base_commit,
-                branch=f"jobs/{job.id}",
+                branch=f"jobs/{job.id}/attempt-{attempt_index}",
                 output_parents=(root,),
                 scoped_memory_paths=(),
                 lane_root=root,
@@ -144,6 +216,9 @@ class GatewayJobsDispatcherMixin:
 __all__ = [
     "GatewayJobsDispatcherMixin",
     "collect_local_lane_health",
+    "collect_fleet_lane_health",
+    "collect_remote_lane_health",
     "dispatch_configuration",
     "dispatch_due_job_once",
+    "remote_configuration",
 ]

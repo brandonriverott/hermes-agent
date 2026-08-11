@@ -167,7 +167,7 @@ def production_registry() -> ExecutorRegistry:
             ),
         }
     )
-    phase_runner = jobs_reliability.LocalProviderPhaseRunner()
+    phase_runner = jobs_reliability.production_phase_runner_from_environment()
     return installed.with_reliability_adapters(
         {
             name: jobs_reliability.ProductionReliabilityAdapter(

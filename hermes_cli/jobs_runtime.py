@@ -174,7 +174,10 @@ def load_lane_crypto(lane_root: Path):
 
 
 def production_preflight_probes(
-    *, lane_root: Path, lane_health: jobs_lanes.LaneHealth
+    *,
+    lane_root: Path,
+    lane_health: jobs_lanes.LaneHealth,
+    remote_repository_ok: Optional[bool] = None,
 ) -> jobs_harness.PreflightProbes:
     """Concrete, bounded checks run immediately before custody is acquired."""
 
@@ -189,7 +192,12 @@ def production_preflight_probes(
 
     def file_paths(value):
         repository, outputs = value
-        okay = Path(repository).is_dir() and all(Path(path).is_dir() for path in outputs)
+        repository_ok = (
+            remote_repository_ok
+            if remote_repository_ok is not None
+            else Path(repository).is_dir()
+        )
+        okay = repository_ok and all(Path(path).is_dir() for path in outputs)
         return result(okay, "FILE_PATHS_INVALID", repository=str(repository))
 
     def permissions(_value):
@@ -205,6 +213,13 @@ def production_preflight_probes(
 
     def worktree(value):
         repository, base, branch = value
+        if remote_repository_ok is not None:
+            return result(
+                remote_repository_ok,
+                "WORKTREE_PRECONDITION_FAILED",
+                branch=str(branch),
+                base_commit=str(base),
+            )
         checked = subprocess.run(
             ["git", "-C", str(repository), "cat-file", "-e", f"{base}^{{commit}}"],
             check=False,
@@ -341,8 +356,21 @@ def dispatch_job_once(
     if signer is None or verifier is None:
         signer, verifier = load_lane_crypto(selected_root)
     if probes is None:
+        remote_repository_ok = None
+        if "-pc-" in decision.lane_id:
+            from hermes_cli import jobs_reliability
+
+            remote_repository_ok = jobs_reliability.production_remote_preflight(
+                provider=identity.executor,
+                repository=Path(repo_path),
+                base_commit=base_commit,
+                branch=branch,
+                lane_id=decision.lane_id,
+            )
         probes = production_preflight_probes(
-            lane_root=selected_root, lane_health=selected_health
+            lane_root=selected_root,
+            lane_health=selected_health,
+            remote_repository_ok=remote_repository_ok,
         )
     if executor_registry is None:
         executor_registry = jobs_executors.production_registry()

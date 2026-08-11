@@ -91,6 +91,7 @@ RELEASE_FILES: tuple[str, ...] = (
     "scripts/jobs_evidence_gate.py",
     "scripts/jobs_lane_health.py",
     "scripts/jobs_provision_lanes.py",
+    "scripts/jobs_remote_worker.py",
 )
 
 

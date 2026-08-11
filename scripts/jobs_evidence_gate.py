@@ -571,9 +571,13 @@ def verify_bridge_settlement(job_dir, *, job: str, base: str) -> dict:
             "EVIDENCE_MALFORMED",
         )
     branch = _require_nonempty_string(done, "branch", "done.json")
-    if branch != f"jobs/{job}":
+    expected_branches = {
+        f"jobs/{job}",
+        f"jobs/{job}/attempt-{attempt}",
+    }
+    if branch not in expected_branches:
         raise EvidenceError(
-            f"done.json names branch {branch!r}, but this settlement owns branch {'jobs/' + job!r}.",
+            f"done.json names branch {branch!r}, but this settlement owns the Job's attempt branch.",
             "EVIDENCE_WRONG_JOB",
         )
     build_exit = done.get("claude_exit")

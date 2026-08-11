@@ -55,7 +55,7 @@ def _context(tmp_path: Path, provider: str) -> dispatch.DispatchContext:
         ordinal=1,
         repository=repo,
         base_commit=base,
-        branch="jobs/j_test",
+        branch="jobs/j_test/attempt-0",
         worktree=lane_root / "worktrees" / "j_test-1",
         lane_root=lane_root,
         requested_lane=identity.requested_lane,
@@ -276,3 +276,101 @@ def test_runtime_production_preflight_refuses_non_idle_health(tmp_path):
     )
     result = probes.auth_check("codex-mac-1")
     assert (result.status, result.code) == ("BLOCKED", "AUTH_REQUIRED")
+
+
+def test_ssh_runner_uses_exact_remote_runtime_and_preserves_provider(tmp_path):
+    context = replace(_context(tmp_path, "codex"), lane_id="codex-pc-1")
+    calls = []
+    response = jobs_reliability.PhaseResult(
+        status="succeeded",
+        commit="c" * 40,
+        tests=({"cmd": "focused", "result": "pass", "evidence": "1 passed"},),
+        review={"verdict": "PASS", "findings": [], "checks_run": ["diff"]},
+        executor_exit_digest="sha256:" + "3" * 64,
+        output_capture_digest="sha256:" + "4" * 64,
+    )
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {
+                    **response.__dict__,
+                    "tests": list(response.tests),
+                }
+            ).encode(),
+            stderr=b"",
+        )
+
+    runner = jobs_reliability.SSHProviderPhaseRunner(
+        host="gpu-pc",
+        runtime_root=Path("/home/brandon/.hermes/releases/hermes-agent-" + "d" * 40),
+        lane_root=Path("/home/brandon/jobs/lanes"),
+        subprocess_run=run,
+    )
+    result = runner("codex", context)
+
+    assert result.status == "succeeded"
+    argv, kwargs = calls[0]
+    assert argv == [
+        "ssh",
+        "gpu-pc",
+        "python3",
+        "/home/brandon/.hermes/releases/hermes-agent-"
+        + "d" * 40
+        + "/scripts/jobs_remote_worker.py",
+        "execute",
+    ]
+    payload = json.loads(kwargs["input"])
+    assert payload["provider"] == "codex"
+    assert payload["context"]["lane_root"] == "/home/brandon/jobs/lanes/codex-pc-1"
+    assert payload["context"]["worktree"].startswith(
+        "/home/brandon/jobs/lanes/codex-pc-1/worktrees/"
+    )
+    assert "claude" not in argv
+
+
+def test_fleet_transport_does_not_cross_provider_or_host(tmp_path, monkeypatch):
+    local_calls = []
+    remote_calls = []
+    local = lambda provider, context: local_calls.append((provider, context)) or "local"
+    remote = lambda provider, context: remote_calls.append((provider, context)) or "remote"
+    fleet = jobs_reliability.FleetProviderPhaseRunner(local=local, remote_pc=remote)
+    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
+    (tmp_path / "mac").mkdir()
+    (tmp_path / "pc").mkdir()
+    mac = _context(tmp_path / "mac", "codex")
+    pc = replace(_context(tmp_path / "pc", "claude"), lane_id="claude-pc-1")
+    assert fleet("codex", mac) == "local"
+    assert fleet("claude", pc) == "remote"
+    assert [call[0] for call in local_calls] == ["codex"]
+    assert [call[0] for call in remote_calls] == ["claude"]
+
+
+def test_ssh_preflight_is_read_only_and_exact(tmp_path):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout=b'{"ok":true}', stderr=b"")
+
+    runner = jobs_reliability.SSHProviderPhaseRunner(
+        host="gpu-pc",
+        runtime_root=Path("/home/brandon/.hermes/releases/hermes-agent-" + "e" * 40),
+        lane_root=Path("/home/brandon/jobs/lanes"),
+        subprocess_run=run,
+    )
+    assert runner.preflight(
+        provider="codex",
+        repository=Path("/home/brandon/code/hermes-agent"),
+        base_commit="f" * 40,
+        branch="jobs/j_test",
+        lane_id="codex-pc-1",
+    )
+    argv, kwargs = calls[0]
+    assert argv[-1] == "preflight"
+    payload = json.loads(kwargs["input"])
+    assert payload["provider"] == "codex"
+    assert payload["lane_root"] == "/home/brandon/jobs/lanes/codex-pc-1"

@@ -379,6 +379,210 @@ class LocalProviderPhaseRunner:
         )
 
 
+_SSH_HOST_RE = re.compile(r"\A[A-Za-z0-9_.:@-]{1,255}\Z")
+
+
+class SSHProviderPhaseRunner:
+    """Execute one provider pipeline in the immutable runtime on the PC."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        runtime_root: Path,
+        lane_root: Path,
+        ssh_binary: str = "ssh",
+        subprocess_run: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    ):
+        if _SSH_HOST_RE.fullmatch(host) is None:
+            raise ValueError("remote Jobs host is invalid")
+        for value, label in ((runtime_root, "runtime"), (lane_root, "lane")):
+            if not Path(value).is_absolute():
+                raise ValueError(f"remote {label} root must be absolute")
+        self.host = host
+        self.runtime_root = Path(runtime_root)
+        self.lane_root = Path(lane_root)
+        self.ssh_binary = ssh_binary
+        self._subprocess_run = subprocess_run
+
+    def preflight(
+        self,
+        *,
+        provider: str,
+        repository: Path,
+        base_commit: str,
+        branch: str,
+        lane_id: str,
+    ) -> bool:
+        payload = {
+            "schema_version": 1,
+            "provider": provider,
+            "repository": str(repository),
+            "base_commit": base_commit,
+            "branch": branch,
+            "lane_root": str(self.lane_root / lane_id),
+            "lane_id": lane_id,
+        }
+        script = self.runtime_root / "scripts" / "jobs_remote_worker.py"
+        try:
+            completed = self._subprocess_run(
+                [self.ssh_binary, self.host, "python3", str(script), "preflight"],
+                input=json.dumps(payload, sort_keys=True).encode("utf-8"),
+                capture_output=True,
+                check=False,
+                timeout=45,
+            )
+            return completed.returncode == 0 and completed.stdout == b'{"ok":true}'
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def __call__(self, provider: str, context: object) -> PhaseResult:
+        remote_lane = self.lane_root / str(getattr(context, "lane_id"))
+        payload = {
+            "schema_version": 1,
+            "provider": provider,
+            "context": {
+                "job_id": str(getattr(context, "job_id")),
+                "job_number": int(getattr(context, "job_number")),
+                "job_name": str(getattr(context, "job_name")),
+                "goal": str(getattr(context, "goal")),
+                "attempt_id": str(getattr(context, "attempt_id")),
+                "ordinal": int(getattr(context, "ordinal")),
+                "repository": str(getattr(context, "repository")),
+                "base_commit": str(getattr(context, "base_commit")),
+                "branch": str(getattr(context, "branch")),
+                "worktree": str(
+                    remote_lane
+                    / "worktrees"
+                    / f"{getattr(context, 'job_id')}-{getattr(context, 'ordinal')}"
+                ),
+                "lane_root": str(remote_lane),
+                "requested_lane": str(getattr(context, "requested_lane")),
+                "lane_id": str(getattr(context, "lane_id")),
+                "executor": str(getattr(context, "executor")),
+                "specialist": str(getattr(context, "specialist")),
+                "model": str(getattr(context, "model")),
+                "effort": str(getattr(context, "effort")),
+                "max_turns": int(getattr(context, "max_turns")),
+            },
+        }
+        script = self.runtime_root / "scripts" / "jobs_remote_worker.py"
+        try:
+            completed = self._subprocess_run(
+                [self.ssh_binary, self.host, "python3", str(script), "execute"],
+                input=json.dumps(payload, sort_keys=True).encode("utf-8"),
+                capture_output=True,
+                check=False,
+                timeout=max(300, int(getattr(context, "max_turns", 120)) * 60),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise jobs_execution.AdapterError(
+                "remote provider transport is unavailable"
+            ) from exc
+        if completed.returncode != 0 or len(completed.stdout) > _MAX_PHASE_BYTES:
+            raise jobs_execution.AdapterError("remote provider execution failed")
+        try:
+            raw = json.loads(completed.stdout.decode("utf-8"))
+            if not isinstance(raw, dict) or set(raw) != {
+                "status",
+                "commit",
+                "tests",
+                "review",
+                "executor_exit_digest",
+                "output_capture_digest",
+                "failure_reason_code",
+                "http_status",
+                "safety_gate",
+            }:
+                raise ValueError("shape")
+            return PhaseResult(
+                status=str(raw["status"]),
+                commit=raw["commit"] if isinstance(raw["commit"], str) else None,
+                tests=tuple(
+                    dict(item) for item in raw["tests"] if isinstance(item, dict)
+                ),
+                review=dict(raw["review"]) if isinstance(raw["review"], dict) else {},
+                executor_exit_digest=str(raw["executor_exit_digest"]),
+                output_capture_digest=str(raw["output_capture_digest"]),
+                failure_reason_code=(
+                    raw["failure_reason_code"]
+                    if isinstance(raw["failure_reason_code"], str)
+                    else None
+                ),
+                http_status=(
+                    raw["http_status"] if isinstance(raw["http_status"], int) else None
+                ),
+                safety_gate=raw["safety_gate"] is True,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise jobs_execution.AdapterError(
+                "remote provider result is malformed"
+            ) from exc
+
+
+class FleetProviderPhaseRunner:
+    """Select physical transport only; never select or substitute a provider."""
+
+    def __init__(self, *, local: PhaseRunner, remote_pc: Optional[PhaseRunner]):
+        self.local = local
+        self.remote_pc = remote_pc
+
+    def __call__(self, provider: str, context: object) -> PhaseResult:
+        lane_id = str(getattr(context, "lane_id", ""))
+        system = platform.system().lower()
+        local_host = "mac" if system == "darwin" else "pc"
+        if f"-{local_host}-" in lane_id:
+            return self.local(provider, context)
+        if "-pc-" in lane_id and self.remote_pc is not None:
+            return self.remote_pc(provider, context)
+        raise jobs_execution.AdapterError(
+            "selected physical lane has no installed transport"
+        )
+
+
+def _remote_runner_from_environment() -> Optional[SSHProviderPhaseRunner]:
+    host = os.environ.get("HERMES_JOBS_PC_HOST", "").strip()
+    runtime = os.environ.get("HERMES_JOBS_PC_RUNTIME_ROOT", "").strip()
+    lanes = os.environ.get("HERMES_JOBS_PC_LANE_ROOT", "").strip()
+    if not (host and runtime and lanes):
+        return None
+    try:
+        return SSHProviderPhaseRunner(
+            host=host, runtime_root=Path(runtime), lane_root=Path(lanes)
+        )
+    except ValueError:
+        return None
+
+
+def production_phase_runner_from_environment() -> FleetProviderPhaseRunner:
+    """Build the exact local/PC transport registry from explicit activation env."""
+
+    return FleetProviderPhaseRunner(
+        local=LocalProviderPhaseRunner(),
+        remote_pc=_remote_runner_from_environment(),
+    )
+
+
+def production_remote_preflight(
+    *,
+    provider: str,
+    repository: Path,
+    base_commit: str,
+    branch: str,
+    lane_id: str,
+) -> bool:
+    runner = _remote_runner_from_environment()
+    if runner is None:
+        return False
+    return runner.preflight(
+        provider=provider,
+        repository=repository,
+        base_commit=base_commit,
+        branch=branch,
+        lane_id=lane_id,
+    )
+
+
 def _write_json(path: Path, value: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     body = json.dumps(
@@ -398,9 +602,10 @@ def _write_json(path: Path, value: Mapping[str, object]) -> None:
 
 
 def _gate_envelope(context: object, *, kind: str, commit: str) -> dict[str, object]:
+    review_attempt = max(0, int(getattr(context, "ordinal")) - 1)
     return {
         "job": str(getattr(context, "job_id")),
-        "attempt": 0,
+        "attempt": review_attempt,
         "commit": commit,
         "base": str(getattr(context, "base_commit")),
         "kind": kind,
@@ -475,7 +680,8 @@ class ProductionReliabilityAdapter:
             "output_capture_digest": result.output_capture_digest,
         }
         tests_path = evidence_dir / "tests.json"
-        review_path = evidence_dir / "review-0.json"
+        review_attempt = max(0, int(getattr(context, "ordinal")) - 1)
+        review_path = evidence_dir / f"review-{review_attempt}.json"
         output_path = evidence_dir / "output.json"
         _write_json(tests_path, tests_doc)
         _write_json(review_path, review_doc)
@@ -492,12 +698,6 @@ class ProductionReliabilityAdapter:
             executor_exit_digest=result.executor_exit_digest,
             output_capture_digest=result.output_capture_digest,
         )
-
-
-def unavailable_phase_runner(_provider: str, _context: object) -> PhaseResult:
-    """Fail closed until the concrete subprocess phase runner is installed."""
-
-    raise jobs_execution.AdapterError("production provider runner is unavailable")
 
 
 def production_gate(context: object, execution: jobs_execution.ReliabilityExecution):
@@ -518,8 +718,8 @@ def production_gate(context: object, execution: jobs_execution.ReliabilityExecut
         branch=str(getattr(context, "branch")),
         base=str(getattr(context, "base_commit")),
         commit=execution.commit,
-        attempt=0,
-        rounds=1,
+        attempt=max(0, int(getattr(context, "ordinal")) - 1),
+        rounds=int(getattr(context, "ordinal")),
         build_exit=0,
         effort=str(getattr(context, "effort", "max")),
     )
@@ -529,7 +729,9 @@ def production_gate(context: object, execution: jobs_execution.ReliabilityExecut
         base=str(getattr(context, "base_commit")),
     )
     return jobs_run.adapt_gate_settlement(
-        normalized, job_dir=evidence_dir, review_attempt=0
+        normalized,
+        job_dir=evidence_dir,
+        review_attempt=max(0, int(getattr(context, "ordinal")) - 1),
     )
 
 
@@ -569,9 +771,13 @@ def production_completion_gate(context: object, gate: object):
 
 __all__ = [
     "LocalProviderPhaseRunner",
+    "FleetProviderPhaseRunner",
     "PhaseResult",
     "ProcessResult",
     "ProductionReliabilityAdapter",
+    "SSHProviderPhaseRunner",
+    "production_phase_runner_from_environment",
+    "production_remote_preflight",
     "production_completion_gate",
     "production_gate",
 ]
