@@ -231,6 +231,14 @@ def test_local_phase_runner_uses_two_fresh_same_provider_sessions(
     if provider == "codex":
         assert "workspace-write" in calls[0]
         assert "read-only" in calls[1]
+        for call in calls:
+            allowed_git_metadata = [
+                call[index + 1]
+                for index, item in enumerate(call)
+                if item == "--add-dir"
+            ]
+            assert len(allowed_git_metadata) == 2
+            assert all(Path(path).is_dir() for path in allowed_git_metadata)
     else:
         assert "acceptEdits" in calls[0]
         assert "plan" in calls[1]

@@ -177,6 +177,26 @@ def _phase_env(provider: str, lane_root: Path, handoff: Path) -> dict[str, str]:
     return env
 
 
+def _codex_git_metadata_dirs(worktree: Path) -> tuple[Path, ...]:
+    """Return only this isolated worktree's Git metadata write locations.
+
+    Codex's workspace sandbox permits the checkout itself, but Git stores the
+    worktree index and branch ref outside it.  Granting these two resolved
+    metadata directories lets the worker commit its own branch without giving
+    it write access to arbitrary source paths or another lane's workspace.
+    """
+    locations: list[Path] = []
+    for command in ("--git-dir", "--git-common-dir"):
+        raw = Path(_git(worktree, "rev-parse", command))
+        location = raw if raw.is_absolute() else (worktree / raw)
+        location = location.resolve()
+        if not location.is_dir():
+            raise jobs_execution.AdapterError("selected worktree Git metadata is unavailable")
+        if location not in locations:
+            locations.append(location)
+    return tuple(locations)
+
+
 def _provider_command(
     provider: str,
     *,
@@ -186,7 +206,7 @@ def _provider_command(
 ) -> list[str]:
     schema = _BUILD_SCHEMA if phase == "build" else _REVIEW_SCHEMA
     if provider == "codex":
-        return [
+        command = [
             "codex",
             "exec",
             "--model",
@@ -201,8 +221,10 @@ def _provider_command(
             str(schema),
             "--output-last-message",
             str(result_path),
-            "-",
         ]
+        for metadata_dir in _codex_git_metadata_dirs(Path(getattr(context, "worktree"))):
+            command.extend(["--add-dir", str(metadata_dir)])
+        return [*command, "-"]
     return [
         "claude",
         "-p",
