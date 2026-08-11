@@ -89,6 +89,7 @@ RELEASE_FILES: tuple[str, ...] = (
     "scripts/jobs-release-rollback.py",
     "scripts/jobs-runtime-parity.py",
     "scripts/jobs_evidence_gate.py",
+    "scripts/jobs-gateway-runtime-pointer.py",
     "scripts/jobs_lane_health.py",
     "scripts/jobs_provision_lanes.py",
     "scripts/jobs_remote_worker.py",
