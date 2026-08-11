@@ -217,6 +217,8 @@ class DispatchSpec:
     model: str
     worktree_parent: Optional[Path] = None
     lane_root: Optional[Path] = None
+    effort: str = "max"
+    max_turns: int = 120
 
 
 @dataclass(frozen=True)
@@ -236,6 +238,11 @@ class DispatchContext:
     executor: str
     specialist: str
     model: str
+    job_name: str = "Job"
+    goal: str = "unspecified"
+    lane_root: Optional[Path] = None
+    effort: str = "max"
+    max_turns: int = 120
 
 
 @dataclass(frozen=True)
@@ -659,6 +666,11 @@ def dispatch_once(
         executor=identity.executor,
         specialist=identity.specialist,
         model=identity.model,
+        job_name=job.name,
+        goal=job.goal,
+        lane_root=None if spec.lane_root is None else Path(spec.lane_root),
+        effort=spec.effort,
+        max_turns=spec.max_turns,
     )
     sequence = 0
 

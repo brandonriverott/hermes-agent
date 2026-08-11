@@ -10,6 +10,11 @@ provider-free :func:`hermes_cli.jobs_dispatch.dispatch_once`.
 from __future__ import annotations
 
 from pathlib import Path
+import base64
+import json
+import shutil
+import subprocess
+from cryptography.hazmat.primitives import serialization
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from hermes_cli import jobs_db as jdb
@@ -17,6 +22,9 @@ from hermes_cli import jobs_dispatch as dispatch
 from hermes_cli import jobs_executors
 from hermes_cli import jobs_identity as ji
 from hermes_cli import jobs_lanes
+from hermes_cli import jobs_graph
+from hermes_cli import jobs_harness
+from hermes_cli import jobs_receipts
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +104,10 @@ def _build_spec(
     scoped_memory_paths: Sequence[Path],
     lane_root: Path,
 ) -> dispatch.DispatchSpec:
+    try:
+        header = dispatch.parse_legacy_execution_header(job.goal)
+    except dispatch.LegacyMetadataError:
+        header = None
     lane_root_path = Path(lane_root)
     lane_root_path.mkdir(parents=True, exist_ok=True)
     for name in ("auth", "worktrees", "handoffs", "receipts", "health"):
@@ -114,6 +126,137 @@ def _build_spec(
         model=identity.model,
         worktree_parent=worktree_parent,
         lane_root=lane_root_path,
+        effort=(
+            header.effort
+            if header is not None
+            else ("high" if identity.executor == "codex" else "max")
+        ),
+        max_turns=120 if header is None else header.max_turns,
+    )
+
+
+def _selected_lane_root(base: Path, lane_id: str) -> Path:
+    """Resolve an explicit lane root, preserving the Task 5 test seam."""
+
+    root = Path(base)
+    child = root / lane_id
+    return child if child.is_dir() and not child.is_symlink() else root
+
+
+def load_lane_crypto(lane_root: Path):
+    """Load the selected lane's private signer and matching public verifier."""
+
+    root = Path(lane_root)
+    try:
+        config = json.loads((root / "lane-config.json").read_text(encoding="utf-8"))
+        key_id = config["key_id"]
+        configured_public = base64.b64decode(
+            str(config["public_key"]).removeprefix("base64:"), validate=True
+        )
+        private_key = jobs_receipts.load_private_key(
+            root / "auth" / "receipt-signing-key.pem"
+        )
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("selected lane signing identity is unavailable") from exc
+    if not isinstance(key_id, str) or not key_id.startswith("lane:"):
+        raise ValueError("selected lane signing identity is invalid")
+    observed_public = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    if configured_public != observed_public:
+        raise ValueError("selected lane signing identity is inconsistent")
+    signer = jobs_harness.ReceiptSigner(key_id, private_key)
+    verifier = jobs_graph.ReceiptVerifier(
+        trusted_keys={key_id: private_key.public_key()}
+    )
+    return signer, verifier
+
+
+def production_preflight_probes(
+    *, lane_root: Path, lane_health: jobs_lanes.LaneHealth
+) -> jobs_harness.PreflightProbes:
+    """Concrete, bounded checks run immediately before custody is acquired."""
+
+    root = Path(lane_root)
+
+    def result(passed: bool, code: str, **detail):
+        return jobs_harness.ProbeResult(
+            "PASS" if passed else "BLOCKED",
+            "OK" if passed else code,
+            detail if passed else {},
+        )
+
+    def file_paths(value):
+        repository, outputs = value
+        okay = Path(repository).is_dir() and all(Path(path).is_dir() for path in outputs)
+        return result(okay, "FILE_PATHS_INVALID", repository=str(repository))
+
+    def permissions(_value):
+        required = tuple(root / name for name in ("auth", "worktrees", "handoffs", "receipts", "health"))
+        okay = root.is_dir() and not root.is_symlink() and all(
+            path.is_dir() and not path.is_symlink() for path in required
+        )
+        return result(okay, "LANE_PERMISSIONS_INVALID", path=str(root))
+
+    def memory_store(paths):
+        okay = all(Path(path).is_file() for path in paths)
+        return result(okay, "MEMORY_SCOPE_INVALID", paths=[str(path) for path in paths])
+
+    def worktree(value):
+        repository, base, branch = value
+        checked = subprocess.run(
+            ["git", "-C", str(repository), "cat-file", "-e", f"{base}^{{commit}}"],
+            check=False,
+            capture_output=True,
+            timeout=120,
+        )
+        branch_check = subprocess.run(
+            ["git", "-C", str(repository), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            check=False,
+            capture_output=True,
+            timeout=120,
+        )
+        return result(
+            checked.returncode == 0 and branch_check.returncode != 0,
+            "WORKTREE_PRECONDITION_FAILED",
+            branch=str(branch),
+            base_commit=str(base),
+        )
+
+    def tool_routing(value):
+        lane_id, executor, model = value
+        okay = (
+            lane_id == lane_health.lane_id
+            and lane_health.status == "PASS"
+            and lane_health.state == "IDLE"
+            and lane_id.startswith(str(executor) + "-")
+            and bool(model)
+        )
+        return result(okay, "TOOL_ROUTING_INVALID", lane_id=str(lane_id), executor=str(executor), model=str(model))
+
+    def auth_check(_value):
+        return result(
+            lane_health.status == "PASS" and lane_health.state == "IDLE",
+            "AUTH_REQUIRED",
+            authenticated=True,
+        )
+
+    def resource_budget(_value):
+        try:
+            free = shutil.disk_usage(root).free
+        except OSError:
+            free = 0
+        return result(free >= 1024 * 1024 * 1024, "DISK_BUDGET_LOW", free_bytes=free, required_bytes=1024 * 1024 * 1024)
+
+    return jobs_harness.PreflightProbes(
+        file_paths=file_paths,
+        permissions=permissions,
+        memory_store=memory_store,
+        worktree=worktree,
+        tool_routing=tool_routing,
+        auth_check=auth_check,
+        resource_budget=resource_budget,
     )
 
 
@@ -134,9 +277,9 @@ def dispatch_job_once(
     signer: Any,
     verifier: Any,
     worker_id: str,
-    executor_registry: jobs_executors.ExecutorRegistry,
-    gate: Callable[..., Any],
-    activation_gate: Callable[..., Any],
+    executor_registry: Optional[jobs_executors.ExecutorRegistry],
+    gate: Optional[Callable[..., Any]],
+    activation_gate: Optional[Callable[..., Any]],
     observed_at: str,
     now: int,
     lane_health: Sequence[jobs_lanes.LaneHealth],
@@ -189,6 +332,28 @@ def dispatch_job_once(
     if decision.lane_id is None:
         raise ValueError("selected lane decision has no lane_id")
 
+    selected_root = _selected_lane_root(Path(lane_root), decision.lane_id)
+    selected_health = next(
+        (item for item in health if item.lane_id == decision.lane_id), None
+    )
+    if selected_health is None:
+        raise ValueError("selected lane has no durable health evidence")
+    if signer is None or verifier is None:
+        signer, verifier = load_lane_crypto(selected_root)
+    if probes is None:
+        probes = production_preflight_probes(
+            lane_root=selected_root, lane_health=selected_health
+        )
+    if executor_registry is None:
+        executor_registry = jobs_executors.production_registry()
+    if gate is None or activation_gate is None:
+        from hermes_cli import jobs_reliability
+
+        gate = gate or jobs_reliability.production_gate
+        activation_gate = (
+            activation_gate or jobs_reliability.production_completion_gate
+        )
+
     # 7. Build the immutable spec and dispatch via the provider-true seam.
     spec = _build_spec(
         job=job,
@@ -199,7 +364,7 @@ def dispatch_job_once(
         branch=branch,
         output_parents=output_parents,
         scoped_memory_paths=scoped_memory_paths,
-        lane_root=lane_root,
+        lane_root=selected_root,
     )
     result = dispatch.dispatch_once(
         conn=conn,

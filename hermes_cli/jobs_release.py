@@ -52,9 +52,12 @@ LIVE_PROFILES = frozenset({"mac", "pc"})
 # Deliberately not a glob: an immutable release must be reproducible and
 # reviewable, and broad recursive targets are forbidden.
 RELEASE_FILES: tuple[str, ...] = (
+    "gateway/jobs_dispatcher.py",
     "gateway/jobs_notifications.py",
     "gateway/run.py",
     "hermes_cli/data/jobs-codex-result.v1.schema.json",
+    "hermes_cli/data/jobs-build-result.v1.schema.json",
+    "hermes_cli/data/jobs-review-result.v1.schema.json",
     "hermes_cli/data/jobs-lanes.v1.json",
     "hermes_cli/jobs.py",
     "hermes_cli/jobs_adapter_claude.py",
@@ -73,6 +76,7 @@ RELEASE_FILES: tuple[str, ...] = (
     "hermes_cli/jobs_model_policy.py",
     "hermes_cli/jobs_notifications.py",
     "hermes_cli/jobs_receipts.py",
+    "hermes_cli/jobs_reliability.py",
     "hermes_cli/jobs_release.py",
     "hermes_cli/jobs_run.py",
     "hermes_cli/jobs_runtime.py",

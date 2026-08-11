@@ -149,8 +149,9 @@ def production_registry() -> ExecutorRegistry:
 
     from hermes_cli import jobs_adapter_claude as claude
     from hermes_cli import jobs_adapter_codex as codex
+    from hermes_cli import jobs_reliability
 
-    return registry.with_legacy_adapters(
+    installed = registry.with_legacy_adapters(
         {
             ji.CLAUDE_EXECUTOR: LegacyExecutorAdapter(
                 name=ji.CLAUDE_EXECUTOR,
@@ -164,5 +165,14 @@ def production_registry() -> ExecutorRegistry:
                 preflight_skills=codex.preflight_skills,
                 run_attempt=codex.run_codex_attempt,
             ),
+        }
+    )
+    phase_runner = jobs_reliability.LocalProviderPhaseRunner()
+    return installed.with_reliability_adapters(
+        {
+            name: jobs_reliability.ProductionReliabilityAdapter(
+                name, phase_runner=phase_runner
+            )
+            for name in ji.REQUESTED_LANES
         }
     )

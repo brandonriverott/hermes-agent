@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Jobs builder and test result (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome", "tests"],
+  "properties": {
+    "outcome": {"type": "string", "enum": ["succeeded", "failed"]},
+    "failure_class": {
+      "type": ["string", "null"],
+      "enum": [null, "implementation", "infrastructure", "timeout", "safety", "cancelled"]
+    },
+    "reason": {"type": ["string", "null"], "maxLength": 512},
+    "tests": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cmd", "result", "evidence"],
+        "properties": {
+          "cmd": {"type": "string", "minLength": 1, "maxLength": 512},
+          "result": {"type": "string", "enum": ["pass", "fail", "flaky"]},
+          "evidence": {"type": "string", "minLength": 1, "maxLength": 1024},
+          "classification": {
+            "type": "string",
+            "enum": ["candidate_regression", "pre_existing", "infrastructure", "prerequisite_unavailable"]
+          },
+          "note": {"type": "string", "maxLength": 1024}
+        }
+      }
+    }
+  }
+}
