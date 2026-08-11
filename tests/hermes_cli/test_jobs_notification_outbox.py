@@ -426,3 +426,19 @@ def test_pending_rows_claim_retry_acknowledge_in_order_per_job(conn, tmp_path, s
         ]
     finally:
         other.close()
+
+
+def test_unavailable_older_job_does_not_starve_a_new_job_notification(conn):
+    """Delivery order is strict within a Job, never a global backlog lock."""
+    import time
+
+    now = int(time.time())
+    older = _queued_job(conn)
+    newer = _queued_job(conn)
+    older_row = jn.list_notifications(conn, job_id=older)[0]
+    newer_row = jn.list_notifications(conn, job_id=newer)[0]
+
+    claimed = jn.claim_due(conn, owner="notifier", now=now + 1)
+
+    assert claimed.notification_id == newer_row.notification_id
+    assert claimed.notification_id != older_row.notification_id

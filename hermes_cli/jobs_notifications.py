@@ -216,13 +216,15 @@ def claim_due(
     now: int,
     lease_seconds: int = 60,
 ) -> Optional[NotificationRecord]:
-    """Claim the earliest due pending row, respecting per-Job order.
+    """Claim the newest eligible pending row, respecting per-Job order.
 
     A row is claimable when its next attempt time has arrived, it is not
     delivered, and no earlier undelivered row exists for the same Job — a
-    later milestone can never overtake an earlier undelivered one.  The
-    selection and the compare-and-set update run in one IMMEDIATE transaction,
-    so two workers cannot claim the same row.
+    later milestone can never overtake an earlier undelivered one.  Across
+    separate Jobs, newest-first prevents a stale unavailable origin from
+    starving a newly-created chat update. The selection and compare-and-set
+    update run in one IMMEDIATE transaction, so two workers cannot claim the
+    same row.
     """
     if not owner:
         raise ValueError("claim owner must not be empty")
@@ -243,7 +245,7 @@ def claim_due(
             "  AND earlier.id < n.id "
             "  AND earlier.delivered_at IS NULL"
             ") "
-            "ORDER BY n.id ASC LIMIT 1",
+            "ORDER BY n.id DESC LIMIT 1",
             (now, now),
         ).fetchone()
         if row is None:
