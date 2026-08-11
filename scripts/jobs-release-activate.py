@@ -39,9 +39,12 @@ def _write_receipt(receipt: dict, receipt_dir: Path) -> Path:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-root", required=True, type=Path,
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--source-root", type=Path,
                         help="clean git source tree to bundle")
-    parser.add_argument("--output-root", required=True, type=Path,
+    source.add_argument("--bundle", type=Path,
+                        help="already-verified immutable bundle from another host")
+    parser.add_argument("--output-root", type=Path,
                         help="where releases and activation receipts are written")
     parser.add_argument("--root", type=Path,
                         help="Mac target root (simulated in tests)")
@@ -64,8 +67,18 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        bundle_dir, manifest = jobs_release.build_bundle(args.source_root, args.output_root)
-        jobs_release.verify_bundle(bundle_dir)
+        if args.bundle is not None:
+            bundle_dir = args.bundle.resolve()
+            manifest = jobs_release.verify_bundle(bundle_dir)
+        else:
+            if args.output_root is None:
+                raise jobs_release.ReleaseRefused(
+                    "source bundle build requires --output-root"
+                )
+            bundle_dir, manifest = jobs_release.build_bundle(
+                args.source_root, args.output_root
+            )
+            jobs_release.verify_bundle(bundle_dir)
 
         if args.live_profile:
             if args.root is not None or args.pc_root is not None:
@@ -145,7 +158,11 @@ def main(argv=None) -> int:
         jobs_release.refuse_live_root(args.root)
         if args.pc_root is not None:
             jobs_release.refuse_live_root(args.pc_root)
-        receipt_dir = args.receipt_out or (args.output_root / jobs_release.RECEIPT_SUBDIR)
+        receipt_dir = args.receipt_out or (
+            args.output_root / jobs_release.RECEIPT_SUBDIR
+            if args.output_root is not None
+            else bundle_dir.parent / jobs_release.RECEIPT_SUBDIR
+        )
         mode = "apply" if args.apply else "dry-run"
 
         mac_receipt = jobs_release.install_release(

@@ -125,6 +125,31 @@ def test_activate_apply_installs_and_backs_up_mac_and_pc(tmp_path):
     assert len(pc_receipts) == 1
 
 
+def test_activate_verified_prebuilt_bundle_without_a_source_tree(tmp_path):
+    """A second host activates the exact bundle produced by the first host."""
+    src = _make_source(tmp_path)
+    built = tmp_path / "built"
+    target = tmp_path / "target"
+    target.mkdir()
+    _run(
+        ACTIVATE,
+        "--source-root", str(src),
+        "--output-root", str(built),
+        "--root", str(tmp_path / "dry-run"),
+    )
+    bundle = _bundle_dir(built)
+
+    result = _run(
+        ACTIVATE,
+        "--bundle", str(bundle),
+        "--root", str(target),
+        "--apply",
+    )
+
+    assert "status: ok" in result.stdout
+    assert all((target / rel).is_file() for rel in _release_relpaths())
+
+
 def test_activate_refuses_dirty_source(tmp_path):
     src = _make_source(tmp_path)
     (src / "hermes_cli" / "jobs_identity.py").write_text("dirty\n", encoding="utf-8")
