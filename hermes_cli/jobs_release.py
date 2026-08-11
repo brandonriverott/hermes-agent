@@ -28,6 +28,7 @@ import json
 import os
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ SCHEMA_VERSION = 1
 BUNDLE_NAME = "jobs-release-v1"
 MANIFEST_NAME = "manifest.json"
 FILES_SUBDIR = "files"
+RUNTIME_ARCHIVE_NAME = "runtime.tar.gz"
 RECEIPT_SUBDIR = "activation-receipts"
 BACKUP_DIRNAME = ".jobs-release-backup"
 KIND = "jobs-release-activation"
@@ -152,6 +154,8 @@ def _content_digest(manifest: dict) -> str:
         "schema_version": manifest.get("schema_version"),
         "release_sha": manifest.get("release_sha"),
         "files": manifest.get("files"),
+        "runtime_archive": manifest.get("runtime_archive"),
+        "runtime_files": manifest.get("runtime_files"),
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -195,6 +199,71 @@ def resolve_release_files(source_root: Path) -> list[str]:
     return list(RELEASE_FILES)
 
 
+def _tracked_runtime_files(source_root: Path) -> list[dict]:
+    completed = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=source_root,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise ReleaseError("cannot enumerate tracked runtime files")
+    entries: list[dict] = []
+    for raw in completed.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            rel = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ReleaseError("tracked runtime path is not UTF-8") from exc
+        parts = Path(rel).parts
+        if not parts or Path(rel).is_absolute() or ".." in parts:
+            raise ReleaseError("tracked runtime path escapes source root")
+        source = source_root / rel
+        if source.is_symlink():
+            raise ReleaseError("tracked runtime symlinks are not supported")
+        if not source.is_file():
+            raise ReleaseError(f"tracked runtime file is missing: {rel}")
+        entries.append(
+            {
+                "relpath": rel.replace(os.sep, "/"),
+                "sha256": sha256_file(source),
+                "size": source.stat().st_size,
+                "mode": source.stat().st_mode & 0o777,
+            }
+        )
+    if not entries:
+        raise ReleaseError("tracked runtime is empty")
+    return sorted(entries, key=lambda item: item["relpath"])
+
+
+def _build_runtime_archive(source_root: Path, destination: Path) -> dict:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=destination.name + ".", suffix=".tmp", dir=str(destination.parent)
+    )
+    os.close(fd)
+    try:
+        completed = subprocess.run(
+            ["git", "archive", "--format=tar.gz", "-o", tmp_name, "HEAD"],
+            cwd=source_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ReleaseError("cannot build complete runtime archive")
+        os.replace(tmp_name, destination)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return {
+        "relpath": RUNTIME_ARCHIVE_NAME,
+        "sha256": sha256_file(destination),
+        "size": destination.stat().st_size,
+    }
+
+
 # ── bundle construction and verification ─────────────────────────────────────
 
 
@@ -223,6 +292,10 @@ def build_bundle(
     release_sha = git_head_sha(source_root)
     bundle = output_root / "releases" / release_sha / BUNDLE_NAME
     files_dir = bundle / FILES_SUBDIR
+    runtime_archive = _build_runtime_archive(
+        source_root, bundle / RUNTIME_ARCHIVE_NAME
+    )
+    runtime_files = _tracked_runtime_files(source_root)
 
     entries: list[dict] = []
     for rel in rels:
@@ -241,6 +314,8 @@ def build_bundle(
         "created_by": "jobs_release.build_bundle",
         "source": str(source_root),
         "files": entries,
+        "runtime_archive": runtime_archive,
+        "runtime_files": runtime_files,
         "bundle_digest": "",
         "manifest_digest": "",
     }
@@ -287,11 +362,101 @@ def verify_bundle(bundle_dir: Path) -> dict:
         raise ReleaseRefused("missing manifest files in bundle: " + ", ".join(missing))
     if mismatched:
         raise ReleaseRefused("digest mismatch in bundle: " + ", ".join(mismatched))
+    runtime = manifest.get("runtime_archive")
+    if not isinstance(runtime, dict) or runtime.get("relpath") != RUNTIME_ARCHIVE_NAME:
+        raise ReleaseRefused("manifest missing complete runtime archive")
+    archive = bundle_dir / RUNTIME_ARCHIVE_NAME
+    if not archive.is_file():
+        raise ReleaseRefused("missing complete runtime archive")
+    if (
+        sha256_file(archive) != runtime.get("sha256")
+        or archive.stat().st_size != runtime.get("size")
+    ):
+        raise ReleaseRefused("runtime archive digest mismatch")
+    runtime_files = manifest.get("runtime_files")
+    if not isinstance(runtime_files, list) or not runtime_files:
+        raise ReleaseRefused("manifest missing complete runtime file inventory")
     if _content_digest(manifest) != manifest.get("bundle_digest"):
         raise ReleaseRefused("bundle digest mismatch in manifest")
     if _canonical_digest(manifest) != manifest.get("manifest_digest"):
         raise ReleaseRefused("manifest digest mismatch")
     return manifest
+
+
+def verify_runtime_root(root: Path, bundle_dir: Path) -> dict:
+    """Verify every tracked runtime file and refuse unrecorded files."""
+    root = root.resolve()
+    manifest = verify_bundle(bundle_dir)
+    expected = {entry["relpath"]: entry for entry in manifest["runtime_files"]}
+    observed = {
+        path.relative_to(root).as_posix(): path
+        for path in root.rglob("*")
+        if path.is_file() or path.is_symlink()
+    }
+    missing = sorted(set(expected) - set(observed))
+    extra = sorted(set(observed) - set(expected))
+    mismatched = []
+    mode_mismatched = []
+    for rel in sorted(set(expected) & set(observed)):
+        path = observed[rel]
+        entry = expected[rel]
+        if path.is_symlink() or sha256_file(path) != entry["sha256"]:
+            mismatched.append(rel)
+        elif path.stat().st_size != entry["size"]:
+            mismatched.append(rel)
+        elif path.stat().st_mode & 0o777 != entry["mode"]:
+            mode_mismatched.append(rel)
+    if missing or extra or mismatched or mode_mismatched:
+        raise ReleaseRefused(
+            "runtime root mismatch"
+            f" (missing={len(missing)}, extra={len(extra)}, "
+            f"digest={len(mismatched)}, mode={len(mode_mismatched)})"
+        )
+    return {"ok": True, "checked": len(expected), "root": str(root)}
+
+
+def _extract_runtime_root(root: Path, bundle_dir: Path) -> None:
+    """Atomically materialize the verified full runtime into a new root."""
+    if root.exists():
+        raise ReleaseRefused("immutable runtime root already exists")
+    manifest = verify_bundle(bundle_dir)
+    expected_entries = {
+        entry["relpath"]: entry for entry in manifest["runtime_files"]
+    }
+    expected = set(expected_entries)
+    root.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(prefix=f".{root.name}.stage-", dir=str(root.parent))
+    )
+    try:
+        with tarfile.open(bundle_dir / RUNTIME_ARCHIVE_NAME, mode="r:gz") as archive:
+            archived_files: set[str] = set()
+            for member in archive.getmembers():
+                rel = member.name.rstrip("/")
+                parts = Path(rel).parts
+                if not rel or Path(rel).is_absolute() or ".." in parts:
+                    raise ReleaseRefused("runtime archive path escapes release root")
+                destination = stage / rel
+                if member.isdir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isfile():
+                    raise ReleaseRefused("runtime archive contains unsupported entry")
+                archived_files.add(rel)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise ReleaseRefused("runtime archive member cannot be read")
+                with source, destination.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+                os.chmod(destination, expected_entries[rel]["mode"])
+            if archived_files != expected:
+                raise ReleaseRefused("runtime archive inventory mismatch")
+        verify_runtime_root(stage, bundle_dir)
+        os.replace(stage, root)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
 
 
 # ── install: check, dry-run, apply ────────────────────────────────────────────
@@ -361,25 +526,34 @@ def install_release(
         install_check(root, bundle_dir)  # refuse drift in validation mode
 
     files_dir = bundle_dir / FILES_SUBDIR
+    runtime_root_created = False
     if not dry_run:
         if backup_dir is None:
             backup_dir = root / BACKUP_DIRNAME / time.strftime("%Y%m%d-%H%M%S")
         backup_dir = backup_dir.resolve()
         backup_dir.mkdir(parents=True, exist_ok=False)
+        if live_authorization is not None:
+            _extract_runtime_root(root, bundle_dir)
+            runtime_root_created = True
 
     targets: list[dict] = []
     for entry in manifest["files"]:
         rel = entry["relpath"]
         target = root / rel
-        before_sha = sha256_file(target) if target.is_file() else None
+        before_sha = (
+            None
+            if runtime_root_created
+            else (sha256_file(target) if target.is_file() else None)
+        )
         backup = None
         if dry_run:
             after_sha = entry["sha256"]
         else:
-            if target.is_file():
-                backup = backup_dir / rel
-                _atomic_copy(target, backup)
-            _atomic_copy(files_dir / rel, target)
+            if live_authorization is None:
+                if target.is_file():
+                    backup = backup_dir / rel
+                    _atomic_copy(target, backup)
+                _atomic_copy(files_dir / rel, target)
             after_sha = sha256_file(target)
             if after_sha != entry["sha256"]:
                 raise ReleaseError(f"post-install verification failed for {rel}")
@@ -405,6 +579,9 @@ def install_release(
         "created_at": _utcnow_iso(),
         "bundle_dir": str(bundle_dir),
         "backup_dir": str(backup_dir) if not dry_run else None,
+        "runtime_archive_sha256": manifest["runtime_archive"]["sha256"],
+        "runtime_file_count": len(manifest["runtime_files"]),
+        "runtime_root_created": runtime_root_created,
         "targets": targets,
     }
 
@@ -625,7 +802,24 @@ def rollback(
         )
 
     outcomes: list[dict] = []
-    for target in receipt.get("targets", []):
+    runtime_root_action = None
+    targets = receipt.get("targets", [])
+    if receipt.get("runtime_root_created") is True:
+        bundle_dir = Path(str(receipt.get("bundle_dir", "")))
+        manifest = verify_bundle(bundle_dir)
+        if manifest["runtime_archive"]["sha256"] != receipt.get(
+            "runtime_archive_sha256"
+        ):
+            raise ReleaseRefused("runtime archive receipt mismatch")
+        verify_runtime_root(root, bundle_dir)
+        shutil.rmtree(root)
+        runtime_root_action = "removed"
+        outcomes.append(
+            {"relpath": ".", "action": "removed", "final_sha": None}
+        )
+        targets = []
+
+    for target in targets:
         rel = target["relpath"]
         target_path = root / rel
         if not target_path.is_relative_to(root):
@@ -663,6 +857,7 @@ def rollback(
         "root": str(root),
         "release_sha": receipt.get("release_sha"),
         "result": "ok",
+        "runtime_root_action": runtime_root_action,
         "targets": outcomes,
     }
     ev_dir = evidence_dir or receipt_path.parent

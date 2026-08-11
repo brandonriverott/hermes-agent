@@ -46,6 +46,7 @@ def _make_source(tmp_path: Path, files=FILES) -> Path:
     root.mkdir()
     for rel in files:
         _write(root, rel)
+    _write(root, "runtime_only.py", "FULL_RUNTIME_SENTINEL = True\n")
     _git("init", "-q", "-b", "main", cwd=root)
     _git("config", "user.email", "test@example.com", cwd=root)
     _git("config", "user.name", "Test", cwd=root)
@@ -115,6 +116,15 @@ def test_build_creates_versioned_immutable_bundle(tmp_path, monkeypatch):
         assert entry["sha256"] == _sha_bytes(src_file.read_bytes())
         assert entry["size"] == src_file.stat().st_size
     assert len(manifest["bundle_digest"]) == 64
+    runtime = manifest["runtime_archive"]
+    assert runtime["relpath"] == jobs_release.RUNTIME_ARCHIVE_NAME
+    assert len(runtime["sha256"]) == 64
+    assert runtime["size"] > 0
+    assert any(
+        entry["relpath"] == "runtime_only.py"
+        for entry in manifest["runtime_files"]
+    )
+    assert (bundle / jobs_release.RUNTIME_ARCHIVE_NAME).is_file()
 
     # Rebuilding from the same clean source yields the same release SHA.
     monkeypatch.setattr(jobs_release, "_utcnow_iso", lambda: "2099-01-01T00:00:00+00:00")
@@ -163,6 +173,57 @@ def test_verify_refuses_digest_mismatch(tmp_path):
     f.write_bytes(f.read_bytes() + b"corrupt")
     with pytest.raises(ReleaseRefused, match="digest"):
         jobs_release.verify_bundle(bundle)
+
+
+def test_verify_refuses_runtime_archive_digest_mismatch(tmp_path):
+    _, _, bundle, _ = _build(tmp_path)
+    archive = bundle / jobs_release.RUNTIME_ARCHIVE_NAME
+    archive.write_bytes(archive.read_bytes() + b"corrupt")
+    with pytest.raises(ReleaseRefused, match="runtime archive digest"):
+        jobs_release.verify_bundle(bundle)
+
+
+def test_runtime_verification_refuses_mode_drift(tmp_path):
+    _, _, bundle, manifest = _build(tmp_path)
+    home = tmp_path / "home"
+    backup = jobs_release.live_backup_dir(home, "mac", manifest["release_sha"])
+    receipts = jobs_release.live_receipt_dir(home)
+    preflight = tmp_path / "preflight.json"
+    root = jobs_release.live_target_root(home, "mac", manifest["release_sha"])
+    jobs_release.write_live_preflight(
+        preflight,
+        bundle,
+        profile="mac",
+        home_dir=home,
+        backup_dir=backup,
+        receipt_dir=receipts,
+    )
+    authorization = jobs_release.authorize_live_activation(
+        bundle,
+        profile="mac",
+        expected_release_sha=manifest["release_sha"],
+        acknowledgement=jobs_release.live_acknowledgement(
+            "mac", manifest["release_sha"]
+        ),
+        preflight_path=preflight,
+        home_dir=home,
+        backup_dir=backup,
+        receipt_dir=receipts,
+    )
+    jobs_release.install_release(
+        root,
+        bundle,
+        dry_run=False,
+        backup_dir=backup,
+        host_kind="mac",
+        home_dir=home,
+        live_authorization=authorization,
+    )
+    target = root / "runtime_only.py"
+    target.chmod(0o777)
+
+    with pytest.raises(ReleaseRefused, match="runtime root mismatch"):
+        jobs_release.verify_runtime_root(root, bundle)
 
 
 # ── install check: target drift refusal, missing vs match ────────────────────
@@ -406,6 +467,101 @@ def test_live_activation_requires_exact_profile_sha_ack_and_preflight(tmp_path):
     assert receipt["live_profile"] == "mac"
     assert receipt["bundle_digest"] == manifest["bundle_digest"]
     assert Path(receipt["root"]) == root
+    assert receipt["runtime_root_created"] is True
+    assert (root / "runtime_only.py").read_text(encoding="utf-8") == (
+        "FULL_RUNTIME_SENTINEL = True\n"
+    )
+    assert jobs_release.verify_runtime_root(root, bundle)["ok"] is True
+
+
+def test_live_activation_never_overwrites_existing_same_sha_root(tmp_path):
+    _, _, bundle, manifest = _build(tmp_path)
+    home = tmp_path / "home"
+    backup = jobs_release.live_backup_dir(home, "mac", manifest["release_sha"])
+    receipts = jobs_release.live_receipt_dir(home)
+    preflight = tmp_path / "preflight-mac.json"
+    root = jobs_release.live_target_root(home, "mac", manifest["release_sha"])
+    root.mkdir(parents=True)
+    (root / "operator-file").write_text("must survive\n", encoding="utf-8")
+
+    jobs_release.write_live_preflight(
+        preflight,
+        bundle,
+        profile="mac",
+        home_dir=home,
+        backup_dir=backup,
+        receipt_dir=receipts,
+    )
+    authorization = jobs_release.authorize_live_activation(
+        bundle,
+        profile="mac",
+        expected_release_sha=manifest["release_sha"],
+        acknowledgement=jobs_release.live_acknowledgement(
+            "mac", manifest["release_sha"]
+        ),
+        preflight_path=preflight,
+        home_dir=home,
+        backup_dir=backup,
+        receipt_dir=receipts,
+    )
+
+    with pytest.raises(ReleaseRefused, match="immutable runtime root already exists"):
+        jobs_release.install_release(
+            root,
+            bundle,
+            dry_run=False,
+            backup_dir=backup,
+            host_kind="mac",
+            home_dir=home,
+            live_authorization=authorization,
+        )
+    assert (root / "operator-file").read_text(encoding="utf-8") == "must survive\n"
+
+
+def test_live_rollback_removes_exact_verified_runtime_root(tmp_path):
+    _, _, bundle, manifest = _build(tmp_path)
+    home = tmp_path / "home"
+    backup = jobs_release.live_backup_dir(home, "pc", manifest["release_sha"])
+    receipts = jobs_release.live_receipt_dir(home)
+    preflight = tmp_path / "preflight-pc.json"
+    root = jobs_release.live_target_root(home, "pc", manifest["release_sha"])
+    jobs_release.write_live_preflight(
+        preflight,
+        bundle,
+        profile="pc",
+        home_dir=home,
+        backup_dir=backup,
+        receipt_dir=receipts,
+    )
+    authorization = jobs_release.authorize_live_activation(
+        bundle,
+        profile="pc",
+        expected_release_sha=manifest["release_sha"],
+        acknowledgement=jobs_release.live_acknowledgement(
+            "pc", manifest["release_sha"]
+        ),
+        preflight_path=preflight,
+        home_dir=home,
+        backup_dir=backup,
+        receipt_dir=receipts,
+    )
+    receipt = jobs_release.install_release(
+        root,
+        bundle,
+        dry_run=False,
+        backup_dir=backup,
+        host_kind="pc",
+        home_dir=home,
+        live_authorization=authorization,
+    )
+    receipt_path = receipts / "pc-activation.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    evidence = jobs_release.rollback(root, receipt_path)
+
+    assert not root.exists()
+    assert evidence["runtime_root_action"] == "removed"
 
 
 @pytest.mark.parametrize(

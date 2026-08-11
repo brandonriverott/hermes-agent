@@ -35,6 +35,8 @@ def _make_source(tmp_path: Path) -> Path:
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(f"fake {rel}\n", encoding="utf-8")
+    runtime_only = root / "runtime_only.py"
+    runtime_only.write_text("FULL_RUNTIME_SENTINEL = True\n", encoding="utf-8")
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
@@ -262,6 +264,8 @@ def test_live_profile_requires_preflight_then_applies_only_declared_root(tmp_pat
     target = jobs_release.live_target_root(home, "mac", release_sha)
     assert target.is_dir()
     assert all((target / rel).is_file() for rel in _release_relpaths())
+    assert (target / "runtime_only.py").is_file()
+    assert jobs_release.verify_runtime_root(target, _bundle_dir(out))["ok"] is True
     receipts = list(jobs_release.live_receipt_dir(home).glob("mac-*.json"))
     assert len(receipts) == 1
 
