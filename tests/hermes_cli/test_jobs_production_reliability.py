@@ -22,6 +22,34 @@ from hermes_cli import jobs_runtime
 from hermes_cli import jobs_lanes
 
 
+@pytest.mark.parametrize(
+    "filename",
+    ["jobs-build-result.v1.schema.json", "jobs-review-result.v1.schema.json"],
+)
+def test_codex_phase_schemas_are_strict_response_format_compatible(filename):
+    """Every object property must be required for Codex strict schemas.
+
+    Fields that are logically optional must express absence with ``null``.
+    Codex rejects schemas that omit object properties from ``required`` before
+    it starts the worker, so this validates the release artifact directly.
+    """
+    schema = json.loads(
+        (Path(jobs_reliability.__file__).resolve().parent / "data" / filename).read_text()
+    )
+
+    def assert_strict(node):
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            assert set(node.get("required", ())) == set(properties)
+            for child in properties.values():
+                assert_strict(child)
+        assert_strict(node.get("items"))
+
+    assert_strict(schema)
+
+
 def _repo(tmp_path: Path) -> tuple[Path, str]:
     repo = tmp_path / "repo"
     repo.mkdir()

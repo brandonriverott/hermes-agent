@@ -3,7 +3,7 @@
   "title": "Jobs builder and test result (v1)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["outcome", "tests"],
+  "required": ["outcome", "failure_class", "reason", "tests"],
   "properties": {
     "outcome": {"type": "string", "enum": ["succeeded", "failed"]},
     "failure_class": {
@@ -18,16 +18,16 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["cmd", "result", "evidence"],
+        "required": ["cmd", "result", "evidence", "classification", "note"],
         "properties": {
           "cmd": {"type": "string", "minLength": 1, "maxLength": 512},
           "result": {"type": "string", "enum": ["pass", "fail", "flaky"]},
           "evidence": {"type": "string", "minLength": 1, "maxLength": 1024},
           "classification": {
-            "type": "string",
-            "enum": ["candidate_regression", "pre_existing", "infrastructure", "prerequisite_unavailable"]
+            "type": ["string", "null"],
+            "enum": [null, "candidate_regression", "pre_existing", "infrastructure", "prerequisite_unavailable"]
           },
-          "note": {"type": "string", "maxLength": 1024}
+          "note": {"type": ["string", "null"], "maxLength": 1024}
         }
       }
     }
