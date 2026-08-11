@@ -135,6 +135,10 @@ def _phase_env(provider: str, lane_root: Path, handoff: Path) -> dict[str, str]:
     env = {key: os.environ[key] for key in _ENV_ALLOWLIST if key in os.environ}
     if "PATH" not in env:
         env["PATH"] = os.defpath
+    user_bins = [Path.home() / ".hermes" / "node" / "bin", Path.home() / ".local" / "bin"]
+    prefixes = [str(path) for path in user_bins if path.is_dir()]
+    if prefixes:
+        env["PATH"] = os.pathsep.join([env["PATH"], *prefixes])
     executable = shutil.which(provider, path=env["PATH"])
     if executable is None:
         raise jobs_execution.AdapterError("selected provider executable is unavailable")

@@ -98,6 +98,10 @@ def _allowed_environment(
     }
     if "PATH" not in environment:
         environment["PATH"] = os.defpath
+    user_bins = [Path.home() / ".hermes" / "node" / "bin", Path.home() / ".local" / "bin"]
+    prefixes = [str(path) for path in user_bins if path.is_dir()]
+    if prefixes:
+        environment["PATH"] = os.pathsep.join([environment["PATH"], *prefixes])
     auth_dir = str(lane_dir / "auth")
     if lane.executor == "claude":
         environment["CLAUDE_CONFIG_DIR"] = auth_dir
