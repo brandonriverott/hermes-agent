@@ -80,6 +80,17 @@ _CANONICAL_FIELDS = (
     "created_at",
 )
 _CANONICAL_FIELD_SET = frozenset(_CANONICAL_FIELDS)
+_PHASE_OUTCOMES = {
+    "QUEUED": frozenset({"started"}),
+    "ASSIGNED": frozenset({"handed_off"}),
+    "BUILDING": frozenset({"started"}),
+    "EVIDENCE_COLLECTING": frozenset({"handed_off"}),
+    "REVIEWING": frozenset({"handed_off"}),
+    "VERIFIED": frozenset({"passed"}),
+    "FAILED": frozenset({"rejected"}),
+    "BLOCKED": frozenset({"blocked"}),
+    "COMPLETED": frozenset({"completed", "activated"}),
+}
 
 
 def _exact_mapping(
@@ -89,8 +100,8 @@ def _exact_mapping(
     field: str,
     required: frozenset[str] | None = None,
 ) -> Mapping[str, object]:
-    if not isinstance(value, Mapping):
-        raise HandoffValidationError(f"{field} must be an object")
+    if type(value) is not dict:
+        raise HandoffValidationError(f"{field} must use exact JSON object types")
     actual = set(value)
     unknown = actual - expected
     if unknown:
@@ -103,17 +114,53 @@ def _exact_mapping(
     return value
 
 
+def _require_exact_json_tree(value: object, *, field: str) -> None:
+    ancestors: set[int] = set()
+    pending: list[tuple[object, bool]] = [(value, False)]
+    while pending:
+        item, leaving = pending.pop()
+        if leaving:
+            ancestors.remove(id(item))
+            continue
+        if item is None or type(item) in {str, int}:
+            continue
+        if type(item) not in {dict, list}:
+            raise HandoffValidationError(f"{field} must use exact JSON built-in types")
+        identity = id(item)
+        if identity in ancestors:
+            raise HandoffValidationError(f"{field} must be an acyclic JSON tree")
+        ancestors.add(identity)
+        pending.append((item, True))
+        if type(item) is list:
+            pending.extend((child, False) for child in reversed(item))
+            continue
+        children = []
+        for key, child in item.items():
+            if type(key) is not str:
+                raise HandoffValidationError(f"{field} must use exact JSON string keys")
+            children.append(child)
+        pending.extend((child, False) for child in reversed(children))
+
+
 def _bounded_text(
-    value: object, *, field: str, max_chars: int, narrative: bool = False
+    value: object,
+    *,
+    field: str,
+    max_chars: int,
+    narrative: bool = False,
 ) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if type(value) is not str or not value.strip():
         raise HandoffValidationError(f"{field} must be a non-empty string")
+    value = unicodedata.normalize("NFC", value)
     if len(value) > max_chars:
         raise HandoffValidationError(f"{field} exceeds its {max_chars}-character limit")
     if any(marker in value.casefold() for marker in _SECRET_MARKERS):
         raise HandoffValidationError(f"{field} contains a forbidden secret marker")
     for character in value:
-        if unicodedata.category(character) != "Cc":
+        category = unicodedata.category(character)
+        if category in {"Cf", "Cs"}:
+            raise HandoffValidationError(f"{field} contains unsafe Unicode")
+        if category != "Cc":
             continue
         if narrative and character in {"\n", "\t"}:
             continue
@@ -121,11 +168,51 @@ def _bounded_text(
     return value
 
 
+def _require_persisted_nfc(value: object) -> None:
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if type(item) is str:
+            if unicodedata.normalize("NFC", item) != item:
+                raise HandoffValidationError(
+                    "persisted handoff strings must be NFC-normalized"
+                )
+        elif type(item) is list:
+            pending.extend(item)
+        elif type(item) is dict:
+            pending.extend(item)
+            pending.extend(item.values())
+
+
+def _normalize_transition_evidence(value: object) -> dict[str, str]:
+    if type(value) is not dict:
+        raise HandoffValidationError(
+            "transition_evidence must use an exact JSON object"
+        )
+    normalized: dict[str, str] = {}
+    for key, digest in value.items():
+        normalized_key = _bounded_text(
+            key,
+            field="transition_evidence key",
+            max_chars=120,
+        )
+        if normalized_key in normalized:
+            raise HandoffValidationError(
+                "transition_evidence contains duplicate normalized keys"
+            )
+        if type(digest) is not str or _DIGEST.fullmatch(digest) is None:
+            raise HandoffValidationError(
+                "transition_evidence values must be canonical sha256 digests"
+            )
+        normalized[normalized_key] = digest
+    return normalized
+
+
 def _normalize_evidence(
     value: object, *, transition_evidence: Mapping[str, str]
 ) -> list[dict[str, str]]:
-    if not isinstance(value, list):
-        raise HandoffValidationError("evidence_summary must be a list")
+    if type(value) is not list:
+        raise HandoffValidationError("evidence_summary must use an exact JSON list")
     if len(value) > MAX_EVIDENCE_ITEMS:
         raise HandoffValidationError(
             f"evidence_summary may contain at most {MAX_EVIDENCE_ITEMS} items"
@@ -134,20 +221,14 @@ def _normalize_evidence(
         raise HandoffValidationError(
             "evidence_summary requires at least one fact when transition evidence exists"
         )
-    allowed_digests: set[str] = set()
-    for digest in transition_evidence.values():
-        if not isinstance(digest, str):
-            raise HandoffValidationError(
-                "transition_evidence values must be sha256 digest strings"
-            )
-        allowed_digests.add(digest)
+    allowed_digests = set(transition_evidence.values())
     normalized = []
     for index, item in enumerate(value):
         fact = _exact_mapping(
             item, _EVIDENCE_FIELDS, field=f"evidence_summary[{index}]"
         )
         digest = fact["digest"]
-        if not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None:
+        if type(digest) is not str or _DIGEST.fullmatch(digest) is None:
             raise HandoffValidationError(
                 f"evidence_summary[{index}].digest must be a canonical sha256 digest"
             )
@@ -174,8 +255,8 @@ def _normalize_evidence(
 
 
 def _normalize_issues(value: object) -> list[dict[str, str]]:
-    if not isinstance(value, list):
-        raise HandoffValidationError("issues must be a list")
+    if type(value) is not list:
+        raise HandoffValidationError("issues must use an exact JSON list")
     if len(value) > MAX_ISSUES:
         raise HandoffValidationError(f"issues may contain at most {MAX_ISSUES} items")
     normalized = []
@@ -198,8 +279,10 @@ def _normalize_decision(value: object) -> dict[str, object] | None:
         return None
     decision = _exact_mapping(value, _DECISION_FIELDS, field="decision_request")
     options = decision["options"]
-    if not isinstance(options, list):
-        raise HandoffValidationError("decision_request.options must be a list")
+    if type(options) is not list:
+        raise HandoffValidationError(
+            "decision_request.options must use an exact JSON list"
+        )
     if len(options) not in {2, 3}:
         raise HandoffValidationError(
             "decision_request.options must contain two or three options"
@@ -281,7 +364,7 @@ def _normalize_artifact(value: object) -> dict[str, str] | None:
     if value is None:
         return None
     artifact = _exact_mapping(value, _ARTIFACT_FIELDS, field="artifact_identity")
-    kind = artifact["kind"]
+    kind = _bounded_text(artifact["kind"], field="artifact_identity.kind", max_chars=80)
     if kind not in {"commit", "release", "deployment", "artifact"}:
         raise HandoffValidationError("artifact_identity.kind is unsupported")
     value_text = _bounded_text(
@@ -303,7 +386,7 @@ def _canonical_json(value: object) -> str:
             separators=(",", ":"),
             allow_nan=False,
         )
-    except (TypeError, ValueError) as exc:
+    except (RecursionError, TypeError, UnicodeError, ValueError) as exc:
         raise HandoffValidationError("handoff must be canonical JSON data") from exc
 
 
@@ -313,6 +396,26 @@ def _enforce_json_budget(receipt: dict) -> dict:
             f"canonical handoff exceeds {MAX_HANDOFF_JSON_CHARS} characters"
         )
     return receipt
+
+
+def _validate_phase_outcome(
+    *,
+    attempt_id: str | None,
+    from_phase: str,
+    to_phase: str,
+    outcome: str,
+) -> None:
+    allowed = _PHASE_OUTCOMES.get(to_phase)
+    if allowed is None or outcome not in allowed:
+        raise HandoffValidationError("handoff phase and outcome are incompatible")
+    intake_edge = (from_phase, to_phase, outcome, attempt_id) == (
+        "INTAKE",
+        "QUEUED",
+        "started",
+        None,
+    )
+    if (from_phase == "INTAKE" or to_phase == "QUEUED") and not intake_edge:
+        raise HandoffValidationError("handoff phase and outcome are incompatible")
 
 
 def normalize_handoff(
@@ -333,13 +436,18 @@ def normalize_handoff(
 ) -> dict:
     """Bind caller-supplied handoff facts to one transition identity."""
 
+    _require_exact_json_tree(raw, field="handoff")
+    if artifact_identity is not None:
+        _require_exact_json_tree(artifact_identity, field="artifact_identity")
+    _require_exact_json_tree(transition_evidence, field="transition_evidence")
+    transition_evidence = _normalize_transition_evidence(transition_evidence)
     raw = _exact_mapping(
         raw,
         _RAW_FIELDS,
         field="handoff",
         required=frozenset({"summary", "evidence_summary", "next_action"}),
     )
-    if outcome not in OUTCOMES:
+    if type(outcome) is not str or outcome not in OUTCOMES:
         raise HandoffValidationError("unsupported handoff outcome")
 
     job_id = _bounded_text(job_id, field="job_id", max_chars=_MAX_IDENTITY_CHARS)
@@ -365,6 +473,12 @@ def normalize_handoff(
         attempt_id = _bounded_text(
             attempt_id, field="attempt_id", max_chars=_MAX_IDENTITY_CHARS
         )
+    _validate_phase_outcome(
+        attempt_id=attempt_id,
+        from_phase=from_phase,
+        to_phase=to_phase,
+        outcome=outcome,
+    )
 
     if next_owner_role is None:
         if outcome != "completed":
@@ -377,11 +491,9 @@ def normalize_handoff(
             field="next_owner_role",
             max_chars=_MAX_IDENTITY_CHARS,
         )
-    if isinstance(created_at, bool) or not isinstance(created_at, int):
+    if type(created_at) is not int:
         raise HandoffValidationError("created_at must be an integer")
 
-    if not isinstance(transition_evidence, Mapping):
-        raise HandoffValidationError("transition_evidence must be an object")
     issues = _normalize_issues(raw.get("issues", []))
     if outcome == "rejected" and not issues:
         raise HandoffValidationError(
@@ -432,31 +544,38 @@ def normalize_handoff(
 
 
 def validate_persisted_handoff(
-    value: object, *, target_state: str | None = None
+    value: object,
+    *,
+    target_state: str | None = None,
+    transition_evidence: Mapping[str, str] | None = None,
 ) -> dict:
     """Strictly revalidate a canonical handoff already loaded from storage."""
 
+    _require_exact_json_tree(value, field="persisted handoff")
     persisted = _exact_mapping(value, _CANONICAL_FIELD_SET, field="persisted handoff")
+    _require_persisted_nfc(value)
     schema_version = persisted["schema_version"]
-    if (
-        isinstance(schema_version, bool)
-        or not isinstance(schema_version, int)
-        or schema_version != SCHEMA_VERSION
-    ):
+    if type(schema_version) is not int or schema_version != SCHEMA_VERSION:
         raise HandoffValidationError("unsupported schema_version")
-    if target_state is not None and persisted["to_phase"] != target_state:
-        raise HandoffValidationError(
-            "persisted handoff target_state does not match to_phase"
+    if target_state is not None:
+        target_state = _bounded_text(
+            target_state,
+            field="target_state",
+            max_chars=_MAX_IDENTITY_CHARS,
         )
+        if persisted["to_phase"] != target_state:
+            raise HandoffValidationError(
+                "persisted handoff target_state does not match to_phase"
+            )
 
-    evidence_values = {}
     evidence_summary = persisted["evidence_summary"]
-    if isinstance(evidence_summary, list):
-        for index, fact in enumerate(evidence_summary):
-            if isinstance(fact, Mapping):
-                digest = fact.get("digest")
-                if isinstance(digest, str):
-                    evidence_values[f"evidence-{index}"] = digest
+    if type(evidence_summary) is list and evidence_summary:
+        if transition_evidence is None:
+            raise HandoffValidationError(
+                "evidence_summary requires trusted transition_evidence"
+            )
+    elif transition_evidence is None:
+        transition_evidence = {}
 
     raw = {
         "summary": persisted["summary"],
@@ -477,7 +596,7 @@ def validate_persisted_handoff(
         next_owner_role=persisted["next_owner_role"],
         outcome=persisted["outcome"],
         artifact_identity=persisted["artifact_identity"],
-        transition_evidence=evidence_values,
+        transition_evidence=transition_evidence,
         created_at=persisted["created_at"],
     )
     if normalized != dict(persisted):
@@ -580,13 +699,35 @@ def blocker_handoff(
     )
 
 
-def render_handoff(receipt: object) -> str:
+def _render_text(value: str) -> str:
+    """Keep user-controlled narrative on one structural renderer line."""
+
+    return (
+        value
+        .replace("\n", " ⏎ ")
+        .replace("\t", " ⇥ ")
+        .replace("\u2028", " ⏎ ")
+        .replace("\u2029", " ⏎ ")
+    )
+
+
+def render_handoff(
+    receipt: object,
+    *,
+    transition_evidence: Mapping[str, str] | None = None,
+) -> str:
     """Render one validated canonical handoff without consulting other state."""
 
-    handoff = validate_persisted_handoff(receipt)
+    handoff = validate_persisted_handoff(
+        receipt, transition_evidence=transition_evidence
+    )
     outcome = handoff["outcome"]
-    speaker_role = handoff["speaker_role"]
-    next_owner_role = handoff["next_owner_role"]
+    speaker_role = _render_text(handoff["speaker_role"])
+    next_owner_role = (
+        None
+        if handoff["next_owner_role"] is None
+        else _render_text(handoff["next_owner_role"])
+    )
     if outcome == "started":
         heading = f"{speaker_role} started"
     elif outcome == "passed":
@@ -600,26 +741,31 @@ def render_handoff(receipt: object) -> str:
     else:
         heading = f"{speaker_role} → {next_owner_role}"
 
-    lines = [heading, handoff["summary"]]
+    lines = [heading, _render_text(handoff["summary"])]
     for fact in handoff["evidence_summary"]:
-        lines.append(f"Evidence: {fact['label']}: {fact['result']}")
+        lines.append(
+            f"Evidence: {_render_text(fact['label'])}: {_render_text(fact['result'])}"
+        )
     for issue in handoff["issues"]:
         lines.extend((
-            f"Issue — {issue['requirement']}: {issue['finding']}",
-            f"Required fix: {issue['required_fix']}",
+            f"Issue — {_render_text(issue['requirement'])}: "
+            f"{_render_text(issue['finding'])}",
+            f"Required fix: {_render_text(issue['required_fix'])}",
         ))
     decision = handoff["decision_request"]
     if decision is not None:
-        lines.append(decision["question"])
+        lines.append(_render_text(decision["question"]))
         for index, option in enumerate(decision["options"], start=1):
             lines.append(
-                f"{index}. {option['id']} — {option['label']}: {option['consequence']}"
+                f"{index}. {_render_text(option['id'])} — "
+                f"{_render_text(option['label'])}: "
+                f"{_render_text(option['consequence'])}"
             )
         lines.extend((
-            f"Recommendation: {decision['recommendation']} — "
-            f"{decision['recommendation_reason']}",
-            f"Blocked: {decision['blocked_scope']}",
-            f"Safe now: {decision['safe_state']}",
+            f"Recommendation: {_render_text(decision['recommendation'])} — "
+            f"{_render_text(decision['recommendation_reason'])}",
+            f"Blocked: {_render_text(decision['blocked_scope'])}",
+            f"Safe now: {_render_text(decision['safe_state'])}",
         ))
-    lines.append(f"Next: {handoff['next_action']}")
+    lines.append(f"Next: {_render_text(handoff['next_action'])}")
     return "\n".join(lines)

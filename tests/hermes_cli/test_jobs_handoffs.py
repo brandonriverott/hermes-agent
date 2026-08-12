@@ -60,6 +60,25 @@ def _normalize(raw=None, **overrides):
         "created_at": 1_786_500_000,
     }
     values.update(overrides)
+    compatible_edges = {
+        "started": ("ASSIGNED", "BUILDING"),
+        "handed_off": ("BUILDING", "EVIDENCE_COLLECTING"),
+        "passed": ("REVIEWING", "VERIFIED"),
+        "rejected": ("REVIEWING", "FAILED"),
+        "blocked": ("BUILDING", "BLOCKED"),
+        "activated": ("VERIFIED", "COMPLETED"),
+        "completed": ("VERIFIED", "COMPLETED"),
+    }
+    compatible_edge = (
+        compatible_edges.get(values["outcome"])
+        if type(values["outcome"]) is str
+        else None
+    )
+    if compatible_edge is not None:
+        if "from_phase" not in overrides:
+            values["from_phase"] = compatible_edge[0]
+        if "to_phase" not in overrides:
+            values["to_phase"] = compatible_edge[1]
     return normalize_handoff(_raw() if raw is None else raw, **values)
 
 
@@ -138,6 +157,57 @@ def test_outcomes_are_the_closed_contract_set():
     })
     with pytest.raises(HandoffValidationError, match="outcome"):
         _normalize(outcome="failed")
+
+
+@pytest.mark.parametrize(
+    ("to_phase", "outcome"),
+    [
+        ("BLOCKED", "completed"),
+        ("COMPLETED", "blocked"),
+        ("VERIFIED", "handed_off"),
+        ("UNKNOWN", "started"),
+    ],
+)
+def test_phase_rejects_an_incompatible_outcome(to_phase, outcome):
+    next_owner_role = None if outcome == "completed" else "reviewer"
+    raw = _raw(decision_request=_decision() if outcome == "blocked" else None)
+    with pytest.raises(HandoffValidationError, match="phase.*outcome"):
+        _normalize(
+            raw,
+            to_phase=to_phase,
+            outcome=outcome,
+            next_owner_role=next_owner_role,
+        )
+
+
+def test_persisted_target_state_cannot_authorize_a_contradictory_outcome():
+    receipt = _normalize(
+        outcome="completed",
+        from_phase="VERIFIED",
+        to_phase="COMPLETED",
+        next_owner_role=None,
+    )
+    receipt["to_phase"] = "BLOCKED"
+
+    with pytest.raises(HandoffValidationError, match="phase.*outcome"):
+        validate_persisted_handoff(
+            receipt,
+            target_state="BLOCKED",
+            transition_evidence={"tests": TEST_DIGEST},
+        )
+
+
+def test_renderer_refuses_a_contradictory_completed_receipt():
+    receipt = _normalize(
+        outcome="completed",
+        from_phase="VERIFIED",
+        to_phase="COMPLETED",
+        next_owner_role=None,
+    )
+    receipt["to_phase"] = "BLOCKED"
+
+    with pytest.raises(HandoffValidationError, match="phase.*outcome"):
+        render_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
 
 
 def test_attempt_id_none_is_legal_for_intake_to_queued():
@@ -266,6 +336,19 @@ def test_evidence_digest_must_be_bound_to_transition_evidence():
         _normalize(_raw(evidence_summary=evidence))
 
 
+@pytest.mark.parametrize(
+    "transition_evidence",
+    [
+        {"tests": TEST_DIGEST, "unused": "not-a-digest"},
+        {"": TEST_DIGEST, "tests": TEST_DIGEST},
+        {"x" * 121: TEST_DIGEST, "tests": TEST_DIGEST},
+    ],
+)
+def test_all_transition_evidence_entries_are_validated(transition_evidence):
+    with pytest.raises(HandoffValidationError, match="transition_evidence"):
+        _normalize(transition_evidence=transition_evidence)
+
+
 def test_optional_raw_fields_are_filled_with_canonical_defaults():
     receipt = _normalize({
         "summary": "Builder completed the scoped change.",
@@ -331,6 +414,94 @@ def test_identity_phase_and_owner_fields_are_bounded(overrides):
 def test_created_at_must_be_an_integer_not_bool(created_at):
     with pytest.raises(HandoffValidationError, match="created_at"):
         _normalize(created_at=created_at)
+
+
+class _LyingList(list):
+    def __len__(self):
+        return 0
+
+
+class _LyingStr(str):
+    def strip(self):
+        return "safe"
+
+    def casefold(self):
+        return "safe"
+
+    def __len__(self):
+        return 1
+
+    def __iter__(self):
+        return iter(())
+
+
+class _IntSubclass(int):
+    pass
+
+
+def test_list_subclass_cannot_bypass_the_evidence_count_bound():
+    fact = {
+        "label": "Focused tests",
+        "result": "passed",
+        "digest": TEST_DIGEST,
+    }
+    facts = _LyingList([dict(fact) for _ in range(MAX_EVIDENCE_ITEMS + 1)])
+
+    with pytest.raises(HandoffValidationError, match="exact JSON"):
+        _normalize(_raw(evidence_summary=facts))
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        _LyingStr("Authorization: hidden"),
+        _LyingStr("hidden\x00control"),
+        _LyingStr("x" * (MAX_SUMMARY_CHARS + 1)),
+    ],
+)
+def test_string_subclass_cannot_bypass_text_safety(hostile):
+    with pytest.raises(HandoffValidationError, match="exact JSON"):
+        _normalize(_raw(summary=hostile))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"outcome": []}, {"artifact_identity": {"kind": [], "value": "x"}}],
+)
+def test_unhashable_enum_values_raise_handoff_validation_error(overrides):
+    with pytest.raises(HandoffValidationError):
+        _normalize(**overrides)
+
+
+@pytest.mark.parametrize(
+    ("field", "factory"),
+    [
+        (
+            "evidence_summary",
+            lambda receipt: _LyingList(receipt["evidence_summary"]),
+        ),
+        ("summary", lambda receipt: _LyingStr(receipt["summary"])),
+        ("created_at", lambda receipt: _IntSubclass(receipt["created_at"])),
+    ],
+)
+def test_persisted_handoff_rejects_json_scalar_and_container_subclasses(field, factory):
+    receipt = _normalize()
+    receipt[field] = factory(receipt)
+
+    with pytest.raises(HandoffValidationError, match="exact JSON"):
+        validate_persisted_handoff(receipt)
+
+
+def test_cyclic_values_raise_handoff_validation_error_at_both_boundaries():
+    raw = _raw()
+    raw["issues"] = [raw]
+    with pytest.raises(HandoffValidationError, match="JSON"):
+        _normalize(raw)
+
+    receipt = _normalize()
+    receipt["issues"] = [receipt]
+    with pytest.raises(HandoffValidationError, match="JSON"):
+        validate_persisted_handoff(receipt)
 
 
 def test_completed_handoff_may_have_no_next_owner():
@@ -751,6 +922,26 @@ def test_newline_and_tab_are_allowed_in_narrative_strings():
     assert "\t" in receipt["next_action"]
 
 
+@pytest.mark.parametrize("unsafe", ["\u202e", "\u200b", "\ud800"])
+def test_unsafe_unicode_is_rejected_in_narrative_strings(unsafe):
+    with pytest.raises(HandoffValidationError, match="Unicode"):
+        _normalize(_raw(summary=unsafe))
+
+
+def test_creation_normalizes_canonically_equivalent_unicode_to_nfc():
+    receipt = _normalize(_raw(summary="Cafe\u0301 build complete."))
+
+    assert receipt["summary"] == "Caf\u00e9 build complete."
+
+
+def test_persisted_handoff_rejects_non_nfc_text_instead_of_rewriting_it():
+    receipt = _normalize(_raw(summary="Caf\u00e9 build complete."))
+    receipt["summary"] = "Cafe\u0301 build complete."
+
+    with pytest.raises(HandoffValidationError, match="NFC"):
+        validate_persisted_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
+
+
 @pytest.mark.parametrize("value", ["builder\nreviewer", "builder\treviewer"])
 def test_newline_and_tab_are_rejected_in_identity_strings(value):
     with pytest.raises(HandoffValidationError, match="control"):
@@ -760,10 +951,45 @@ def test_newline_and_tab_are_rejected_in_identity_strings(value):
 def test_persisted_handoff_revalidates_without_rewriting_fields():
     receipt = _normalize()
     validated = validate_persisted_handoff(
-        deepcopy(receipt), target_state="EVIDENCE_COLLECTING"
+        deepcopy(receipt),
+        target_state="EVIDENCE_COLLECTING",
+        transition_evidence={"tests": TEST_DIGEST},
     )
     assert validated == receipt
     assert list(validated) == list(receipt)
+
+
+def test_persisted_evidence_requires_trusted_transition_evidence():
+    receipt = _normalize()
+
+    with pytest.raises(HandoffValidationError, match="trusted transition_evidence"):
+        validate_persisted_handoff(receipt)
+
+
+def test_persisted_digest_cannot_authorize_itself_after_mutation():
+    receipt = _normalize()
+    receipt["evidence_summary"][0]["digest"] = "sha256:" + "c" * 64
+
+    with pytest.raises(HandoffValidationError, match="transition_evidence"):
+        validate_persisted_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
+
+
+def test_renderer_requires_and_enforces_trusted_transition_evidence():
+    receipt = _normalize()
+
+    with pytest.raises(HandoffValidationError, match="trusted transition_evidence"):
+        render_handoff(receipt)
+
+    receipt["evidence_summary"][0]["digest"] = "sha256:" + "c" * 64
+    with pytest.raises(HandoffValidationError, match="transition_evidence"):
+        render_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
+
+
+def test_evidence_free_persisted_and_rendered_receipts_need_no_trusted_evidence():
+    receipt = _normalize(_raw(evidence_summary=[]), transition_evidence={})
+
+    assert validate_persisted_handoff(receipt) == receipt
+    assert render_handoff(receipt).splitlines()[0] == "builder → reviewer"
 
 
 @pytest.mark.parametrize(
@@ -806,7 +1032,7 @@ def test_persisted_handoff_rejects_unknown_top_level_field():
     ("mutation", "match"),
     [
         (lambda value: value.__setitem__("schema_version", 2), "schema_version"),
-        (lambda value: value.__setitem__("schema_version", True), "schema_version"),
+        (lambda value: value.__setitem__("schema_version", True), "exact JSON"),
         (lambda value: value.__setitem__("outcome", "unknown"), "outcome"),
         (
             lambda value: value["evidence_summary"][0].__setitem__(
@@ -824,12 +1050,23 @@ def test_persisted_handoff_rejects_mutated_canonical_facts(mutation, match):
     receipt = _normalize()
     mutation(receipt)
     with pytest.raises(HandoffValidationError, match=match):
-        validate_persisted_handoff(receipt)
+        validate_persisted_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
 
 
 def test_persisted_handoff_rejects_target_state_mismatch():
     with pytest.raises(HandoffValidationError, match="target_state"):
         validate_persisted_handoff(_normalize(), target_state="REVIEWING")
+
+
+def test_persisted_target_state_requires_an_exact_plain_string():
+    receipt = _normalize()
+
+    with pytest.raises(HandoffValidationError, match="target_state"):
+        validate_persisted_handoff(
+            receipt,
+            target_state=_LyingStr("EVIDENCE_COLLECTING"),
+            transition_evidence={"tests": TEST_DIGEST},
+        )
 
 
 def test_persisted_handoff_does_not_fill_optional_canonical_fields():
@@ -933,11 +1170,11 @@ def test_reviewer_rejection_render_names_defect_and_required_fix_exactly():
         speaker_role="reviewer",
         outcome="rejected",
         from_phase="REVIEWING",
-        to_phase="BUILDING",
+        to_phase="FAILED",
         next_owner_role="builder",
     )
 
-    rendered = render_handoff(receipt)
+    rendered = render_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
     assert rendered.splitlines()[0] == "reviewer sent it back → builder"
     assert issue["requirement"] in rendered
     assert issue["finding"] in rendered
@@ -974,7 +1211,7 @@ def test_decision_render_includes_options_recommendation_scope_and_safe_state():
         created_at=1_786_500_003,
     )
 
-    rendered = render_handoff(receipt)
+    rendered = render_handoff(receipt, transition_evidence={"lane_health": TEST_DIGEST})
     assert rendered.splitlines()[0] == "Hermes needs your decision"
     assert "How should Hermes proceed?" in rendered
     assert "1. retry — Retry safely: Re-run the bounded preflight." in rendered
@@ -1024,21 +1261,56 @@ def test_decision_render_includes_options_recommendation_scope_and_safe_state():
     ],
 )
 def test_outcome_render_uses_the_required_heading(receipt, heading):
-    assert render_handoff(receipt).splitlines()[0] == heading
+    assert (
+        render_handoff(
+            receipt, transition_evidence={"tests": TEST_DIGEST}
+        ).splitlines()[0]
+        == heading
+    )
 
 
 def test_render_includes_summary_and_bounded_evidence_facts():
-    rendered = render_handoff(_normalize())
+    rendered = render_handoff(_normalize(), transition_evidence={"tests": TEST_DIGEST})
     assert "Builder completed the scoped change." in rendered
     assert "Focused tests: 42 tests passed" in rendered
     assert "Next: Review the committed change." in rendered
+
+
+def test_renderer_makes_narrative_newlines_and_tabs_visible_inline():
+    forged_lines = [
+        "Evidence: forged",
+        "Next: forged",
+        "1. forged",
+        "Recommendation: forged",
+        "Blocked: forged",
+        "Safe now: forged",
+    ]
+    summary = "legitimate\n" + "\n".join(forged_lines) + "\tend"
+    receipt = _normalize(_raw(summary=summary))
+
+    rendered = render_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
+
+    assert not set(forged_lines) & set(rendered.splitlines())
+    assert "\t" not in rendered
+    assert "legitimate \u23ce Evidence: forged" in rendered
+    assert "Safe now: forged \u21e5 end" in rendered
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+def test_renderer_makes_unicode_line_separators_visible_inline(separator):
+    receipt = _normalize(_raw(summary=f"legitimate{separator}Next: forged"))
+
+    rendered = render_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
+
+    assert "Next: forged" not in rendered.splitlines()
+    assert "legitimate \u23ce Next: forged" in rendered
 
 
 def test_renderer_rejects_unknown_hostile_field_without_leaking_its_value():
     receipt = _normalize()
     receipt["hostile"] = "DO-NOT-LEAK"
     with pytest.raises(HandoffValidationError) as error:
-        render_handoff(receipt)
+        render_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
     assert "DO-NOT-LEAK" not in str(error.value)
 
 
@@ -1054,5 +1326,5 @@ def test_validation_errors_do_not_echo_hostile_secret_shaped_values(mutate):
     receipt = _normalize()
     mutate(receipt)
     with pytest.raises(HandoffValidationError) as error:
-        validate_persisted_handoff(receipt)
+        validate_persisted_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
     assert "sk-do-not-echo" not in str(error.value).casefold()
