@@ -48,6 +48,7 @@ _INFRA_REASONS = frozenset({
     "REVIEWER_PROCESS_FAILED",
     "CLEANUP_FAILED",
     "RESULT_CLEANUP_FAILED",
+    "HANDOFF_INCOMPLETE",
 })
 _REASON_CODE = re.compile(r"\A[A-Z][A-Z0-9_]{0,63}\Z")
 _DIGEST = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
@@ -138,7 +139,7 @@ def classify_failure(signal: FailureSignal) -> FailureDecision:
     if signal.safety_gate or reason in _SAFETY_REASONS:
         return FailureDecision(
             "SAFETY_GATE",
-            reason if reason in _SAFETY_REASONS else "SAFETY_GATE",
+            reason if reason is not None else "SAFETY_GATE",
             "HUMAN_ACTION",
         )
     if (
@@ -163,6 +164,9 @@ def decide_retry(
     *,
     evidence_digest: str,
     failure_class: str,
+    prior_failure_digest: str | None = None,
+    changed_evidence_digest: str | None = None,
+    what_changed: str | None = None,
     policy: RetryPolicy = RetryPolicy(),
 ) -> RetryDecision:
     """Return a deterministic decision without mutating attempt state."""
@@ -173,7 +177,30 @@ def decide_retry(
         return RetryDecision("HUMAN_ACTION", f"{failure_class}_REQUIRES_HUMAN", 0)
     if failure_class not in {"PROVIDER", "INFRA_FAILURE", "TASK_FAILURE"}:
         return RetryDecision("BLOCKED", "UNSUPPORTED_FAILURE_CLASS", 0)
-    if any(item.evidence_digest == evidence_digest for item in history):
+    # Keep the original API usable for old callers, while requiring the
+    # stronger three-part correction proof whenever a dispatcher supplies it.
+    if any(
+        value is not None
+        for value in (prior_failure_digest, changed_evidence_digest, what_changed)
+    ) and (
+        not prior_failure_digest
+        or not changed_evidence_digest
+        or not isinstance(what_changed, str)
+        or not what_changed.strip()
+    ):
+        return RetryDecision("BLOCKED", "RETRY_REQUIRES_CHANGED_EVIDENCE", 0)
+    if (
+        changed_evidence_digest is not None
+        and not _DIGEST.fullmatch(changed_evidence_digest)
+    ) or (
+        prior_failure_digest is not None
+        and not _DIGEST.fullmatch(prior_failure_digest)
+    ):
+        return RetryDecision("BLOCKED", "RETRY_REQUIRES_CHANGED_EVIDENCE", 0)
+    if any(
+        item.evidence_digest in {evidence_digest, changed_evidence_digest}
+        for item in history
+    ):
         return RetryDecision("BLOCKED", "RETRY_REJECTED_NO_NEW_EVIDENCE", 0)
     if len(history) >= policy.max_attempts:
         return RetryDecision("BLOCKED", "RETRY_LIMIT", 0)

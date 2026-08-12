@@ -27,6 +27,7 @@ from hermes_cli import jobs_execution
 from hermes_cli import jobs_executors
 from hermes_cli import jobs_graph as graph
 from hermes_cli import jobs_harness as harness
+from hermes_cli import jobs_handoffs
 from hermes_cli import jobs_loop
 from hermes_cli import jobs_lanes
 from hermes_cli import jobs_receipts
@@ -49,6 +50,7 @@ WORKSPACE_KINDS = frozenset({"worktree"})
 MAX_TURNS_CEILING = 500
 
 _SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
+_DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _HEADER_KEY_RE = re.compile(r"\A[A-Z][A-Z0-9_]*\Z")
 
 
@@ -243,6 +245,7 @@ class DispatchContext:
     lane_root: Optional[Path] = None
     effort: str = "max"
     max_turns: int = 120
+    prior_handoff: Optional[Mapping[str, object]] = None
 
 
 @dataclass(frozen=True)
@@ -253,6 +256,7 @@ class ActivationDecision:
     reason_code: str
     activation_gate_digest: str
     completion_receipt_digest: str
+    completion_handoff: Optional[Mapping[str, object]] = None
 
 
 @dataclass(frozen=True)
@@ -311,6 +315,251 @@ def _execution_spec_digest(spec: DispatchSpec) -> str:
             ),
             "lane_root": None if spec.lane_root is None else str(spec.lane_root),
         }
+    )
+
+
+def _observed_commit(worktree: Path) -> Optional[str]:
+    """Read the candidate identity from Git, never from provider narration."""
+
+    try:
+        observed = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return observed if _SHA_RE.fullmatch(observed) else None
+
+
+def _latest_prior_handoff(conn, job_id: str) -> Optional[Mapping[str, object]]:
+    """Load only the latest persisted rejection/blocker for correction context."""
+
+    attempts = jdb.get_attempts(conn, job_id)
+    for attempt in reversed(attempts):
+        handoff = jdb.latest_handoff(conn, str(attempt["id"]))
+        if handoff is None or handoff.get("to_phase") not in {"FAILED", "BLOCKED"}:
+            continue
+        if handoff.get("outcome") not in {"rejected", "blocked"}:
+            continue
+        return dict(handoff)
+    return None
+
+
+def _handoff_facts(evidence: Mapping[str, str]) -> list[dict[str, str]]:
+    return [
+        {"label": key, "result": "observed", "digest": digest}
+        for key, digest in list(evidence.items())[:8]
+    ]
+
+
+def _provider_handoff_value(
+    value: object,
+    *,
+    summary: str,
+    next_action: str,
+    issues: list[dict[str, str]] | None = None,
+) -> tuple[str, str, list[dict[str, str]]]:
+    if isinstance(value, Mapping):
+        safe_summary = value.get("summary")
+        safe_next = value.get("next_action")
+        if isinstance(safe_summary, str) and safe_summary.strip():
+            summary = safe_summary
+        if isinstance(safe_next, str) and safe_next.strip():
+            next_action = safe_next
+        raw_issues = value.get("issues")
+        if issues is None and isinstance(raw_issues, list):
+            issues = [
+                {
+                    "requirement": str(item.get("requirement", "review requirement")),
+                    "finding": str(item.get("finding", "unresolved finding")),
+                    "required_fix": str(item.get("required_fix", next_action)),
+                }
+                for item in raw_issues
+                if isinstance(item, Mapping)
+            ]
+    return summary, next_action, issues or []
+
+
+def _valid_execution_handoff(value: object, *, executor: str, kind: str) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    provider = executor.capitalize()
+    expected = {
+        "builder": (f"{provider} Builder", f"{provider} Tester"),
+        "tester": (f"{provider} Tester", "Independent Reviewer"),
+        "reviewer": ("Independent Reviewer", "Hermes"),
+    }[kind]
+    if kind == "reviewer" and value.get("verdict") != "PASS":
+        expected = (expected[0], f"{provider} Builder")
+    if (
+        value.get("speaker_role") != expected[0]
+        or value.get("speaker_executor") != executor
+        or value.get("next_owner_role") != expected[1]
+        or not isinstance(value.get("summary"), str)
+        or not isinstance(value.get("next_action"), str)
+    ):
+        return False
+    if kind == "reviewer":
+        verdict = value.get("verdict")
+        issues = value.get("issues")
+        if verdict not in {"PASS", "NEEDS_CHANGES", "UNABLE_TO_VERIFY"}:
+            return False
+        if not isinstance(issues, list):
+            return False
+        if verdict == "PASS" and issues:
+            return False
+        if verdict != "PASS" and not issues:
+            return False
+    return True
+
+
+def _transition_handoff(
+    *,
+    job_id: str,
+    attempt_id: str,
+    initiator_id: str,
+    executor: str,
+    source: Optional[str],
+    target: str,
+    evidence: Mapping[str, str],
+    commit: str,
+    created_at: int,
+    provider_handoff: object = None,
+    failure_class: Optional[str] = None,
+    blocker_code: Optional[str] = None,
+) -> dict[str, object]:
+    """Create the smallest canonical handoff for one graph edge."""
+
+    provider_name = executor.capitalize()
+    if target == "QUEUED":
+        role, speaker_executor, owner = "Hermes", "hermes", f"{provider_name} Builder"
+        outcome, summary, next_action, issues = (
+            "started",
+            "Hermes queued the claimed attempt.",
+            "Assign the attempt to its selected lane.",
+            [],
+        )
+    elif target == "ASSIGNED":
+        role, speaker_executor, owner = "Hermes", "hermes", f"{provider_name} Builder"
+        outcome, summary, next_action, issues = (
+            "handed_off",
+            "Hermes assigned the attempt after preflight and custody evidence.",
+            "Start the isolated worktree attempt.",
+            [],
+        )
+    elif target == "BUILDING":
+        role, speaker_executor, owner = "Hermes", "hermes", f"{provider_name} Builder"
+        outcome, summary, next_action, issues = (
+            "started",
+            "Hermes started the isolated attempt; this is an internal signed edge.",
+            "Collect executor evidence.",
+            [],
+        )
+    elif target == "EVIDENCE_COLLECTING":
+        role, speaker_executor, owner = f"{provider_name} Builder", executor, f"{provider_name} Tester"
+        outcome, summary, next_action, issues = (
+            "handed_off",
+            "The builder returned the observed candidate and evidence.",
+            "Independently verify the recorded tests and artifacts.",
+            [],
+        )
+        summary, next_action, issues = _provider_handoff_value(
+            provider_handoff, summary=summary, next_action=next_action
+        )
+    elif target == "REVIEWING":
+        role, speaker_executor, owner = f"{provider_name} Tester", executor, "Independent Reviewer"
+        outcome, summary, next_action, issues = (
+            "handed_off",
+            "The tester verified the bounded artifact readbacks.",
+            "Review the exact observed candidate and evidence.",
+            [],
+        )
+        summary, next_action, issues = _provider_handoff_value(
+            provider_handoff, summary=summary, next_action=next_action
+        )
+    elif target == "VERIFIED":
+        role, speaker_executor, owner = "Independent Reviewer", executor, "Hermes"
+        outcome, summary, next_action, issues = (
+            "passed",
+            "The independent reviewer approved the observed candidate.",
+            "Evaluate the explicit activation gate.",
+            [],
+        )
+        summary, next_action, issues = _provider_handoff_value(
+            provider_handoff, summary=summary, next_action=next_action
+        )
+    elif target == "BLOCKED":
+        role, speaker_executor, owner = "Hermes", "hermes", "Brandon"
+        outcome, summary, next_action, issues = (
+            "blocked",
+            f"Hermes blocked the attempt: {blocker_code or 'evidence required'}.",
+            "Choose one of the bounded recovery options.",
+            [],
+        )
+    elif target == "COMPLETED":
+        role, speaker_executor, owner = "Hermes", "hermes", None
+        outcome, summary, next_action, issues = (
+            "completed",
+            "Hermes activated the explicitly authorized candidate.",
+            "Keep the bounded rollback path available.",
+            [],
+        )
+        summary, next_action, issues = _provider_handoff_value(
+            provider_handoff, summary=summary, next_action=next_action
+        )
+    else:  # FAILED
+        role, speaker_executor, owner = "Hermes", "hermes", f"{provider_name} Builder"
+        outcome, summary, next_action, issues = (
+            "rejected",
+            f"Hermes rejected the attempt: {failure_class or 'failure'}.",
+            "Correct the recorded failure and submit changed evidence.",
+            [{
+                "requirement": "Reliability evidence",
+                "finding": failure_class or "attempt failed",
+                "required_fix": "Provide changed, independently readable evidence.",
+            }],
+        )
+        summary, next_action, provider_issues = _provider_handoff_value(
+            provider_handoff, summary=summary, next_action=next_action, issues=issues
+        )
+        issues = provider_issues or issues
+    raw = {
+        "summary": summary,
+        "evidence_summary": _handoff_facts(evidence),
+        "next_action": next_action,
+        "issues": issues,
+        "decision_request": None,
+    }
+    if target == "BLOCKED":
+        raw["decision_request"] = {
+            "question": "How should Hermes recover this blocked attempt?",
+            "options": [
+                {"id": "human_fix", "label": "Fix the blocker", "consequence": "Resume only after new evidence is recorded."},
+                {"id": "leave_blocked", "label": "Keep it blocked", "consequence": "No provider work or completion occurs."},
+            ],
+            "recommendation": "human_fix",
+            "recommendation_reason": "The blocker is bounded and recoverable without guessing.",
+            "blocked_scope": "This Jobs attempt only.",
+            "safe_state": "No unverified candidate is activated.",
+            "next_owner_role": "Brandon",
+        }
+    artifact = {"kind": "commit", "value": commit}
+    return jobs_handoffs.normalize_handoff(
+        raw,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        speaker_id=initiator_id,
+        speaker_role=role,
+        speaker_executor=speaker_executor,
+        from_phase="ATTEMPT_CREATED" if source is None and target == "QUEUED" else str(source),
+        to_phase=target,
+        next_owner_role=owner,
+        outcome=outcome,
+        artifact_identity=artifact,
+        transition_evidence=dict(evidence),
+        created_at=created_at,
     )
 
 
@@ -671,6 +920,7 @@ def dispatch_once(
         lane_root=None if spec.lane_root is None else Path(spec.lane_root),
         effort=spec.effort,
         max_turns=spec.max_turns,
+        prior_handoff=_latest_prior_handoff(conn, job.id),
     )
     sequence = 0
 
@@ -681,6 +931,7 @@ def dispatch_once(
         commit: str,
         failure_class: Optional[str] = None,
         blocker_code: Optional[str] = None,
+        provider_handoff: object = None,
     ) -> graph.TransitionRecord:
         nonlocal sequence
         latest = jdb.latest_transition(conn, attempt_id)
@@ -706,6 +957,20 @@ def dispatch_once(
                 f"dispatch:{source_state or 'NONE'}:{target_state}"
             ),
             created_at=int(now) + sequence,
+            handoff=_transition_handoff(
+                job_id=job.id,
+                attempt_id=attempt_id,
+                initiator_id=worker_id,
+                executor=identity.executor,
+                source=source_state,
+                target=target_state,
+                evidence=evidence,
+                commit=commit,
+                created_at=int(now) + sequence,
+                provider_handoff=provider_handoff,
+                failure_class=failure_class,
+                blocker_code=blocker_code,
+            ),
         )
         envelope = signer.sign(
             {
@@ -714,6 +979,7 @@ def dispatch_once(
                 "commit": commit,
                 "state": target_state,
                 "evidence": dict(evidence),
+                "handoff": request.handoff,
                 "timestamp": observed_at,
                 "transitioned_by": "jobs_dispatch/1",
             },
@@ -729,6 +995,7 @@ def dispatch_once(
         evidence_digest: str,
         commit: str,
         force_blocked: bool = False,
+        provider_handoff: object = None,
     ) -> DispatchResult:
         decision = jobs_loop.classify_failure(signal)
         reported_reason = decision.reason_code
@@ -736,7 +1003,21 @@ def dispatch_once(
         recovery = decision.recovery_decision
         target = "FAILED"
         blocker_code: Optional[str] = None
-        if decision.failure_class in {"AUTH_INFRA", "SAFETY_GATE"}:
+        user_blocker_codes = {
+            "AUTH_REQUIRED",
+            "CREDENTIALS_EXPIRED",
+            "MISSING_LANE_LOGIN",
+            "SSH_AUTH_FAILED",
+            "TOKEN_EXPIRED",
+            "UNAUTHORIZED",
+            "APPROVAL_REQUIRED",
+            "IRREVERSIBLE_ACTION",
+            "SAFETY_GATE",
+        }
+        if (
+            decision.failure_class in {"AUTH_INFRA", "SAFETY_GATE"}
+            and decision.reason_code in user_blocker_codes
+        ):
             target = "BLOCKED"
             retry_action = "HUMAN_ACTION"
             blocker_code = decision.reason_code
@@ -757,6 +1038,17 @@ def dispatch_once(
                 ],
                 evidence_digest=evidence_digest,
                 failure_class=decision.failure_class,
+                prior_failure_digest=(
+                    str(history_rows[-1]["evidence_digest"])
+                    if history_rows
+                    else evidence_digest
+                ),
+                changed_evidence_digest=evidence_digest,
+                what_changed=(
+                    "first observed failure"
+                    if not history_rows
+                    else "new attempt evidence digest"
+                ),
             )
             stored = jdb.record_retry_decision(
                 conn,
@@ -779,10 +1071,24 @@ def dispatch_once(
                 blocker_code = str(stored["reason_code"])
                 reported_reason = blocker_code
         if force_blocked:
-            target = "BLOCKED"
-            retry_action = retry_action or "HUMAN_ACTION"
-            recovery = retry_action
-            blocker_code = decision.reason_code
+            # Only bounded evidence blockers may surface as a user decision;
+            # unknown codes remain diagnostic failures, never user-facing BLOCKED.
+            if decision.reason_code in {
+                "READBACK_MISSING",
+                "READBACK_FAILED",
+                "READBACK_SIZE_MISMATCH",
+                "READBACK_DIGEST_MISMATCH",
+                "DUPLICATE_ARTIFACT_CLAIM",
+                "TEST_EVIDENCE_MISSING",
+                "HANDOFF_INCOMPLETE",
+            }:
+                target = "BLOCKED"
+                retry_action = retry_action or "HUMAN_ACTION"
+                recovery = retry_action
+                blocker_code = "EVIDENCE_REQUIRED"
+            else:
+                target = "FAILED"
+                blocker_code = None
 
         if placement_id is not None:
             placement = jdb.get_lane_placement(conn, placement_id)
@@ -805,6 +1111,10 @@ def dispatch_once(
             commit=commit,
             failure_class=decision.failure_class,
             blocker_code=blocker_code,
+            provider_handoff=(provider_handoff if provider_handoff is not None else {
+                "summary": f"Failure evidence is {evidence_digest}.",
+                "next_action": "Resolve the blocker and provide changed evidence.",
+            }),
         )
         journal_error = None
         try:
@@ -877,6 +1187,13 @@ def dispatch_once(
                     else [check.evidence_digest for check in preflight.checks]
                 )
             ),
+            "claim": _digest({"job_id": job.id, "worker_id": worker_id}),
+            "worktree": _digest(
+                {"path": str(planned_worktree), "branch": spec.branch}
+            ),
+            "attempt_started": _digest(
+                {"attempt_id": attempt_id, "ordinal": int(attempt["ordinal"])}
+            ),
         },
         commit=spec.base_commit,
     )
@@ -927,7 +1244,24 @@ def dispatch_once(
             ),
             commit=spec.base_commit,
         )
-    candidate = execution.commit or spec.base_commit
+    observed_candidate = _observed_commit(execution.worktree)
+    candidate = observed_candidate or execution.commit or spec.base_commit
+    for kind, value in (
+        ("builder", execution.builder_handoff),
+        ("tester", execution.tester_handoff),
+        ("reviewer", execution.reviewer_handoff),
+    ):
+        if value is not None and not _valid_execution_handoff(
+            value, executor=identity.executor, kind=kind
+        ):
+            return fail(
+                jobs_loop.FailureSignal(
+                    reason_code="HANDOFF_INCOMPLETE", stage="handoff"
+                ),
+                evidence_digest=_digest({"malformed": f"{kind}_handoff"}),
+                commit=candidate if _SHA_RE.fullmatch(candidate) else spec.base_commit,
+                force_blocked=True,
+            )
     if execution.status != "succeeded":
         return fail(
             jobs_loop.FailureSignal(
@@ -943,6 +1277,37 @@ def dispatch_once(
                 }
             ),
             commit=candidate,
+            provider_handoff=execution.reviewer_handoff or execution.builder_handoff,
+        )
+    if execution.builder_handoff is None:
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="HANDOFF_INCOMPLETE", stage="handoff"
+            ),
+            evidence_digest=_digest({"missing": "builder_handoff"}),
+            commit=spec.base_commit,
+            force_blocked=True,
+        )
+    if observed_candidate is None:
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="NO_CANDIDATE_COMMIT", stage="executor"
+            ),
+            evidence_digest=_digest({"observed_commit": None}),
+            commit=spec.base_commit,
+        )
+    if execution.commit not in {None, observed_candidate}:
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="NO_CANDIDATE_COMMIT", stage="executor"
+            ),
+            evidence_digest=_digest(
+                {
+                    "reported_commit": execution.commit,
+                    "observed_commit": observed_candidate,
+                }
+            ),
+            commit=spec.base_commit,
         )
     if _SHA_RE.fullmatch(candidate) is None or candidate == spec.base_commit:
         return fail(
@@ -960,8 +1325,10 @@ def dispatch_once(
         {
             "executor_exit": execution.executor_exit_digest,
             "output_capture": execution.output_capture_digest,
+            "builder_handoff": _digest(execution.builder_handoff),
         },
         commit=candidate,
+        provider_handoff=execution.builder_handoff,
     )
     if not execution.artifacts:
         return fail(
@@ -1021,6 +1388,15 @@ def dispatch_once(
             commit=candidate,
             force_blocked=True,
         )
+    if execution.tester_handoff is None:
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="HANDOFF_INCOMPLETE", stage="handoff"
+            ),
+            evidence_digest=_digest({"missing": "tester_handoff"}),
+            commit=candidate,
+            force_blocked=True,
+        )
     advance(
         "REVIEWING",
         {
@@ -1036,8 +1412,10 @@ def dispatch_once(
                     for item in readbacks
                 ]
             ),
+            "tester_handoff": _digest(execution.tester_handoff),
         },
         commit=candidate,
+        provider_handoff=execution.tester_handoff,
     )
 
     try:
@@ -1083,6 +1461,8 @@ def dispatch_once(
                 }
             ),
             commit=candidate,
+            force_blocked=False,
+            provider_handoff=execution.reviewer_handoff,
         )
     if (
         gate_evidence.commit != candidate
@@ -1098,6 +1478,15 @@ def dispatch_once(
             failure_class="INFRA_FAILURE",
             commit=candidate,
         )
+    if execution.reviewer_handoff is None:
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="HANDOFF_INCOMPLETE", stage="handoff"
+            ),
+            evidence_digest=_digest({"missing": "reviewer_handoff"}),
+            commit=candidate,
+            force_blocked=True,
+        )
     advance(
         "VERIFIED",
         {
@@ -1105,8 +1494,10 @@ def dispatch_once(
             "receipt_verification": (
                 gate_evidence.receipt_verification_digest
             ),
+            "reviewer_handoff": _digest(execution.reviewer_handoff),
         },
         commit=candidate,
+        provider_handoff=execution.reviewer_handoff,
     )
 
     if placement_id is not None:
@@ -1162,13 +1553,72 @@ def dispatch_once(
             commit=candidate,
             force_blocked=True,
         )
+    required_completion_fields = {
+        "summary",
+        "next_action",
+        "observed_candidate",
+        "environment",
+        "gate_digest",
+        "rollback",
+    }
+    if (
+        not isinstance(activation.completion_handoff, Mapping)
+        or not required_completion_fields.issubset(activation.completion_handoff)
+        or any(
+            not isinstance(activation.completion_handoff.get(field), str)
+            or not activation.completion_handoff.get(field).strip()
+            or len(activation.completion_handoff.get(field)) > 700
+            for field in required_completion_fields
+        )
+    ):
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="ACTIVATION_HANDOFF_INCOMPLETE", safety_gate=True
+            ),
+            evidence_digest=_digest({"activation": "completion_handoff_missing"}),
+            commit=candidate,
+            force_blocked=True,
+        )
+    if (
+        _SHA_RE.fullmatch(str(activation.completion_handoff["observed_candidate"]))
+        is None
+        or not _DIGEST_RE.fullmatch(
+            str(activation.completion_handoff["gate_digest"])
+        )
+    ):
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="ACTIVATION_HANDOFF_INCOMPLETE", safety_gate=True
+            ),
+            evidence_digest=_digest({"activation": "completion_handoff_malformed"}),
+            commit=candidate,
+            force_blocked=True,
+        )
+    if str(activation.completion_handoff.get("observed_candidate", candidate)) != candidate:
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="ACTIVATION_CANDIDATE_MISMATCH", safety_gate=True
+            ),
+            evidence_digest=_digest(
+                {
+                    "observed_candidate": activation.completion_handoff.get(
+                        "observed_candidate"
+                    ),
+                    "candidate": candidate,
+                }
+            ),
+            commit=candidate,
+            force_blocked=True,
+        )
     advance(
         "COMPLETED",
         {
             "activation_gate": activation.activation_gate_digest,
             "completion_receipt": activation.completion_receipt_digest,
+            "completion_handoff": _digest(activation.completion_handoff),
         },
         commit=candidate,
+        provider_handoff=activation.completion_handoff,
     )
     return DispatchResult(
         claimed=True,

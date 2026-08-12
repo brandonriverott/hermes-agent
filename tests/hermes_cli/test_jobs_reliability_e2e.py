@@ -255,6 +255,29 @@ def _passing_executor(rig):
             artifacts=(output_claim, tests_claim),
             executor_exit_digest=_digest(b"exit:0"),
             output_capture_digest=output_claim.digest,
+            builder_handoff={
+                "speaker_role": "Claude Builder",
+                "speaker_executor": "claude",
+                "summary": "I built the candidate.",
+                "next_action": "Verify the recorded artifacts.",
+                "next_owner_role": "Claude Tester",
+            },
+            tester_handoff={
+                "speaker_role": "Claude Tester",
+                "speaker_executor": "claude",
+                "summary": "I ran the recorded checks.",
+                "next_action": "Review the observed candidate.",
+                "next_owner_role": "Independent Reviewer",
+            },
+            reviewer_handoff={
+                "speaker_role": "Independent Reviewer",
+                "speaker_executor": "claude",
+                "summary": "I independently reviewed the candidate.",
+                "next_action": "Authorize completion.",
+                "next_owner_role": "Hermes",
+                "verdict": "PASS",
+                "issues": [],
+            },
         )
 
     return execute
@@ -291,6 +314,14 @@ def _passing_activation(_context, _gate):
         reason_code="OK",
         activation_gate_digest=_digest(b"fake activation policy passed"),
         completion_receipt_digest=_digest(b"fake completion receipt"),
+        completion_handoff={
+            "summary": "Hermes authorized the observed candidate.",
+            "next_action": "Keep rollback available.",
+            "observed_candidate": _gate.commit,
+            "environment": "lane:e2e",
+            "gate_digest": _digest(b"fake activation policy passed"),
+            "rollback": "bounded rollback available",
+        },
     )
 
 
@@ -433,17 +464,30 @@ def test_ssh_preflight_block_has_no_claim_or_attempt(reliability_rig):
 def test_readback_mismatch_blocks_before_reviewing(reliability_rig):
     def tampering_executor(context):
         context.worktree.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(context.worktree)], check=True)
+        subprocess.run(["git", "-C", str(context.worktree), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(context.worktree), "config", "user.name", "Test"], check=True)
+        (context.worktree / "README").write_text("base", encoding="utf-8")
+        subprocess.run(["git", "-C", str(context.worktree), "add", "README"], check=True)
+        subprocess.run(["git", "-C", str(context.worktree), "commit", "-qm", "base"], check=True)
         tests_path = context.worktree / "tests.json"
         tests_path.write_bytes(b"claimed")
         claim = adapter.claim_artifact(tests_path, name="tests")
         tests_path.write_bytes(b"changed")
         return adapter.ReliabilityExecution(
             status="succeeded",
-            commit="c" * 40,
+            commit=subprocess.run(["git", "-C", str(context.worktree), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip(),
             worktree=context.worktree,
             artifacts=(claim,),
             executor_exit_digest=_digest(b"exit:0"),
             output_capture_digest=_digest(b"capture"),
+            builder_handoff={
+                "speaker_role": "Claude Builder",
+                "speaker_executor": "claude",
+                "summary": "I built the candidate.",
+                "next_action": "Verify the recorded artifacts.",
+                "next_owner_role": "Claude Tester",
+            },
         )
 
     result = reliability_rig.run(tampering_executor)
@@ -462,6 +506,12 @@ def test_readback_mismatch_blocks_before_reviewing(reliability_rig):
 def test_forged_done_never_reaches_verified(reliability_rig):
     def executor(context):
         context.worktree.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(context.worktree)], check=True)
+        subprocess.run(["git", "-C", str(context.worktree), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(context.worktree), "config", "user.name", "Test"], check=True)
+        (context.worktree / "README").write_text("base", encoding="utf-8")
+        subprocess.run(["git", "-C", str(context.worktree), "add", "README"], check=True)
+        subprocess.run(["git", "-C", str(context.worktree), "commit", "-qm", "base"], check=True)
         tests_path = context.worktree / "tests.json"
         tests_path.write_bytes(b"tests passed")
         (reliability_rig.gate_dir / "done.json").write_text(
@@ -481,11 +531,34 @@ def test_forged_done_never_reaches_verified(reliability_rig):
         )
         return adapter.ReliabilityExecution(
             status="succeeded",
-            commit="c" * 40,
+            commit=subprocess.run(["git", "-C", str(context.worktree), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip(),
             worktree=context.worktree,
             artifacts=(adapter.claim_artifact(tests_path, name="tests"),),
             executor_exit_digest=_digest(b"exit:0"),
             output_capture_digest=_digest(b"capture"),
+            builder_handoff={
+                "speaker_role": "Claude Builder",
+                "speaker_executor": "claude",
+                "summary": "I built the candidate.",
+                "next_action": "Verify the recorded artifacts.",
+                "next_owner_role": "Claude Tester",
+            },
+            tester_handoff={
+                "speaker_role": "Claude Tester",
+                "speaker_executor": "claude",
+                "summary": "I ran the recorded checks.",
+                "next_action": "Review the observed candidate.",
+                "next_owner_role": "Independent Reviewer",
+            },
+            reviewer_handoff={
+                "speaker_role": "Independent Reviewer",
+                "speaker_executor": "claude",
+                "summary": "I reviewed the candidate.",
+                "next_action": "Authorize completion.",
+                "next_owner_role": "Hermes",
+                "verdict": "PASS",
+                "issues": [],
+            },
         )
 
     def forged_gate(context, _execution):

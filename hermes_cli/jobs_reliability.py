@@ -919,6 +919,20 @@ def _provider_command(
 
 def _build_prompt(context: object) -> bytes:
     builder, _ = _worker_roles(str(getattr(context, "executor")))
+    prior = getattr(context, "prior_handoff", None)
+    previous = ""
+    if prior is not None:
+        try:
+            previous_json = json.dumps(
+                prior, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise jobs_execution.AdapterError(
+                "previous handoff is not bounded JSON"
+            ) from exc
+        if len(previous_json) > 3000:
+            raise jobs_execution.AdapterError("previous handoff exceeds its bound")
+        previous = f"\nPREVIOUS VERIFIED HANDOFF\n{previous_json}\n"
     return (
         f"You are the {builder}. Complete the Job below in this isolated "
         "worktree. Run the relevant tests, commit the finished change, and "
@@ -927,6 +941,7 @@ def _build_prompt(context: object) -> bytes:
         "Write the handoff summary and next action in first-person as the "
         "builder who performed the work. Do not include raw output or secrets.\n\n"
         + str(getattr(context, "goal"))
+        + previous
     ).encode("utf-8")
 
 
@@ -1946,6 +1961,14 @@ def production_completion_gate(context: object, gate: object):
         reason_code="OK",
         activation_gate_digest=gate_digest,
         completion_receipt_digest=completion_digest,
+        completion_handoff={
+            "summary": "Hermes verified the observed candidate and authorized completion.",
+            "next_action": "Record the bounded activation receipt and keep rollback available.",
+            "observed_candidate": str(getattr(gate, "commit")),
+            "environment": str(getattr(context, "lane_id")),
+            "gate_digest": gate_digest,
+            "rollback": "rollback remains bounded to the observed candidate and lane",
+        },
     )
 
 
