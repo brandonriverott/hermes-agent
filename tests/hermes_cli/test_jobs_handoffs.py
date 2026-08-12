@@ -603,12 +603,41 @@ def test_decision_option_fields_are_nonempty_and_bounded(field, value):
         )
 
 
-def test_decision_next_owner_must_match_the_handoff_owner():
+def test_blocked_handoff_distinguishes_decision_and_post_decision_owners():
+    receipt = _normalize(
+        _raw(decision_request=_decision(next_owner_role="Hermes Dispatcher")),
+        outcome="blocked",
+        next_owner_role="Brandon",
+    )
+
+    assert receipt["next_owner_role"] == "Brandon"
+    assert receipt["decision_request"]["next_owner_role"] == "Hermes Dispatcher"
+
+
+@pytest.mark.parametrize("decision_owner_role", [None, ""])
+def test_blocked_handoff_rejects_missing_or_invalid_decision_owner(
+    decision_owner_role,
+):
     with pytest.raises(HandoffValidationError, match="next_owner_role"):
         _normalize(
-            _raw(decision_request=_decision(next_owner_role="maintainer")),
+            _raw(decision_request=_decision(next_owner_role="Hermes Dispatcher")),
             outcome="blocked",
-            next_owner_role="operator",
+            next_owner_role=decision_owner_role,
+        )
+
+
+@pytest.mark.parametrize("post_decision_owner_role", [None, ""])
+def test_blocked_handoff_rejects_missing_or_invalid_post_decision_owner(
+    post_decision_owner_role,
+):
+    decision = _decision(next_owner_role=post_decision_owner_role)
+    if post_decision_owner_role is None:
+        del decision["next_owner_role"]
+    with pytest.raises(HandoffValidationError, match="next_owner_role"):
+        _normalize(
+            _raw(decision_request=decision),
+            outcome="blocked",
+            next_owner_role="Brandon",
         )
 
 
@@ -851,7 +880,8 @@ def test_blocker_helper_builds_a_complete_decision_without_logs_or_goals():
         speaker_role="dispatcher",
         speaker_executor="hermes",
         from_phase="ASSIGNED",
-        next_owner_role="operator",
+        decision_owner_role="Brandon",
+        post_decision_owner_role="Hermes Dispatcher",
         summary="The selected lane cannot safely start.",
         evidence_summary=[
             {
@@ -873,6 +903,7 @@ def test_blocker_helper_builds_a_complete_decision_without_logs_or_goals():
 
     assert receipt["to_phase"] == "BLOCKED"
     assert receipt["outcome"] == "blocked"
+    assert receipt["next_owner_role"] == "Brandon"
     assert receipt["decision_request"] == {
         "question": "How should Hermes proceed?",
         "options": _decision()["options"],
@@ -880,7 +911,7 @@ def test_blocker_helper_builds_a_complete_decision_without_logs_or_goals():
         "recommendation_reason": "Retry preserves the current safe state.",
         "blocked_scope": "Only this Job is blocked.",
         "safe_state": "No executor has started and no files changed.",
-        "next_owner_role": "operator",
+        "next_owner_role": "Hermes Dispatcher",
     }
     canonical_text = str(receipt).lower()
     assert "output.log" not in canonical_text
@@ -922,7 +953,8 @@ def test_decision_render_includes_options_recommendation_scope_and_safe_state():
         speaker_role="dispatcher",
         speaker_executor="hermes",
         from_phase="ASSIGNED",
-        next_owner_role="operator",
+        decision_owner_role="Brandon",
+        post_decision_owner_role="Hermes Dispatcher",
         summary="The selected lane cannot safely start.",
         evidence_summary=[
             {

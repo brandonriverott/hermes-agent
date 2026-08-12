@@ -393,10 +393,6 @@ def normalize_handoff(
             raise HandoffValidationError(
                 "blocked handoff requires a complete decision_request"
             )
-        if decision_request["next_owner_role"] != next_owner_role:
-            raise HandoffValidationError(
-                "decision_request.next_owner_role must match next_owner_role"
-            )
     elif decision_request is not None:
         raise HandoffValidationError(
             "decision_request is allowed only for a blocked handoff"
@@ -535,7 +531,8 @@ def blocker_handoff(
     speaker_role: str,
     speaker_executor: str,
     from_phase: str,
-    next_owner_role: str,
+    decision_owner_role: str,
+    post_decision_owner_role: str,
     summary: str,
     evidence_summary: Sequence[Mapping[str, object]],
     next_action: str,
@@ -550,7 +547,7 @@ def blocker_handoff(
     issues: Sequence[Mapping[str, object]] = (),
     artifact_identity: Mapping[str, object] | None = None,
 ) -> dict:
-    """Build a complete bounded blocker decision from explicit safe facts."""
+    """Build a blocker for one decision owner and a distinct follow-up owner."""
 
     return normalize_handoff(
         {
@@ -565,7 +562,7 @@ def blocker_handoff(
                 "recommendation_reason": recommendation_reason,
                 "blocked_scope": blocked_scope,
                 "safe_state": safe_state,
-                "next_owner_role": next_owner_role,
+                "next_owner_role": post_decision_owner_role,
             },
         },
         job_id=job_id,
@@ -575,7 +572,7 @@ def blocker_handoff(
         speaker_executor=speaker_executor,
         from_phase=from_phase,
         to_phase="BLOCKED",
-        next_owner_role=next_owner_role,
+        next_owner_role=decision_owner_role,
         outcome="blocked",
         artifact_identity=artifact_identity,
         transition_evidence=transition_evidence,
