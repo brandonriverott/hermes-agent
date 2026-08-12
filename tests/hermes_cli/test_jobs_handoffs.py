@@ -24,6 +24,27 @@ from hermes_cli.jobs_handoffs import (
 
 TEST_DIGEST = "sha256:" + "a" * 64
 COMMIT = "b" * 40
+ACTIVE_PHASES = (
+    "QUEUED",
+    "ASSIGNED",
+    "BUILDING",
+    "EVIDENCE_COLLECTING",
+    "REVIEWING",
+    "VERIFIED",
+)
+ALLOWED_TRANSITIONS = (
+    ("INTAKE", "QUEUED", "started"),
+    ("ATTEMPT_CREATED", "QUEUED", "started"),
+    ("QUEUED", "ASSIGNED", "handed_off"),
+    ("ASSIGNED", "BUILDING", "started"),
+    ("BUILDING", "EVIDENCE_COLLECTING", "handed_off"),
+    ("EVIDENCE_COLLECTING", "REVIEWING", "handed_off"),
+    ("REVIEWING", "VERIFIED", "passed"),
+    ("VERIFIED", "COMPLETED", "completed"),
+    ("VERIFIED", "COMPLETED", "activated"),
+    *((phase, "FAILED", "rejected") for phase in ACTIVE_PHASES),
+    *((phase, "BLOCKED", "blocked") for phase in ACTIVE_PHASES),
+)
 
 
 def _raw(**overrides):
@@ -107,6 +128,18 @@ def _decision(**overrides):
     return decision
 
 
+def _raw_for_outcome(outcome):
+    issue = {
+        "requirement": "The transition must be safe.",
+        "finding": "Review found a blocking defect.",
+        "required_fix": "Correct the defect before retrying.",
+    }
+    return _raw(
+        issues=[issue] if outcome == "rejected" else [],
+        decision_request=_decision() if outcome == "blocked" else None,
+    )
+
+
 def test_valid_builder_handoff_binds_transition_and_artifact_identity():
     receipt = _normalize()
 
@@ -157,6 +190,70 @@ def test_outcomes_are_the_closed_contract_set():
     })
     with pytest.raises(HandoffValidationError, match="outcome"):
         _normalize(outcome="failed")
+
+
+@pytest.mark.parametrize(("from_phase", "to_phase", "outcome"), ALLOWED_TRANSITIONS)
+def test_every_allowed_transition_edge_normalizes(from_phase, to_phase, outcome):
+    receipt = _normalize(
+        _raw_for_outcome(outcome),
+        attempt_id=None if from_phase == "INTAKE" else "attempt-2",
+        from_phase=from_phase,
+        to_phase=to_phase,
+        outcome=outcome,
+        next_owner_role=None if outcome == "completed" else "next-owner",
+    )
+
+    assert (receipt["from_phase"], receipt["to_phase"], receipt["outcome"]) == (
+        from_phase,
+        to_phase,
+        outcome,
+    )
+
+
+@pytest.mark.parametrize(
+    ("from_phase", "to_phase", "outcome"),
+    [
+        ("NOT_A_PHASE", "VERIFIED", "passed"),
+        ("COMPLETED", "VERIFIED", "passed"),
+        ("QUEUED", "VERIFIED", "passed"),
+        ("ASSIGNED", "EVIDENCE_COLLECTING", "handed_off"),
+        ("BUILDING", "ASSIGNED", "handed_off"),
+        ("COMPLETED", "BLOCKED", "blocked"),
+        ("FAILED", "BLOCKED", "blocked"),
+        ("BLOCKED", "FAILED", "rejected"),
+        ("REVIEWING", "COMPLETED", "completed"),
+        ("QUEUED", "CANCELLED", "handed_off"),
+    ],
+)
+def test_unknown_skipped_reversed_and_terminal_source_edges_are_rejected(
+    from_phase, to_phase, outcome
+):
+    with pytest.raises(HandoffValidationError, match="phase.*outcome"):
+        _normalize(
+            _raw_for_outcome(outcome),
+            from_phase=from_phase,
+            to_phase=to_phase,
+            outcome=outcome,
+            next_owner_role=None if outcome == "completed" else "next-owner",
+        )
+
+
+def test_persisted_validation_and_renderer_reject_an_impossible_source_edge():
+    receipt = _normalize(
+        outcome="passed",
+        from_phase="REVIEWING",
+        to_phase="VERIFIED",
+    )
+    receipt["from_phase"] = "COMPLETED"
+
+    with pytest.raises(HandoffValidationError, match="phase.*outcome"):
+        validate_persisted_handoff(
+            receipt,
+            target_state="VERIFIED",
+            transition_evidence={"tests": TEST_DIGEST},
+        )
+    with pytest.raises(HandoffValidationError, match="phase.*outcome"):
+        render_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
 
 
 @pytest.mark.parametrize(
@@ -218,6 +315,16 @@ def test_attempt_id_none_is_legal_for_intake_to_queued():
         outcome="started",
     )
     assert receipt["attempt_id"] is None
+
+
+def test_intake_to_queued_rejects_a_nonnull_attempt_id():
+    with pytest.raises(HandoffValidationError, match="attempt_id"):
+        _normalize(
+            attempt_id="attempt-too-early",
+            from_phase="INTAKE",
+            to_phase="QUEUED",
+            outcome="started",
+        )
 
 
 @pytest.mark.parametrize(
@@ -848,6 +955,52 @@ def test_nonblocked_outcome_rejects_decision_data(outcome):
 def test_secret_markers_are_rejected_case_insensitively(marker):
     with pytest.raises(HandoffValidationError, match="secret"):
         _normalize(_raw(summary=f"Build result: {marker}"))
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "Bearer\tsecret-value",
+        "api_\nkey=secret-value",
+        "ＡＰＩ＿ＫＥＹ＝secret-value",
+        "authorization \n : secret-value",
+        "token \t = secret-value",
+        "private\nkey material",
+        "ｓｋ－secret-value",
+    ],
+)
+def test_nested_secret_markers_reject_whitespace_and_nfkc_disguises(hostile):
+    raw = _raw(
+        issues=[
+            {
+                "requirement": "No credentials in handoffs.",
+                "finding": hostile,
+                "required_fix": "Remove the credential-shaped value.",
+            }
+        ]
+    )
+
+    with pytest.raises(HandoffValidationError, match="secret") as error:
+        _normalize(raw)
+
+    assert hostile not in str(error.value)
+
+
+def test_recursive_secret_screening_runs_before_unknown_key_validation():
+    raw = _raw()
+    raw["untrusted_nested_data"] = {"note": "Bearer\tsecret-value"}
+
+    with pytest.raises(HandoffValidationError, match="secret") as error:
+        _normalize(raw)
+
+    assert "secret-value" not in str(error.value)
+
+
+def test_secret_screening_covers_bound_enum_strings():
+    with pytest.raises(HandoffValidationError, match="secret") as error:
+        _normalize(outcome="Bearer\tsecret-value")
+
+    assert "secret-value" not in str(error.value)
 
 
 @pytest.mark.parametrize(

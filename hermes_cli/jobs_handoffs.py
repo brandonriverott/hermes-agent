@@ -32,13 +32,16 @@ class HandoffValidationError(ValueError):
 _DIGEST = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _COMMIT = re.compile(r"\A[0-9a-f]{40}\Z")
 _MAX_IDENTITY_CHARS = 80
-_SECRET_MARKERS = (
-    "authorization:",
-    "bearer ",
-    "token=",
-    "api_key",
-    "private key",
-    "sk-",
+_SECRET_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"authorization\s*:",
+        r"bearer\s+",
+        r"token\s*=\s*",
+        r"api[\s_-]*key",
+        r"private\s+key",
+        r"sk\s*-\s*",
+    )
 )
 _RAW_FIELDS = frozenset({
     "summary",
@@ -80,17 +83,27 @@ _CANONICAL_FIELDS = (
     "created_at",
 )
 _CANONICAL_FIELD_SET = frozenset(_CANONICAL_FIELDS)
-_PHASE_OUTCOMES = {
-    "QUEUED": frozenset({"started"}),
-    "ASSIGNED": frozenset({"handed_off"}),
-    "BUILDING": frozenset({"started"}),
-    "EVIDENCE_COLLECTING": frozenset({"handed_off"}),
-    "REVIEWING": frozenset({"handed_off"}),
-    "VERIFIED": frozenset({"passed"}),
-    "FAILED": frozenset({"rejected"}),
-    "BLOCKED": frozenset({"blocked"}),
-    "COMPLETED": frozenset({"completed", "activated"}),
-}
+_ACTIVE_PHASES = frozenset({
+    "QUEUED",
+    "ASSIGNED",
+    "BUILDING",
+    "EVIDENCE_COLLECTING",
+    "REVIEWING",
+    "VERIFIED",
+})
+_ALLOWED_TRANSITIONS = frozenset({
+    ("INTAKE", "QUEUED", "started"),
+    ("ATTEMPT_CREATED", "QUEUED", "started"),
+    ("QUEUED", "ASSIGNED", "handed_off"),
+    ("ASSIGNED", "BUILDING", "started"),
+    ("BUILDING", "EVIDENCE_COLLECTING", "handed_off"),
+    ("EVIDENCE_COLLECTING", "REVIEWING", "handed_off"),
+    ("REVIEWING", "VERIFIED", "passed"),
+    ("VERIFIED", "COMPLETED", "completed"),
+    ("VERIFIED", "COMPLETED", "activated"),
+    *((phase, "FAILED", "rejected") for phase in _ACTIVE_PHASES),
+    *((phase, "BLOCKED", "blocked") for phase in _ACTIVE_PHASES),
+})
 
 
 def _exact_mapping(
@@ -142,6 +155,25 @@ def _require_exact_json_tree(value: object, *, field: str) -> None:
         pending.extend((child, False) for child in reversed(children))
 
 
+def _screen_secret_text(value: str, *, field: str) -> None:
+    screening_form = unicodedata.normalize("NFKC", value).casefold()
+    if any(pattern.search(screening_form) for pattern in _SECRET_PATTERNS):
+        raise HandoffValidationError(f"{field} contains a forbidden secret marker")
+
+
+def _screen_json_strings(value: object, *, field: str) -> None:
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if type(item) is str:
+            _screen_secret_text(item, field=field)
+        elif type(item) is list:
+            pending.extend(item)
+        elif type(item) is dict:
+            pending.extend(item)
+            pending.extend(item.values())
+
+
 def _bounded_text(
     value: object,
     *,
@@ -154,8 +186,7 @@ def _bounded_text(
     value = unicodedata.normalize("NFC", value)
     if len(value) > max_chars:
         raise HandoffValidationError(f"{field} exceeds its {max_chars}-character limit")
-    if any(marker in value.casefold() for marker in _SECRET_MARKERS):
-        raise HandoffValidationError(f"{field} contains a forbidden secret marker")
+    _screen_secret_text(value, field=field)
     for character in value:
         category = unicodedata.category(character)
         if category in {"Cf", "Cs"}:
@@ -398,24 +429,18 @@ def _enforce_json_budget(receipt: dict) -> dict:
     return receipt
 
 
-def _validate_phase_outcome(
+def _validate_transition_edge(
     *,
     attempt_id: str | None,
     from_phase: str,
     to_phase: str,
     outcome: str,
 ) -> None:
-    allowed = _PHASE_OUTCOMES.get(to_phase)
-    if allowed is None or outcome not in allowed:
+    edge = (from_phase, to_phase, outcome)
+    if edge not in _ALLOWED_TRANSITIONS:
         raise HandoffValidationError("handoff phase and outcome are incompatible")
-    intake_edge = (from_phase, to_phase, outcome, attempt_id) == (
-        "INTAKE",
-        "QUEUED",
-        "started",
-        None,
-    )
-    if (from_phase == "INTAKE" or to_phase == "QUEUED") and not intake_edge:
-        raise HandoffValidationError("handoff phase and outcome are incompatible")
+    if edge == ("INTAKE", "QUEUED", "started") and attempt_id is not None:
+        raise HandoffValidationError("intake handoff requires attempt_id=None")
 
 
 def normalize_handoff(
@@ -437,9 +462,12 @@ def normalize_handoff(
     """Bind caller-supplied handoff facts to one transition identity."""
 
     _require_exact_json_tree(raw, field="handoff")
+    _screen_json_strings(raw, field="handoff")
     if artifact_identity is not None:
         _require_exact_json_tree(artifact_identity, field="artifact_identity")
+        _screen_json_strings(artifact_identity, field="artifact_identity")
     _require_exact_json_tree(transition_evidence, field="transition_evidence")
+    _screen_json_strings(transition_evidence, field="transition_evidence")
     transition_evidence = _normalize_transition_evidence(transition_evidence)
     raw = _exact_mapping(
         raw,
@@ -447,7 +475,10 @@ def normalize_handoff(
         field="handoff",
         required=frozenset({"summary", "evidence_summary", "next_action"}),
     )
-    if type(outcome) is not str or outcome not in OUTCOMES:
+    if type(outcome) is not str:
+        raise HandoffValidationError("unsupported handoff outcome")
+    _screen_secret_text(outcome, field="outcome")
+    if outcome not in OUTCOMES:
         raise HandoffValidationError("unsupported handoff outcome")
 
     job_id = _bounded_text(job_id, field="job_id", max_chars=_MAX_IDENTITY_CHARS)
@@ -473,7 +504,7 @@ def normalize_handoff(
         attempt_id = _bounded_text(
             attempt_id, field="attempt_id", max_chars=_MAX_IDENTITY_CHARS
         )
-    _validate_phase_outcome(
+    _validate_transition_edge(
         attempt_id=attempt_id,
         from_phase=from_phase,
         to_phase=to_phase,
@@ -552,6 +583,7 @@ def validate_persisted_handoff(
     """Strictly revalidate a canonical handoff already loaded from storage."""
 
     _require_exact_json_tree(value, field="persisted handoff")
+    _screen_json_strings(value, field="persisted handoff")
     persisted = _exact_mapping(value, _CANONICAL_FIELD_SET, field="persisted handoff")
     _require_persisted_nfc(value)
     schema_version = persisted["schema_version"]
