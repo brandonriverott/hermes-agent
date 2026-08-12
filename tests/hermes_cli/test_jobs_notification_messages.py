@@ -192,9 +192,33 @@ def test_malformed_diagnostic_does_not_echo_untrusted_state_or_milestone():
     assert "leaked" not in text
 
 
+def test_handoff_target_without_visible_milestone_fails_closed():
+    digest = "sha256:" + "a" * 64
+    handoff = _handoff()
+    handoff["from_phase"] = "ASSIGNED"
+    handoff["to_phase"] = "BUILDING"
+    handoff["outcome"] = "started"
+    record = _record(jn.MILESTONE_TESTING, target_state="BUILDING", handoff=handoff)
+    text = jn.render_milestone_message(
+        record,
+        transition_evidence={"tests": digest},
+        expected_job_id="job-1",
+        expected_attempt_id="attempt-1",
+        expected_target_state="BUILDING",
+        expected_speaker_id="builder-1",
+    )
+    assert text.startswith("Hermes could not explain this handoff")
+
+
 def test_review_approved_milestone_is_exported_and_maps_verified():
     assert jn.MILESTONE_REVIEW_APPROVED in jn.ALL_MILESTONES
     assert jn.milestone_for_state("VERIFIED") == jn.MILESTONE_REVIEW_APPROVED
+
+
+def test_unknown_legacy_milestone_has_fixed_fallback():
+    assert jn.render_milestone_message(_record("token=secret")) == (
+        "Legacy Jobs update — unavailable"
+    )
 
 
 @pytest.mark.parametrize(

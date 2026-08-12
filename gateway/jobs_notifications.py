@@ -216,7 +216,8 @@ def _validated_handoff(
         milestone_matches = (
             record.milestone in {jn.MILESTONE_CORRECTING, jn.MILESTONE_FAILURE}
             if binding["target_state"] == "FAILED"
-            else expected_milestone is None or record.milestone == expected_milestone
+            else expected_milestone is not None
+            and record.milestone == expected_milestone
         )
         if (
             handoff["job_id"] != binding["job_id"]

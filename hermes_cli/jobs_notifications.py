@@ -451,8 +451,8 @@ def render_milestone_message(
             milestone_matches = (
                 record.milestone in {MILESTONE_CORRECTING, MILESTONE_FAILURE}
                 if expected_target_state == "FAILED"
-                else expected_milestone is None
-                or record.milestone == expected_milestone
+                else expected_milestone is not None
+                and record.milestone == expected_milestone
             )
             if (
                 handoff["job_id"] != expected_job_id
@@ -505,7 +505,7 @@ def _legacy_milestone_message(record: NotificationRecord, *, re_review: bool) ->
     }
     return templates.get(
         record.milestone,
-        f"Update — {name} (#{number}) ({record.milestone})",
+        "unavailable",
     )
 
 
