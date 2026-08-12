@@ -96,6 +96,9 @@ def execute() -> int:
                 review=result.review,
                 executor_exit_digest=result.executor_exit_digest,
                 output_capture_digest=result.output_capture_digest,
+                build_handoff=result.build_handoff,
+                critical_user_journey=result.critical_user_journey,
+                review_handoff=result.review_handoff,
                 failure_reason_code="CLEANUP_FAILED",
             )
         else:
