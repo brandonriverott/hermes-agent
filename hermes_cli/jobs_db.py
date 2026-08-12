@@ -3999,7 +3999,12 @@ def require_transition_handoff_identity(
     payload = envelope.get("payload")
     if not isinstance(payload, Mapping):
         raise jobs_receipts.ReceiptVerificationError("receipt payload is missing")
-    matches = "handoff" in payload and payload["handoff"] == handoff
+    try:
+        matches = "handoff" in payload and jobs_receipts.canonical_json_bytes(
+            payload["handoff"]
+        ) == jobs_receipts.canonical_json_bytes(handoff)
+    except (KeyError, TypeError, ValueError, RecursionError):
+        matches = False
     if not matches:
         raise jobs_receipts.ReceiptVerificationError(
             "receipt handoff identity mismatch"
@@ -4239,10 +4244,9 @@ def record_transition(
                 payload=notification_payload,
                 now=request.created_at,
             )
-            if (
-                notification.transition_id != transition_id
-                or dict(notification.payload) != notification_payload
-            ):
+            if notification.transition_id != transition_id or _reliability_json(
+                dict(notification.payload)
+            ) != _reliability_json(notification_payload):
                 raise GraphConflict(
                     "transition notification intent stores different facts"
                 )

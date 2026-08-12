@@ -509,6 +509,60 @@ def test_conflicting_outbox_intent_rolls_back_transition_and_handoff(conn, signi
     assert jdb.latest_handoff(conn, attempt_id)["to_phase"] == "QUEUED"
 
 
+def test_outbox_handoff_bool_cannot_match_transition_integer(conn, signing_key):
+    job_id = _queued_job(conn)
+    attempt_id = _attempt(conn, job_id)
+    _record_queued(conn, signing_key, job_id, attempt_id, created_at=9)
+    revision_before = jdb.get_job(conn, job_id).revision
+    transition_count = conn.execute(
+        "SELECT COUNT(*) FROM job_attempt_transitions"
+    ).fetchone()[0]
+    next_transition_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM job_attempt_transitions"
+    ).fetchone()[0]
+    write, envelope = _transition(
+        conn,
+        signing_key,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        source="QUEUED",
+        target="ASSIGNED",
+        key="t:bool-conflicting-outbox",
+        created_at=10,
+    )
+    job = jdb.get_job(conn, job_id)
+    changed = dict(write.handoff)
+    changed["schema_version"] = True
+    jn.enqueue_locked(
+        conn,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        job_revision=write.expected_job_revision + 1,
+        milestone=jn.MILESTONE_ASSIGNED,
+        transition_id=next_transition_id,
+        payload={
+            "number": job.number,
+            "name": job.name,
+            "target_state": write.target_state,
+            "failure_class": write.failure_class,
+            "blocker_code": write.blocker_code,
+            "handoff": changed,
+        },
+        now=10,
+    )
+    conn.commit()
+
+    with pytest.raises(jdb.GraphConflict, match="notification intent"):
+        jdb.record_transition(conn, write, envelope)
+
+    assert (
+        conn.execute("SELECT COUNT(*) FROM job_attempt_transitions").fetchone()[0]
+        == transition_count
+    )
+    assert jdb.get_job(conn, job_id).revision == revision_before
+    assert jdb.latest_handoff(conn, attempt_id)["to_phase"] == "QUEUED"
+
+
 def test_pending_rows_claim_retry_acknowledge_in_order_per_job(
     conn, tmp_path, signing_key
 ):

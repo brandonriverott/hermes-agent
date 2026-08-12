@@ -211,6 +211,32 @@ def test_record_transition_rejects_signed_handoff_mismatch_before_mutation(
     assert jdb.get_receipts(conn, write.job_id) == []
 
 
+def test_signed_handoff_bool_cannot_match_request_integer(conn, signing_key):
+    write, _ = _transition(conn, signing_key)
+    changed = dict(write.handoff)
+    changed["schema_version"] = True
+    envelope = _signed(
+        signing_key,
+        receipt_id=write.receipt_id,
+        job_id=write.job_id,
+        attempt_id=write.attempt_id,
+        state=write.target_state,
+        evidence=write.evidence,
+        handoff=changed,
+    )
+    revision = jdb.get_job(conn, write.job_id).revision
+
+    with pytest.raises(
+        receipts.ReceiptVerificationError,
+        match="receipt handoff identity mismatch",
+    ):
+        jdb.record_transition(conn, write, envelope)
+
+    assert jdb.get_job(conn, write.job_id).revision == revision
+    assert jdb.list_transitions(conn, write.job_id) == []
+    assert jdb.get_receipts(conn, write.job_id) == []
+
+
 def test_historical_transition_migrates_to_null_handoff_without_inference(
     tmp_path, signing_key
 ):
