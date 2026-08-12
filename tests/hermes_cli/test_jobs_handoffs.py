@@ -1004,6 +1004,40 @@ def test_secret_screening_covers_bound_enum_strings():
 
 
 @pytest.mark.parametrize(
+    "summary",
+    [
+        "Task - completed successfully.",
+        "Risk - low.",
+        "Disk - healthy.",
+        "Mask - applied.",
+    ],
+)
+def test_sk_prefix_screening_allows_benign_word_suffixes(summary):
+    receipt = _normalize(_raw(summary=summary))
+
+    assert receipt["summary"] == summary
+    assert (
+        validate_persisted_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
+        == receipt
+    )
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "sk - secret-value",
+        "ｓｋ － secret-value",
+        "ＳＫ　－　secret-value",
+    ],
+)
+def test_sk_prefix_screening_still_rejects_standalone_nfkc_variants(hostile):
+    with pytest.raises(HandoffValidationError, match="secret") as error:
+        _normalize(_raw(summary=hostile))
+
+    assert hostile not in str(error.value)
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         _raw(

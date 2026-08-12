@@ -40,7 +40,7 @@ _SECRET_PATTERNS = tuple(
         r"token\s*=\s*",
         r"api[\s_-]*key",
         r"private\s+key",
-        r"sk\s*-\s*",
+        r"(?<!\w)sk\s*-\s*",
     )
 )
 _RAW_FIELDS = frozenset({
