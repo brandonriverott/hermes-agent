@@ -55,10 +55,7 @@ def _registry_manifest() -> dict[str, object]:
             "to_host": "mac",
             "eligible_reason_codes": [
                 "HOST_UNREACHABLE",
-                "SSH_AUTH_FAILED",
-                "AUTH_REQUIRED",
                 "HEALTH_FAILED",
-                "CAPACITY_FULL",
             ],
         },
         "lanes": lanes,
@@ -456,17 +453,8 @@ def test_healthy_matching_pc_lane_wins():
     assert decision.fallback_applied is False
 
 
-@pytest.mark.parametrize(
-    "pc_reason",
-    [
-        "HOST_UNREACHABLE",
-        "SSH_AUTH_FAILED",
-        "AUTH_REQUIRED",
-        "HEALTH_FAILED",
-        "CAPACITY_FULL",
-    ],
-)
-def test_policy_allows_matching_mac_when_pc_is_unavailable(pc_reason):
+@pytest.mark.parametrize("pc_reason", ["HOST_UNREACHABLE", "HEALTH_FAILED"])
+def test_policy_allows_matching_mac_only_for_infrastructure_failed_pc(pc_reason):
     registry = jobs_lanes.load_lane_registry()
     health = _block_host(_routing_health(registry), registry, "pc", pc_reason)
 
@@ -485,6 +473,43 @@ def test_policy_allows_matching_mac_when_pc_is_unavailable(pc_reason):
     assert (decision.executor, decision.model) == ("claude", "claude-opus-5")
 
 
+@pytest.mark.parametrize(
+    ("pc_reason", "failure_class"),
+    [
+        ("AUTH_REQUIRED", "AUTH_INFRA"),
+        ("PROVIDER_OUTAGE", "PROVIDER"),
+        ("SAFETY_GATE", "SAFETY_GATE"),
+        ("TASK_FAILED", "TASK_FAILURE"),
+    ],
+)
+def test_policy_never_fails_over_non_infrastructure_pc_failures(
+    pc_reason, failure_class
+):
+    registry = jobs_lanes.load_lane_registry()
+    health = _block_host(_routing_health(registry), registry, "pc", pc_reason)
+    health = [
+        replace(item, failure_class=failure_class)
+        if item.lane_id.startswith("claude-pc-")
+        else item
+        for item in health
+    ]
+
+    decision = jobs_lanes.select_lane(
+        registry,
+        health,
+        _routing_request(),
+        active_load={},
+        now=ROUTING_NOW,
+    )
+
+    assert (decision.status, decision.lane_id, decision.fallback_applied) == (
+        "BLOCKED",
+        None,
+        False,
+    )
+    assert decision.reason_code == "PC_FALLBACK_NOT_AUTHORIZED"
+
+
 def test_fallback_never_changes_executor_or_model(tmp_path):
     def remove_matching_mac(manifest):
         for lane in manifest["lanes"]:
@@ -494,7 +519,7 @@ def test_fallback_never_changes_executor_or_model(tmp_path):
     registry = jobs_lanes.load_lane_registry(
         _write_registry(tmp_path, mutate=remove_matching_mac)
     )
-    health = _block_host(_routing_health(registry), registry, "pc", "SSH_AUTH_FAILED")
+    health = _block_host(_routing_health(registry), registry, "pc", "HOST_UNREACHABLE")
 
     decision = jobs_lanes.select_lane(
         registry,
@@ -512,7 +537,7 @@ def test_fallback_never_changes_executor_or_model(tmp_path):
     assert (decision.executor, decision.model) == ("claude", "claude-opus-5")
 
 
-def test_three_occupied_pc_seats_force_policy_authorized_mac_fallback():
+def test_three_occupied_pc_seats_queue_without_expanding_the_three_seat_pool():
     registry = jobs_lanes.load_lane_registry()
     active_load = {
         f"claude-pc-{slot}": 1
@@ -527,9 +552,12 @@ def test_three_occupied_pc_seats_force_policy_authorized_mac_fallback():
         now=ROUTING_NOW,
     )
 
-    assert decision.lane_id == "claude-mac-1"
-    assert decision.fallback_applied is True
-    assert decision.reason_code == "MAC_FALLBACK_SELECTED"
+    assert (decision.status, decision.lane_id, decision.fallback_applied) == (
+        "QUEUED",
+        None,
+        False,
+    )
+    assert decision.reason_code == "CAPACITY_FULL"
 
 
 def test_all_matching_seats_busy_keeps_job_queued():
@@ -584,7 +612,7 @@ def test_expired_health_cannot_be_selected():
 
     assert decision.status == "BLOCKED"
     assert decision.lane_id is None
-    assert decision.reason_code == "NO_HEALTHY_MAC_LANE"
+    assert decision.reason_code == "PC_FALLBACK_NOT_AUTHORIZED"
 
 
 def test_duplicate_health_observation_fails_closed():
@@ -700,7 +728,7 @@ def test_atomic_lane_claim_rechecks_capacity_and_never_overbooks(tmp_path):
         conn.close()
 
 
-def test_three_claims_fill_pc_pool_then_fallback_preserves_executor_and_model(
+def test_three_claims_fill_pc_pool_and_fourth_job_does_not_expand_to_mac(
     tmp_path,
 ):
     conn = jdb.connect(tmp_path / "jobs.db")
@@ -754,11 +782,13 @@ def test_three_claims_fill_pc_pool_then_fallback_preserves_executor_and_model(
             fallback.lane_id,
             fallback.executor,
             fallback.model,
+            fallback.reason_code,
         ) == (
-            "SELECTED",
-            "claude-mac-1",
+            "QUEUED",
+            None,
             "claude",
             "claude-opus-5",
+            "CAPACITY_FULL",
         )
     finally:
         conn.close()

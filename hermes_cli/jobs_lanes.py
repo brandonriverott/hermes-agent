@@ -816,6 +816,24 @@ def select_lane(
 
     fallback = registry.fallback
     pc_reasons = tuple(reason(lane) for lane in pc_lanes)
+    # Pool capacity is deliberately bounded at the three PC seats.  It is a
+    # queueing condition, never a reason to start a second three-seat pool on
+    # the Mac.
+    if pc_reasons and all(code == "CAPACITY_FULL" for code in pc_reasons):
+        return _decision(
+            registry,
+            request,
+            considered,
+            status="QUEUED",
+            reason_code="CAPACITY_FULL",
+        )
+    # A Mac lane is a host failover, not overflow capacity and not a way to
+    # dodge an account, provider, safety, or task result.  Reason codes alone
+    # are insufficient here: several non-infrastructure probe failures reduce
+    # to ``HEALTH_FAILED``.  Require the durable health evidence itself to
+    # classify *every* unavailable PC seat as INFRA_FAILURE before moving the
+    # job to another machine.  This keeps the original Job/attempt lineage
+    # intact while preventing an unsafe cross-host retry.
     fallback_authorized = (
         bool(pc_lanes)
         and fallback.enabled
@@ -823,7 +841,12 @@ def select_lane(
         and fallback.preserve_model
         and fallback.from_host == "pc"
         and fallback.to_host == "mac"
-        and all(code in fallback.eligible_reason_codes for code in pc_reasons)
+        and all(
+            health_by_id.get(lane.id) is not None
+            and health_by_id[lane.id].failure_class == "INFRA_FAILURE"
+            and code in fallback.eligible_reason_codes
+            for lane, code in zip(pc_lanes, pc_reasons)
+        )
     )
     if not fallback_authorized:
         return _decision(

@@ -336,6 +336,25 @@ def test_lane_aware_happy_path_cleans_registered_worktree_before_idle(
         (lane_root / name).mkdir(parents=True, exist_ok=True)
     auth_sentinel = lane_root / "auth" / "operator-auth-state"
     auth_sentinel.write_text("do not remove", encoding="utf-8")
+    # Mac execution is only legal after durable evidence that every matching
+    # PC seat failed at the infrastructure layer.  Missing PC health is not a
+    # safe failover signal.
+    for slot in range(1, 4):
+        jdb.record_lane_health(
+            reliability_rig.conn,
+            jobs_lanes.LaneHealth(
+                lane_id=f"claude-pc-{slot}",
+                state="BLOCKED",
+                status="BLOCKED",
+                failure_class="INFRA_FAILURE",
+                reason_code="HOST_UNREACHABLE",
+                observed_at=reliability_rig.clock,
+                expires_at=reliability_rig.clock + 1_000,
+                executor_version="test-1.0",
+                available_capacity=0,
+                safe_detail={},
+            ),
+        )
     jdb.record_lane_health(
         reliability_rig.conn,
         jobs_lanes.LaneHealth(

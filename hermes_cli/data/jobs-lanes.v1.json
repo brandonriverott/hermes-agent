@@ -15,10 +15,7 @@
     "to_host": "mac",
     "eligible_reason_codes": [
       "HOST_UNREACHABLE",
-      "SSH_AUTH_FAILED",
-      "AUTH_REQUIRED",
-      "HEALTH_FAILED",
-      "CAPACITY_FULL"
+      "HEALTH_FAILED"
     ]
   },
   "lanes": [
