@@ -6,6 +6,7 @@ import json
 import subprocess
 import base64
 import io
+import inspect
 import unicodedata
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -381,15 +382,42 @@ def test_phase_prompts_require_substantive_handoffs_without_delegating_review_au
     assert len(review_prompt) < 4_000
 
 
+def test_review_prompt_redacts_goal_only_inside_untrusted_fields(tmp_path):
+    context = replace(_context(tmp_path, "codex"), goal="not")
+
+    prompt = jobs_reliability._review_prompt(
+        context,
+        "c" * 40,
+        builder_handoff={
+            "summary": "I did not bypass the required checks.",
+            "next_action": "Do not trust my summary without verification.",
+        },
+        journey={
+            "name": "notional mobile flow",
+            "result": "pass",
+            "evidence": "The test did not fail.",
+        },
+    ).decode()
+    untrusted = prompt.split("UNTRUSTED BUILDER HANDOFF\n", 1)[1]
+
+    assert "Do not modify files" in prompt
+    assert "not" not in unicodedata.normalize("NFC", untrusted)
+
+
 @pytest.mark.parametrize(
     "hostile",
     [
         "ＡＰＩ＿ＫＥＹ＝supersecret",
         "api_\nkey=supersecret",
-        "sk -",
+        "api.key=supersecretvalue",
+        "sk - supersecretvalue",
         "Ａｕｔｈｏｒｉｚａｔｉｏｎ： Bearer abcdefgh",
         "bearer\tabcdefgh",
+        "bearеr supersecretvalue1",
+        "bеarеr supersecretvalue1",
         "to ken = supersecret",
+        "to-ken=supersecretvalue",
+        "tо-ken=supersecretvalue",
         "－－－－－ＢＥＧＩＮ ＰＲＩＶＡＴＥ ＫＥＹ－－－－－",
         "unsafe\x00control",
         "unsafe\u200bformat",
@@ -419,6 +447,11 @@ def test_untrusted_worker_text_rejects_secrets_and_controls_without_echo(
         "I completed the authentication UI change.",
         "The tokenizer keeps the task suffix intact.",
         "This review covers the mobile card flow.",
+        "I fixed the API key settings screen.",
+        "Authorization checks now preserve permissions.",
+        "Bearer authentication now uses the approved flow.",
+        "Token refresh behavior is verified.",
+        "sk -",
     ],
 )
 def test_secret_screening_does_not_reject_safe_words_with_token_substrings(safe_text):
@@ -507,8 +540,9 @@ def test_review_prompt_scrubs_short_and_canonical_equivalent_goal_replays(
     ).decode()
 
     assert prompt
+    untrusted = prompt.split("UNTRUSTED BUILDER HANDOFF\n", 1)[1]
     assert unicodedata.normalize("NFC", goal).strip() not in unicodedata.normalize(
-        "NFC", prompt
+        "NFC", untrusted
     )
 
 
@@ -950,6 +984,192 @@ def test_result_unlink_failure_does_not_mask_original_provider_failure(
     )
 
     assert result.failure_reason_code == "PROCESS_CRASHED"
+
+
+def test_result_unlink_failure_secures_secret_and_preserves_primary_failure(
+    tmp_path, monkeypatch
+):
+    context = _context(tmp_path, "codex")
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/codex"
+    )
+    result_path = (
+        context.lane_root / "handoffs" / context.attempt_id / "build-result.json"
+    )
+    original_unlink = Path.unlink
+
+    def refuse_result_unlink(path, *args, **kwargs):
+        if path == result_path:
+            raise OSError("synthetic unlink refusal")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_result_unlink)
+
+    def process_runner(argv, *, stdout_path, stderr_path, **kwargs):
+        target = Path(argv[argv.index("--output-last-message") + 1])
+        target.write_text(
+            "Authorization: Bearer raw-secret-value-123", encoding="utf-8"
+        )
+        target.chmod(0o644)
+        stdout_path.touch()
+        stderr_path.touch()
+        return jobs_reliability.ProcessResult(1)
+
+    result = jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
+        "codex", context
+    )
+
+    assert result.failure_reason_code == "PROCESS_CRASHED"
+    assert result_path.stat().st_mode & 0o777 == 0o600
+    secured = result_path.read_text(encoding="utf-8")
+    assert "raw-secret-value" not in secured
+    assert "cleanup" in secured.casefold()
+
+
+def test_unexpected_result_cleanup_exception_does_not_mask_provider_crash(
+    tmp_path, monkeypatch
+):
+    context = _context(tmp_path, "codex")
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/codex"
+    )
+    result_path = (
+        context.lane_root / "handoffs" / context.attempt_id / "build-result.json"
+    )
+    original_unlink = Path.unlink
+
+    def refuse_result_unlink(path, *args, **kwargs):
+        if path == result_path:
+            raise RuntimeError("unexpected cleanup exception")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_result_unlink)
+
+    def process_runner(argv, *, stdout_path, stderr_path, **kwargs):
+        target = Path(argv[argv.index("--output-last-message") + 1])
+        target.write_text(
+            json.dumps({
+                "structured_output": _valid_build_payload(),
+                "provider_secret": "api.key=raw-secret-value",
+            }),
+            encoding="utf-8",
+        )
+        target.chmod(0o644)
+        stdout_path.touch()
+        stderr_path.touch()
+        raise LookupError("primary provider crash")
+
+    with pytest.raises(LookupError, match="primary provider crash"):
+        jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
+            "codex", context
+        )
+
+    assert result_path.stat().st_mode & 0o777 == 0o600
+    assert "raw-secret-value" not in result_path.read_text(encoding="utf-8")
+
+
+def test_result_unlink_failure_fails_closed_when_provider_otherwise_succeeds(
+    tmp_path, monkeypatch
+):
+    context = _context(tmp_path, "codex")
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/codex"
+    )
+    result_path = (
+        context.lane_root / "handoffs" / context.attempt_id / "build-result.json"
+    )
+    original_unlink = Path.unlink
+
+    def refuse_result_unlink(path, *args, **kwargs):
+        if path == result_path:
+            raise OSError("synthetic unlink refusal")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_result_unlink)
+
+    calls = 0
+
+    def process_runner(argv, *, cwd, stdout_path, stderr_path, **kwargs):
+        nonlocal calls
+        calls += 1
+        target = Path(argv[argv.index("--output-last-message") + 1])
+        if calls == 1:
+            (cwd / "built.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(cwd), "add", "built.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(cwd), "commit", "-qm", "candidate"], check=True
+            )
+            payload = _valid_build_payload()
+        else:
+            payload = _valid_review_payload()
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        stdout_path.touch()
+        stderr_path.touch()
+        return jobs_reliability.ProcessResult(0)
+
+    result = jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
+        "codex", context
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason_code == "RESULT_CLEANUP_FAILED"
+    assert result_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_result_cleanup_cannot_secure_secret_fails_closed_without_echo(
+    tmp_path, monkeypatch
+):
+    context = _context(tmp_path, "codex")
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/codex"
+    )
+    result_path = (
+        context.lane_root / "handoffs" / context.attempt_id / "build-result.json"
+    )
+    original_unlink = Path.unlink
+
+    def refuse_result_unlink(path, *args, **kwargs):
+        if path == result_path:
+            raise OSError("synthetic unlink refusal")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_result_unlink)
+    monkeypatch.setattr(
+        jobs_reliability,
+        "_secure_result_cleanup_marker",
+        lambda path: (_ for _ in ()).throw(OSError("synthetic replace refusal")),
+    )
+    original_os_open = jobs_reliability.os.open
+    monkeypatch.setattr(
+        jobs_reliability.os,
+        "open",
+        lambda path, *args, **kwargs: (
+            (_ for _ in ()).throw(OSError("synthetic open refusal"))
+            if Path(path) == result_path
+            else original_os_open(path, *args, **kwargs)
+        ),
+    )
+
+    def process_runner(argv, *, stdout_path, stderr_path, **kwargs):
+        target = Path(argv[argv.index("--output-last-message") + 1])
+        target.write_text(
+            json.dumps({
+                "structured_output": _valid_build_payload(),
+                "provider_secret": "api.key=raw-secret-value",
+            }),
+            encoding="utf-8",
+        )
+        stdout_path.touch()
+        stderr_path.touch()
+        return jobs_reliability.ProcessResult(0)
+
+    result = jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
+        "codex", context
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason_code == "RESULT_CLEANUP_FAILED"
+    assert "raw-secret-value" not in repr(result)
 
 
 @pytest.mark.parametrize(
@@ -1564,6 +1784,82 @@ def test_local_adapter_rejects_noncanonical_success_metadata(tmp_path, field, va
         adapter(context)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("commit", "C" * 40),
+        ("commit", "not-a-commit"),
+        ("executor_exit_digest", "sha256:" + "A" * 64),
+        ("output_capture_digest", "short"),
+        ("failure_reason_code", "lowercase"),
+        ("http_status", 99),
+        ("http_status", True),
+        ("safety_gate", 1),
+    ],
+)
+def test_local_adapter_rejects_noncanonical_failed_metadata(tmp_path, field, value):
+    context = _context(tmp_path, "codex")
+    phase_result = jobs_reliability.PhaseResult(
+        status="failed",
+        commit=None,
+        tests=(),
+        review={},
+        executor_exit_digest="sha256:" + "3" * 64,
+        output_capture_digest="sha256:" + "4" * 64,
+        failure_reason_code="PROCESS_CRASHED",
+    )
+    phase_result = replace(phase_result, **{field: value})
+    adapter = jobs_reliability.ProductionReliabilityAdapter(
+        "codex", phase_runner=lambda *args: phase_result
+    )
+
+    with pytest.raises(jobs_execution.AdapterError, match="metadata"):
+        adapter(context)
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    [
+        "WORKER_INFRASTRUCTURE_FAILED",
+        "PROCESS_TIMEOUT",
+        "REVIEWER_PROCESS_FAILED",
+        "CLEANUP_FAILED",
+        "RESULT_CLEANUP_FAILED",
+    ],
+)
+def test_adapter_infrastructure_failures_retain_retry_semantics(tmp_path, reason_code):
+    context = _context(tmp_path, "codex")
+    phase_result = jobs_reliability.PhaseResult(
+        status="failed",
+        commit=None,
+        tests=(),
+        review={},
+        executor_exit_digest="sha256:" + "3" * 64,
+        output_capture_digest="sha256:" + "4" * 64,
+        failure_reason_code=reason_code,
+    )
+    adapter = jobs_reliability.ProductionReliabilityAdapter(
+        "codex", phase_runner=lambda *args: phase_result
+    )
+
+    execution = adapter(context)
+    decision = jobs_loop.classify_failure(
+        jobs_loop.FailureSignal(reason_code=execution.failure_reason_code)
+    )
+    retry = jobs_loop.decide_retry(
+        [],
+        evidence_digest=execution.output_capture_digest,
+        failure_class=decision.failure_class,
+    )
+
+    assert decision.failure_class == "INFRA_FAILURE"
+    assert (decision.recovery_decision, retry.action, retry.backoff_seconds) == (
+        "RETRY",
+        "RETRY",
+        30,
+    )
+
+
 def test_fleet_transport_does_not_cross_provider_or_host(tmp_path, monkeypatch):
     local_calls = []
     remote_calls = []
@@ -1608,6 +1904,117 @@ def test_ssh_preflight_is_read_only_and_exact(tmp_path):
     payload = json.loads(kwargs["input"])
     assert payload["provider"] == "codex"
     assert payload["lane_root"] == "/home/brandon/jobs/lanes/codex-pc-1"
+
+
+@pytest.mark.parametrize(
+    "lane_id",
+    [
+        "codex-pc-1/../../../escape",
+        r"codex-pc-1\..\escape",
+        "codex-pc-.",
+        "codex-pc-0",
+        "codex-pc-1\x00escape",
+    ],
+)
+def test_ssh_runner_rejects_noncanonical_lane_before_preflight_or_send(
+    tmp_path, lane_id
+):
+    calls = []
+    runner = jobs_reliability.SSHProviderPhaseRunner(
+        host="gpu-pc",
+        runtime_root=Path("/home/brandon/.hermes/releases/hermes-agent-" + "e" * 40),
+        lane_root=Path("/home/brandon/jobs/lanes"),
+        subprocess_run=lambda argv, **kwargs: (
+            calls.append((argv, kwargs))
+            or subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(_valid_transport_payload()).encode(),
+                stderr=b"",
+            )
+        ),
+    )
+    context = replace(_context(tmp_path, "codex"), lane_id=lane_id)
+
+    assert not runner.preflight(
+        provider="codex",
+        repository=context.repository,
+        base_commit=context.base_commit,
+        branch=context.branch,
+        lane_id=lane_id,
+    )
+    with pytest.raises(jobs_execution.AdapterError, match="lane|identity"):
+        runner("codex", context)
+    assert calls == []
+
+
+def test_local_runner_rejects_worktree_outside_lane_before_execution(
+    tmp_path, monkeypatch
+):
+    context = replace(
+        _context(tmp_path, "codex"), worktree=tmp_path / "outside" / "worktree"
+    )
+    calls = []
+    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        jobs_reliability, "_git", lambda *args, **kwargs: calls.append(args)
+    )
+
+    with pytest.raises(jobs_execution.AdapterError, match="path|lane"):
+        jobs_reliability.LocalProviderPhaseRunner()("codex", context)
+    assert calls == []
+
+
+def test_local_runner_rejects_symlinked_lane_category_before_execution(
+    tmp_path, monkeypatch
+):
+    context = _context(tmp_path, "codex")
+    worktrees = context.lane_root / "worktrees"
+    outside = tmp_path / "outside-worktrees"
+    outside.mkdir()
+    worktrees.rmdir()
+    worktrees.symlink_to(outside, target_is_directory=True)
+    calls = []
+    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        jobs_reliability, "_git", lambda *args, **kwargs: calls.append(args)
+    )
+
+    with pytest.raises(jobs_execution.AdapterError, match="layout|lane"):
+        jobs_reliability.LocalProviderPhaseRunner()("codex", context)
+    assert calls == []
+
+
+def test_local_runner_rejects_handoff_traversal_before_execution(tmp_path, monkeypatch):
+    context = replace(_context(tmp_path, "codex"), attempt_id="../../escape")
+    calls = []
+    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        jobs_reliability, "_git", lambda *args, **kwargs: calls.append(args)
+    )
+
+    with pytest.raises(jobs_execution.AdapterError, match="handoff|path"):
+        jobs_reliability.LocalProviderPhaseRunner()("codex", context)
+    assert calls == []
+
+
+def test_ssh_runner_rejects_handoff_traversal_before_send(tmp_path):
+    context = replace(
+        _context(tmp_path, "codex"),
+        lane_id="codex-pc-1",
+        attempt_id=r"..\..\escape",
+    )
+    calls = []
+    runner = jobs_reliability.SSHProviderPhaseRunner(
+        host="gpu-pc",
+        runtime_root=Path("/home/brandon/.hermes/releases/hermes-agent-" + "e" * 40),
+        lane_root=Path("/home/brandon/jobs/lanes"),
+        subprocess_run=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(jobs_execution.AdapterError, match="handoff|component"):
+        runner("codex", context)
+    assert calls == []
 
 
 def test_remote_repository_mapping_is_explicit_and_fail_closed(monkeypatch):
@@ -1683,3 +2090,171 @@ def test_remote_cleanup_failure_preserves_all_handoff_fields(tmp_path, monkeypat
     assert response["build_handoff"] == result.build_handoff
     assert response["critical_user_journey"] == result.critical_user_journey
     assert response["review_handoff"] == result.review_handoff
+
+
+def _remote_worker_request(tmp_path: Path, *, lane_id: str = "codex-pc-1") -> dict:
+    lane_root = tmp_path / "codex-pc-1"
+    for child in ("auth", "worktrees", "handoffs", "receipts", "health"):
+        (lane_root / child).mkdir(parents=True, exist_ok=True)
+    context_root = tmp_path / "context"
+    context_root.mkdir()
+    context = _context(context_root, "codex")
+    return {
+        "schema_version": 1,
+        "provider": "codex",
+        "context": {
+            **asdict(context),
+            "repository": str(context.repository),
+            "worktree": str(lane_root / "worktrees" / "j_test-1"),
+            "lane_root": str(lane_root),
+            "lane_id": lane_id,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("lane_id", "outside_worktree"),
+    [
+        ("codex-pc-1/../../../escape", False),
+        (r"codex-pc-1\..\escape", False),
+        ("codex-pc-1", True),
+    ],
+)
+def test_remote_worker_rejects_lane_or_path_traversal_before_lease(
+    tmp_path, monkeypatch, lane_id, outside_worktree
+):
+    raw = _remote_worker_request(tmp_path, lane_id=lane_id)
+    if outside_worktree:
+        raw["context"]["worktree"] = str(tmp_path / "outside" / "j_test-1")
+    calls = []
+    monkeypatch.setattr(
+        jobs_remote_worker.jobs_reliability,
+        "LocalProviderPhaseRunner",
+        lambda: lambda *args: calls.append(("runner", args)),
+    )
+    monkeypatch.setattr(
+        jobs_remote_worker,
+        "_atomic_lease",
+        lambda *args, **kwargs: calls.append(("lease", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        jobs_remote_worker.sys,
+        "stdin",
+        io.TextIOWrapper(io.BytesIO(json.dumps(raw).encode()), encoding="utf-8"),
+    )
+    monkeypatch.setattr(jobs_remote_worker.sys, "stdout", io.StringIO())
+
+    assert jobs_remote_worker.execute() == 2
+    assert calls == []
+
+
+def test_remote_worker_rejects_handoff_traversal_before_lease(tmp_path, monkeypatch):
+    raw = _remote_worker_request(tmp_path)
+    raw["context"]["attempt_id"] = "../../escape"
+    calls = []
+    monkeypatch.setattr(
+        jobs_remote_worker.jobs_reliability,
+        "LocalProviderPhaseRunner",
+        lambda: lambda *args: calls.append(("runner", args)),
+    )
+    monkeypatch.setattr(
+        jobs_remote_worker,
+        "_atomic_lease",
+        lambda *args, **kwargs: calls.append(("lease", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        jobs_remote_worker.sys,
+        "stdin",
+        io.TextIOWrapper(io.BytesIO(json.dumps(raw).encode()), encoding="utf-8"),
+    )
+    monkeypatch.setattr(jobs_remote_worker.sys, "stdout", io.StringIO())
+
+    assert jobs_remote_worker.execute() == 2
+    assert calls == []
+
+
+def test_remote_cleanup_still_removes_handoff_when_worktree_removal_fails(
+    tmp_path, monkeypatch
+):
+    raw = _remote_worker_request(tmp_path)
+    context = type("Context", (), raw["context"])()
+    worktree = Path(context.worktree)
+    handoff = Path(context.lane_root) / "handoffs" / context.attempt_id
+    worktree.mkdir()
+    handoff.mkdir()
+    (handoff / "temporary.txt").write_text("bounded", encoding="utf-8")
+    monkeypatch.setattr(
+        jobs_remote_worker.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(1, "git")
+        ),
+    )
+
+    assert not jobs_remote_worker._cleanup(context)
+    assert not handoff.exists()
+
+
+@pytest.mark.parametrize("cleanup_behavior", ["ok", "returns_false", "raises"])
+def test_remote_runner_exception_cleans_and_settles_failed_without_masking_primary(
+    tmp_path, monkeypatch, cleanup_behavior
+):
+    raw = _remote_worker_request(tmp_path)
+    calls = []
+
+    def raise_primary(provider, context):
+        calls.append(("runner", provider))
+        raise RuntimeError("primary runner failure")
+
+    def cleanup(context):
+        calls.append(("cleanup", cleanup_behavior))
+        if cleanup_behavior == "raises":
+            raise OSError("synthetic cleanup failure")
+        return cleanup_behavior == "ok"
+
+    monkeypatch.setattr(
+        jobs_remote_worker.jobs_reliability,
+        "LocalProviderPhaseRunner",
+        lambda: raise_primary,
+    )
+    monkeypatch.setattr(
+        jobs_remote_worker,
+        "_cleanup",
+        cleanup,
+    )
+    monkeypatch.setattr(
+        jobs_remote_worker,
+        "_atomic_lease",
+        lambda root, **kwargs: calls.append(("lease", kwargs)),
+    )
+    stdin = io.TextIOWrapper(io.BytesIO(json.dumps(raw).encode()), encoding="utf-8")
+    stderr = io.StringIO()
+    monkeypatch.setattr(jobs_remote_worker.sys, "stdin", stdin)
+    monkeypatch.setattr(jobs_remote_worker.sys, "stdout", io.StringIO())
+    monkeypatch.setattr(jobs_remote_worker.sys, "stderr", stderr)
+
+    assert jobs_remote_worker.execute() == 2
+    leases = [entry[1] for entry in calls if entry[0] == "lease"]
+    assert leases[0]["state"] == "BUILDING"
+    assert leases[-1]["state"] == "FAILED"
+    assert any(entry[0] == "cleanup" for entry in calls)
+    assert "RuntimeError" in stderr.getvalue()
+
+
+def test_worker_handoff_feature_is_jobs_scoped_without_global_chat_hooks():
+    module_source = inspect.getsource(jobs_reliability).casefold()
+    assert "gateway" not in module_source
+    assert "direct_chat" not in module_source
+    assert not any(
+        name.startswith(("register_global", "install_global", "register_chat"))
+        for name in vars(jobs_reliability)
+    )
+
+    package = Path(jobs_reliability.__file__).resolve().parent
+    callers = {
+        path.name
+        for path in package.glob("*.py")
+        if path.name != "jobs_executors.py"
+        and "production_registry()" in path.read_text(encoding="utf-8")
+    }
+    assert callers == {"jobs_run.py", "jobs_runtime.py"}

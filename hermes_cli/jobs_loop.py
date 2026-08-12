@@ -12,42 +12,43 @@ from hermes_cli import jobs_receipts
 from hermes_constants import get_hermes_home
 
 
-FAILURE_CLASSES = frozenset(
-    {"AUTH_INFRA", "PROVIDER", "SAFETY_GATE", "TASK_FAILURE", "INFRA_FAILURE"}
-)
+FAILURE_CLASSES = frozenset({
+    "AUTH_INFRA",
+    "PROVIDER",
+    "SAFETY_GATE",
+    "TASK_FAILURE",
+    "INFRA_FAILURE",
+})
 NON_RETRYABLE = frozenset({"AUTH_INFRA", "SAFETY_GATE"})
 
-_AUTH_REASONS = frozenset(
-    {
-        "AUTH_REQUIRED",
-        "CREDENTIALS_EXPIRED",
-        "MISSING_LANE_LOGIN",
-        "SSH_AUTH_FAILED",
-        "TOKEN_EXPIRED",
-        "UNAUTHORIZED",
-    }
-)
-_SAFETY_REASONS = frozenset(
-    {"APPROVAL_REQUIRED", "IRREVERSIBLE_ACTION", "SAFETY_GATE"}
-)
-_PROVIDER_REASONS = frozenset(
-    {
-        "BILLING_REFUSED",
-        "MODEL_UNAVAILABLE",
-        "PROVIDER_CAPACITY",
-        "PROVIDER_OUTAGE",
-        "RATE_LIMITED",
-    }
-)
-_INFRA_REASONS = frozenset(
-    {
-        "DISK_FULL",
-        "FILESYSTEM_BRIDGE_UNAVAILABLE",
-        "MEMORY_EXHAUSTED",
-        "NETWORK_TRANSPORT_FAILED",
-        "PROCESS_CRASHED",
-    }
-)
+_AUTH_REASONS = frozenset({
+    "AUTH_REQUIRED",
+    "CREDENTIALS_EXPIRED",
+    "MISSING_LANE_LOGIN",
+    "SSH_AUTH_FAILED",
+    "TOKEN_EXPIRED",
+    "UNAUTHORIZED",
+})
+_SAFETY_REASONS = frozenset({"APPROVAL_REQUIRED", "IRREVERSIBLE_ACTION", "SAFETY_GATE"})
+_PROVIDER_REASONS = frozenset({
+    "BILLING_REFUSED",
+    "MODEL_UNAVAILABLE",
+    "PROVIDER_CAPACITY",
+    "PROVIDER_OUTAGE",
+    "RATE_LIMITED",
+})
+_INFRA_REASONS = frozenset({
+    "DISK_FULL",
+    "FILESYSTEM_BRIDGE_UNAVAILABLE",
+    "MEMORY_EXHAUSTED",
+    "NETWORK_TRANSPORT_FAILED",
+    "PROCESS_CRASHED",
+    "PROCESS_TIMEOUT",
+    "WORKER_INFRASTRUCTURE_FAILED",
+    "REVIEWER_PROCESS_FAILED",
+    "CLEANUP_FAILED",
+    "RESULT_CLEANUP_FAILED",
+})
 _REASON_CODE = re.compile(r"\A[A-Z][A-Z0-9_]{0,63}\Z")
 _DIGEST = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 _SECRET_MARKERS = (
@@ -132,9 +133,7 @@ def classify_failure(signal: FailureSignal) -> FailureDecision:
 
     reason = _valid_reason(signal.reason_code)
     if signal.http_status == 401 or reason in _AUTH_REASONS:
-        primary_reason = (
-            reason if reason in _AUTH_REASONS else "HTTP_401_AUTH_FAILED"
-        )
+        primary_reason = reason if reason in _AUTH_REASONS else "HTTP_401_AUTH_FAILED"
         return FailureDecision("AUTH_INFRA", primary_reason, "HUMAN_ACTION")
     if signal.safety_gate or reason in _SAFETY_REASONS:
         return FailureDecision(
@@ -156,9 +155,7 @@ def classify_failure(signal: FailureSignal) -> FailureDecision:
         return FailureDecision("PROVIDER", primary_reason, "RETRY")
     if reason in _INFRA_REASONS:
         return FailureDecision("INFRA_FAILURE", reason, "RETRY")
-    return FailureDecision(
-        "TASK_FAILURE", reason or "TASK_FAILED", "CORRECT"
-    )
+    return FailureDecision("TASK_FAILURE", reason or "TASK_FAILED", "CORRECT")
 
 
 def decide_retry(
@@ -177,9 +174,7 @@ def decide_retry(
     if failure_class not in {"PROVIDER", "INFRA_FAILURE", "TASK_FAILURE"}:
         return RetryDecision("BLOCKED", "UNSUPPORTED_FAILURE_CLASS", 0)
     if any(item.evidence_digest == evidence_digest for item in history):
-        return RetryDecision(
-            "BLOCKED", "RETRY_REJECTED_NO_NEW_EVIDENCE", 0
-        )
+        return RetryDecision("BLOCKED", "RETRY_REJECTED_NO_NEW_EVIDENCE", 0)
     if len(history) >= policy.max_attempts:
         return RetryDecision("BLOCKED", "RETRY_LIMIT", 0)
     attempt_count = len(history) + 1

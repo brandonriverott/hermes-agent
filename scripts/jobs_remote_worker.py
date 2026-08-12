@@ -52,11 +52,74 @@ def _atomic_lease(root: Path, *, state: str, reason_code: str) -> None:
 
 
 def _contained(path: Path, root: Path, category: str) -> bool:
+    category_root = root / category
+    if root.is_symlink() or category_root.is_symlink() or not category_root.is_dir():
+        return False
     try:
-        path.resolve(strict=False).relative_to((root / category).resolve(strict=True))
+        path.resolve(strict=False).relative_to(category_root.resolve(strict=True))
     except (OSError, ValueError):
         return False
-    return path.resolve(strict=False) != (root / category).resolve(strict=True)
+    return path.resolve(strict=False) != category_root.resolve(strict=True)
+
+
+def _validated_lane_root(path: Path, lane_id: str) -> Path:
+    lane = jobs_reliability._lane_identity(lane_id)
+    if lane is None or lane.group("host") != "pc":
+        raise ValueError("lane identity")
+    if not path.is_dir() or path.is_symlink():
+        raise ValueError("lane root")
+    resolved = path.resolve(strict=True)
+    if resolved.name != lane_id:
+        raise ValueError("lane path")
+    for child in ("auth", "worktrees", "handoffs", "receipts", "health"):
+        child_path = resolved / child
+        if not child_path.is_dir() or child_path.is_symlink():
+            raise ValueError("lane layout")
+    configured = os.environ.get("HERMES_JOBS_PC_LANE_ROOT", "").strip()
+    if configured:
+        configured_root = Path(configured).resolve(strict=True)
+        if (
+            not resolved.is_relative_to(configured_root)
+            or resolved.parent != configured_root
+        ):
+            raise ValueError("configured lane path")
+    return resolved
+
+
+def _validated_context_paths(context: SimpleNamespace) -> Path:
+    lane_root = _validated_lane_root(Path(context.lane_root), context.lane_id)
+    attempt_id = jobs_reliability._safe_path_component(
+        context.attempt_id, label="handoff"
+    )
+    jobs_reliability._safe_path_component(context.job_id, label="job")
+    handoff = lane_root / "handoffs" / attempt_id
+    if not _contained(Path(context.worktree), lane_root, "worktrees") or not _contained(
+        handoff, lane_root, "handoffs"
+    ):
+        raise ValueError("worker path")
+    return lane_root
+
+
+def _cleanup_without_masking(context: SimpleNamespace) -> bool:
+    try:
+        return _cleanup(context)
+    except Exception:
+        return False
+
+
+def _settle_failed_without_masking(root: Path, *, cleanup_ok: bool) -> None:
+    try:
+        _atomic_lease(
+            root,
+            state="FAILED",
+            reason_code=(
+                "REMOTE_EXECUTOR_FAILED"
+                if cleanup_ok
+                else "REMOTE_EXECUTOR_FAILED_CLEANUP_FAILED"
+            ),
+        )
+    except Exception:
+        pass
 
 
 def _cleanup(context: SimpleNamespace) -> bool:
@@ -67,30 +130,43 @@ def _cleanup(context: SimpleNamespace) -> bool:
         handoff, lane_root, "handoffs"
     ):
         return False
+    worktree_removed = not worktree.exists()
+    handoff_removed = not handoff.exists()
     try:
         if worktree.exists():
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(context.repository),
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(worktree),
-                ],
-                check=True,
-                capture_output=True,
-                timeout=120,
-            )
+            try:
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(context.repository),
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(worktree),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=120,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+            worktree_removed = not worktree.exists()
         if handoff.is_dir() and not handoff.is_symlink():
-            shutil.rmtree(handoff)
-        return not worktree.exists() and not handoff.exists()
+            try:
+                shutil.rmtree(handoff)
+            except OSError:
+                pass
+            handoff_removed = not handoff.exists()
+        return worktree_removed and handoff_removed
     except (OSError, subprocess.SubprocessError):
         return False
 
 
 def execute() -> int:
+    context: SimpleNamespace | None = None
+    lane_root: Path | None = None
+    building = False
     try:
         raw = json.loads(sys.stdin.buffer.read(128 * 1024).decode("utf-8"))
         if not isinstance(raw, dict) or set(raw) != {
@@ -106,14 +182,14 @@ def execute() -> int:
             raise ValueError("context shape")
         context = SimpleNamespace(**values)
         jobs_reliability._require_provider_context(raw["provider"], context, host="pc")
-        lane_root = Path(context.lane_root)
-        if not lane_root.is_dir() or lane_root.is_symlink():
-            raise ValueError("lane root")
+        lane_root = _validated_context_paths(context)
         _atomic_lease(
             lane_root, state="BUILDING", reason_code="REMOTE_EXECUTOR_STARTED"
         )
+        building = True
         result = jobs_reliability.LocalProviderPhaseRunner()(raw["provider"], context)
-        if not _cleanup(context):
+        cleanup_ok = _cleanup_without_masking(context)
+        if not cleanup_ok:
             _atomic_lease(lane_root, state="FAILED", reason_code="CLEANUP_FAILED")
             result = jobs_reliability.PhaseResult(
                 status="failed",
@@ -129,13 +205,17 @@ def execute() -> int:
                 http_status=result.http_status,
                 safety_gate=result.safety_gate,
             )
-        else:
-            _atomic_lease(lane_root, state="IDLE", reason_code="OK")
         sys.stdout.write(
             json.dumps(asdict(result), sort_keys=True, separators=(",", ":"))
         )
+        if cleanup_ok:
+            _atomic_lease(lane_root, state="IDLE", reason_code="OK")
+        building = False
         return 0
     except Exception as exc:
+        if building and context is not None and lane_root is not None:
+            cleanup_ok = _cleanup_without_masking(context)
+            _settle_failed_without_masking(lane_root, cleanup_ok=cleanup_ok)
         sys.stderr.write(f"remote worker refused: {type(exc).__name__}\n")
         return 2
 
@@ -160,13 +240,17 @@ def preflight() -> int:
             raise ValueError("request shape")
         provider = raw["provider"]
         lane_id = raw["lane_id"]
-        if provider not in {"claude", "codex"} or not str(lane_id).startswith(
-            provider + "-pc-"
+        lane = jobs_reliability._lane_identity(lane_id)
+        if (
+            provider not in {"claude", "codex"}
+            or lane is None
+            or lane.group("provider") != provider
+            or lane.group("host") != "pc"
         ):
             raise ValueError("provider identity")
         repository = Path(raw["repository"])
-        lane_root = Path(raw["lane_root"])
-        if not repository.is_dir() or not lane_root.is_dir() or lane_root.is_symlink():
+        lane_root = _validated_lane_root(Path(raw["lane_root"]), lane_id)
+        if not repository.is_dir():
             raise ValueError("path")
         for child in ("auth", "worktrees", "handoffs", "receipts", "health"):
             path = lane_root / child
