@@ -516,3 +516,67 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_notifier_delivers_worker_started_transition_once(tmp_path, monkeypatch):
+    """A successful process launch is the first honest proof that a worker
+    picked up the card, so the originating chat receives that transition.
+    """
+    db_path = tmp_path / "worker-started.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="worker starts", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb._set_worker_pid(conn, tid, 43210)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert "started" in adapter.sent[0]["text"]
+
+
+def test_notifier_delivers_meaningful_progress_without_liveness_spam(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "worker-progress.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="worker progresses", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb._set_worker_pid(conn, tid, 43210)
+        # Subscribe after launch so this assertion isolates progress delivery.
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.heartbeat_worker(conn, tid, note=None)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.sent == []
+
+    conn = kb.connect()
+    try:
+        assert kb.heartbeat_worker(conn, tid, note="running mobile checks")
+    finally:
+        conn.close()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    assert "running mobile checks" in adapter.sent[0]["text"]

@@ -3794,7 +3794,11 @@ class AIAgent:
                     heartbeat_current_worker_from_env,
                     inject_new_comments_from_env,
                 )
-                heartbeat_current_worker_from_env()
+                # The bridge is already rate-limited to one board write per
+                # minute. Carry the same bounded activity description so card
+                # subscribers see useful automatic progress (tool/API phase),
+                # not only an opaque liveness pulse.
+                heartbeat_current_worker_from_env(self._last_activity_desc)
                 # Fold any new operator notes into the running turn (OUT-OF-BAND
                 # steer) so the user can talk to a live task without a restart.
                 inject_new_comments_from_env(self)

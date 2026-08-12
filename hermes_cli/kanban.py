@@ -1521,6 +1521,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+        # ``hermes kanban create`` is frequently invoked through the terminal
+        # from inside a live Hermes chat. Preserve that originating route just
+        # like the structured ``kanban_create`` tool does, otherwise the card
+        # can run successfully but no lifecycle update can find its way back
+        # to the user who created it.
+        from hermes_cli.kanban_notifications import auto_subscribe_origin
+
+        auto_subscribe_origin(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -2495,6 +2503,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "preflight_failed": [
+                {"task_id": tid, "reason": reason}
+                for tid, reason in res.preflight_failed
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2527,6 +2539,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    if res.preflight_failed:
+        for tid, reason in res.preflight_failed:
+            print(f"Blocked (worker preflight): {tid}: {reason}")
     if res.skipped_per_profile_capped:
         for tid, who, current in res.skipped_per_profile_capped:
             print(

@@ -80,6 +80,31 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_runtime_activity_heartbeat_records_one_bounded_progress_note(
+    worker_env, monkeypatch,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_auto_heartbeat_last_attempt", 0.0)
+
+    assert kt.heartbeat_current_worker_from_env(
+        "executing tool: terminal" + ("x" * 200)
+    )
+    assert not kt.heartbeat_current_worker_from_env("receiving stream response")
+
+    with kb.connect_closing() as conn:
+        events = [
+            event
+            for event in kb.list_events(conn, task_id=worker_env)
+            if event.kind == "heartbeat"
+        ]
+
+    assert len(events) == 1
+    assert events[0].payload["note"].startswith("executing tool: terminal")
+    assert len(events[0].payload["note"]) == 120
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

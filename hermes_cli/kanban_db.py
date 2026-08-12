@@ -2878,6 +2878,289 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_LEGACY_JOBS_LANE_ALIASES = {
+    "cc-builder": "claude",
+    "codex-builder": "codex",
+}
+
+
+def _legacy_jobs_lane_preflight_reason(
+    assignee: Optional[str],
+    *,
+    profile_is_launchable: Optional[bool] = None,
+) -> Optional[str]:
+    """Reject historical Kanban aliases that now belong in Jobs.
+
+    These names used to be pulled by dedicated external pollers.  When those
+    pollers are paused, the ordinary Kanban dispatcher intentionally skips the
+    cards forever because the names are not Hermes profiles.  A genuinely
+    provisioned profile with the same name remains valid; only the
+    non-launchable legacy alias is rejected.
+    """
+    lane = _LEGACY_JOBS_LANE_ALIASES.get(assignee or "")
+    if lane is None:
+        return None
+    if profile_is_launchable is None:
+        try:
+            from hermes_cli.profiles import profile_exists
+
+            profile_is_launchable = bool(profile_exists(assignee or ""))
+        except Exception:
+            # If profile discovery itself is unavailable, preserve the prior
+            # fail-open behavior and let dispatch diagnostics remain the
+            # authority rather than blocking potentially valid work.
+            return None
+    if profile_is_launchable:
+        return None
+    return (
+        f"@{assignee} is not a launchable Kanban profile; "
+        f"create this work in Jobs lane {lane}"
+    )
+
+
+def _profile_skill_inventory(assignee: str) -> Optional[set[str]]:
+    """Return skill identifiers loadable by *assignee*, or ``None`` when the
+    profile environment cannot be inspected safely.
+
+    Worker processes switch ``HERMES_HOME`` to the assigned profile before
+    resolving ``--skills``.  Preflight therefore inspects that profile's own
+    ``skills/`` plus its configured external roots rather than the dispatching
+    gateway's skill tree.  A category directory without its own ``SKILL.md``
+    is intentionally not an identifier (the exact shape behind card #1638).
+    """
+    try:
+        from agent.skill_utils import (
+            iter_skill_index_files,
+            parse_frontmatter,
+            skill_matches_platform,
+            yaml_load,
+        )
+        from hermes_cli.profiles import resolve_profile_env
+
+        profile_home = Path(resolve_profile_env(assignee)).expanduser().resolve()
+    except Exception:
+        return None
+
+    roots: list[Path] = [profile_home / "skills"]
+    disabled: set[str] = set()
+    config_path = profile_home / "config.yaml"
+    if config_path.is_file():
+        try:
+            raw = yaml_load(config_path.read_text(encoding="utf-8"))
+            skills_cfg = raw.get("skills") if isinstance(raw, dict) else None
+            if isinstance(skills_cfg, dict):
+                disabled_raw = skills_cfg.get("disabled") or []
+                if isinstance(disabled_raw, str):
+                    disabled_raw = [disabled_raw]
+                if isinstance(disabled_raw, list):
+                    disabled = {
+                        str(name).strip()
+                        for name in disabled_raw
+                        if str(name).strip()
+                    }
+                platform = (
+                    os.environ.get("HERMES_PLATFORM")
+                    or os.environ.get("HERMES_SESSION_PLATFORM")
+                )
+                platform_disabled = skills_cfg.get("platform_disabled") or {}
+                if platform and isinstance(platform_disabled, dict):
+                    scoped = platform_disabled.get(platform) or []
+                    if isinstance(scoped, str):
+                        scoped = [scoped]
+                    if isinstance(scoped, list):
+                        disabled.update(
+                            str(name).strip()
+                            for name in scoped
+                            if str(name).strip()
+                        )
+                external = skills_cfg.get("external_dirs") or []
+                if isinstance(external, str):
+                    external = [external]
+                if isinstance(external, list):
+                    for entry in external:
+                        value = str(entry or "").strip()
+                        if not value:
+                            continue
+                        expanded = Path(
+                            os.path.expanduser(os.path.expandvars(value))
+                        )
+                        if not expanded.is_absolute():
+                            expanded = profile_home / expanded
+                        try:
+                            expanded = expanded.resolve()
+                        except OSError:
+                            continue
+                        if expanded.is_dir() and expanded not in roots:
+                            roots.append(expanded)
+        except Exception:
+            # A malformed optional skills section should not stop the board;
+            # the primary profile skills root remains inspectable.
+            pass
+
+    # An identifier is loadable only when it resolves to exactly one physical
+    # skill file. ``skill_view`` deliberately rejects ambiguous bare aliases
+    # across local/external/category roots, so retain source identity while
+    # indexing instead of collapsing immediately to a set.
+    identifier_sources: dict[str, set[str]] = {}
+
+    def _record_identifier(identifier: str, source: Path) -> None:
+        name = identifier.strip()
+        if not name or name in disabled:
+            return
+        try:
+            source_key = str(source.resolve())
+        except OSError:
+            source_key = str(source)
+        identifier_sources.setdefault(name, set()).add(source_key)
+
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            skill_files = list(iter_skill_index_files(root, "SKILL.md"))
+        except Exception:
+            continue
+        for skill_md in skill_files:
+            try:
+                frontmatter, _ = parse_frontmatter(
+                    skill_md.read_text(encoding="utf-8-sig", errors="replace")
+                )
+            except Exception:
+                frontmatter = {}
+            declared_name = str(
+                frontmatter.get("name") or skill_md.parent.name
+            ).strip()
+            # Explicit ``--skills`` bypasses environment relevance filtering,
+            # but not operator disablement or hard OS compatibility.
+            if declared_name in disabled or not skill_matches_platform(frontmatter):
+                continue
+            try:
+                relative_dir = skill_md.parent.relative_to(root)
+            except ValueError:
+                continue
+            relative_name = relative_dir.as_posix()
+            if relative_name and relative_name != ".":
+                _record_identifier(relative_name, skill_md)
+                _record_identifier(relative_name.replace("/", ":", 1), skill_md)
+            _record_identifier(skill_md.parent.name, skill_md)
+            if declared_name:
+                _record_identifier(declared_name, skill_md)
+
+        # Legacy flat ``<skill>.md`` packages remain supported by skill_view.
+        try:
+            for flat_file in root.glob("*.md"):
+                if flat_file.name not in {"SKILL.md", "DESCRIPTION.md"}:
+                    _record_identifier(flat_file.stem, flat_file)
+        except OSError:
+            pass
+
+    return {
+        identifier
+        for identifier, sources in identifier_sources.items()
+        if len(sources) == 1
+    }
+
+
+def _missing_worker_skills(
+    assignee: Optional[str],
+    skills: Optional[Iterable[str]],
+    *,
+    inventory_cache: Optional[dict[str, Optional[set[str]]]] = None,
+) -> list[str]:
+    """Return attached skill identifiers unavailable to a real profile.
+
+    ``None`` inventory means inspection itself was unavailable, so this fails
+    open and lets the worker's existing runtime validation remain authoritative.
+    That avoids blocking work during a partial install while still catching
+    deterministic missing-skill failures on healthy profiles.
+    """
+    requested = [str(name).strip() for name in (skills or ()) if str(name).strip()]
+    if not assignee or not requested:
+        return []
+    try:
+        from hermes_cli.profiles import profile_exists
+
+        if not profile_exists(assignee):
+            return []
+    except Exception:
+        return []
+
+    if inventory_cache is not None and assignee in inventory_cache:
+        inventory = inventory_cache[assignee]
+    else:
+        inventory = _profile_skill_inventory(assignee)
+        if inventory_cache is not None:
+            inventory_cache[assignee] = inventory
+    if inventory is None:
+        return []
+
+    missing: list[str] = []
+    for identifier in requested:
+        if identifier in inventory:
+            continue
+        # Plugin-qualified identifiers live outside profile skills roots. Ask
+        # the plugin registry as a fallback without treating a category-style
+        # ``category:skill`` as automatically valid.
+        plugin_skill = None
+        if ":" in identifier:
+            try:
+                from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+                discover_plugins()
+                plugin_skill = get_plugin_manager().find_plugin_skill(identifier)
+            except Exception:
+                plugin_skill = None
+        if plugin_skill is None:
+            missing.append(identifier)
+    return missing
+
+
+def _worker_skill_preflight_reason(
+    assignee: str,
+    skills: Optional[Iterable[str]],
+    *,
+    inventory_cache: Optional[dict[str, Optional[set[str]]]] = None,
+) -> Optional[str]:
+    missing = _missing_worker_skills(
+        assignee, skills, inventory_cache=inventory_cache
+    )
+    if not missing:
+        return None
+    return (
+        f"unknown or unavailable skill(s) for @{assignee}: "
+        + ", ".join(missing)
+    )
+
+
+def _block_worker_preflight(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+) -> bool:
+    """Block a malformed ready card without creating a worker run/attempt."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+            "block_recurrences = 1, last_failure_error = ? "
+            "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+            (reason[:500], task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {
+                "reason": reason,
+                "kind": "capability",
+                "source": "worker_preflight",
+                "recurrences": 1,
+            },
+        )
+    return True
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2954,6 +3237,9 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    assignee_preflight_reason = _legacy_jobs_lane_preflight_reason(assignee)
+    if assignee_preflight_reason:
+        raise ValueError(assignee_preflight_reason)
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -3115,6 +3401,13 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+
+    if skills_list and assignee:
+        preflight_reason = _worker_skill_preflight_reason(
+            assignee, skills_list
+        )
+        if preflight_reason:
+            raise ValueError(preflight_reason)
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -6816,6 +7109,10 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    preflight_failed: list[tuple[str, str]] = field(default_factory=list)
+    """Malformed ready cards blocked before claim/spawn, represented as
+    ``(task_id, reason)``. These consume no run and no retry attempt; the
+    blocker is durable and user-visible instead of looking like a dead worker."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -8516,6 +8813,10 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    # Skill discovery can walk symlinked profile roots. Cache one inventory per
+    # assignee for this tick so a queue of cards for the same worker pays that
+    # cost once, while each new tick still sees newly-installed skills.
+    _skill_inventory_cache: dict[str, Optional[set[str]]] = {}
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -8578,6 +8879,15 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
+            preflight_reason = _legacy_jobs_lane_preflight_reason(
+                row_assignee,
+                profile_is_launchable=False,
+            )
+            if preflight_reason:
+                result.preflight_failed.append((row["id"], preflight_reason))
+                if not dry_run:
+                    _block_worker_preflight(conn, row["id"], preflight_reason)
+                continue
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -8585,6 +8895,17 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        ready_task = get_task(conn, row["id"])
+        preflight_reason = _worker_skill_preflight_reason(
+            row_assignee,
+            ready_task.skills if ready_task is not None else None,
+            inventory_cache=_skill_inventory_cache,
+        )
+        if preflight_reason:
+            result.preflight_failed.append((row["id"], preflight_reason))
+            if not dry_run:
+                _block_worker_preflight(conn, row["id"], preflight_reason)
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at

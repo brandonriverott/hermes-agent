@@ -171,7 +171,11 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "spawned", "heartbeat", "status", "archived", "unblocked",
+            "block_loop_detected",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -473,6 +477,25 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
+                            )
+                        elif kind == "spawned":
+                            msg = (
+                                f"▶ {board_tag}{tag}Kanban {sub['task_id']} started"
+                                f" — {title}"
+                            )
+                        elif kind == "heartbeat":
+                            note = ""
+                            if ev.payload and ev.payload.get("note"):
+                                note = str(ev.payload["note"]).strip()
+                            # Automatic liveness heartbeats carry no note and
+                            # happen every minute. Claim their cursor but do
+                            # not turn them into chat spam; only explicit
+                            # human-readable progress notes are delivered.
+                            if not note:
+                                continue
+                            msg = (
+                                f"… {board_tag}{tag}Kanban {sub['task_id']} progress"
+                                f" — {note[:200]}"
                             )
                         elif kind == "status":
                             new_status = ""
@@ -1474,6 +1497,15 @@ class GatewayKanbanWatchersMixin:
                     results = await asyncio.to_thread(_tick_once)
                     any_spawned = False
                     for slug, res in (results or []):
+                        for tid, reason in (
+                            getattr(res, "preflight_failed", ()) if res is not None else ()
+                        ):
+                            logger.warning(
+                                "kanban dispatcher [%s]: blocked %s in worker preflight: %s",
+                                slug,
+                                tid,
+                                reason,
+                            )
                         if res is not None and getattr(res, "spawned", None):
                             any_spawned = True
                             # Quiet by default — only log when something actually

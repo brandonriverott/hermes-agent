@@ -75,6 +75,27 @@ def test_touch_activity_skips_persist_without_session_db(monkeypatch):
     assert agent._last_activity_provenance is ActivityProvenance.UNKNOWN
 
 
+def test_touch_activity_projects_description_to_kanban_progress(monkeypatch):
+    """A running card's ordinary agent activity becomes its automatic,
+    rate-limited progress note instead of a liveness-only heartbeat.
+    """
+    from tools import kanban_tools
+
+    agent = _agent_with_db()
+    heartbeat = MagicMock()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_progress")
+    monkeypatch.setattr(
+        kanban_tools, "heartbeat_current_worker_from_env", heartbeat
+    )
+    monkeypatch.setattr(
+        kanban_tools, "inject_new_comments_from_env", MagicMock()
+    )
+
+    agent._touch_activity("executing tool: terminal")
+
+    heartbeat.assert_called_once_with("executing tool: terminal")
+
+
 def test_touch_activity_accepts_named_provenance(monkeypatch):
     agent = _agent_with_db()
     monkeypatch.setattr(run_agent.time, "time", lambda: 1_700_000_000.0)

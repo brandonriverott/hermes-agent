@@ -981,6 +981,34 @@ def _make_create_ns(**overrides):
     return ns
 
 
+def test_cli_create_auto_subscribes_originating_tui_session(
+    kanban_home, monkeypatch,
+):
+    """Shelling out to ``hermes kanban create`` from a Hermes chat must not
+    lose the session route that the structured ``kanban_create`` tool keeps.
+
+    This is the path the #1638 conversation used: the card existed, but no
+    ``kanban_notify_subs`` row was written, so later lifecycle events had no
+    route back to the originating Desktop/TUI chat.
+    """
+    from hermes_cli import kanban as kb_cli
+
+    monkeypatch.setenv("HERMES_SESSION_KEY", "origin-session-key")
+
+    assert kb_cli._cmd_create(_make_create_ns(title="notify my chat")) == 0
+
+    with kb.connect_closing() as conn:
+        task = conn.execute(
+            "SELECT id FROM tasks WHERE title = ?", ("notify my chat",)
+        ).fetchone()
+        assert task is not None
+        subs = kb.list_notify_subs(conn, task["id"])
+
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "tui"
+    assert subs[0]["chat_id"] == "origin-session-key"
+
+
 def test_cli_daemon_help_marks_deprecated():
     """The argparse help string on `daemon` mentions deprecation so users
     scanning `--help` see the migration before running the stub."""
@@ -1406,5 +1434,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 

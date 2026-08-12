@@ -102,6 +102,41 @@ class TestCollectKanbanNotifications:
         assert len(rows) == 1
         assert rows[0]["last_event_id"] > pre_cursor
 
+    def test_delivers_worker_started_transition_once(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            kb._set_worker_pid(conn, tid, 43210)
+        finally:
+            conn.close()
+
+        first = _collect_kanban_notifications(_session())
+        second = _collect_kanban_notifications(_session())
+
+        assert len(first) == 1
+        assert tid in first[0]
+        assert "started" in first[0]
+        assert second == []
+
+    def test_delivers_explicit_progress_note_but_silences_automatic_heartbeat(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            assert kb.heartbeat_worker(conn, tid, note=None)
+            assert kb.heartbeat_worker(conn, tid, note="running mobile checks")
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert len(texts) == 1
+        assert tid in texts[0]
+        assert "running mobile checks" in texts[0]
+
     def test_non_tui_subscription_does_not_open_board_writable(self):
         tid = _create_subscribed_task(platform="telegram", chat_id="chat-1")
         # New subs start caught up at creation time (issue #29905); record the
@@ -221,6 +256,25 @@ class TestFormatKanbanEventText:
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
+
+    def test_spawned_reports_worker_started(self):
+        ev = SimpleNamespace(kind="spawned", payload={"pid": 43210})
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
+        assert "started" in text
+        assert "43210" not in text
+
+    def test_heartbeat_only_reports_human_readable_progress_notes(self):
+        silent = SimpleNamespace(kind="heartbeat", payload={})
+        progress = SimpleNamespace(
+            kind="heartbeat", payload={"note": "running mobile checks"}
+        )
+        assert _format_kanban_event_text(
+            self.SUB, self.TASK, silent, "main"
+        ) is None
+        text = _format_kanban_event_text(
+            self.SUB, self.TASK, progress, "main"
+        )
+        assert "running mobile checks" in text
 
 
 class TestNotificationPollerLoopKanbanWiring:
