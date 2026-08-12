@@ -357,6 +357,93 @@ def test_provider_free_happy_path_reaches_exact_completed_graph(reliability_rig)
     assert jdb.get_job(reliability_rig.conn, reliability_rig.job_id).claimed_by is None
 
 
+def test_nonpassing_reviewer_handoff_never_reaches_verified(reliability_rig):
+    passing = _passing_executor(reliability_rig)
+
+    def executor(context):
+        execution = passing(context)
+        return replace(
+            execution,
+            reviewer_handoff={
+                "speaker_role": "Independent Reviewer",
+                "speaker_executor": "claude",
+                "summary": "I found a concrete defect.",
+                "next_action": "Correct the defect and rerun review.",
+                "next_owner_role": "Claude Builder",
+                "verdict": "NEEDS_CHANGES",
+                "issues": [
+                    {
+                        "requirement": "Candidate correctness",
+                        "finding": "The candidate has a blocking defect.",
+                        "required_fix": "Correct the defect.",
+                    }
+                ],
+            },
+        )
+
+    result = reliability_rig.run(
+        executor,
+        gate_callback=_authoritative_gate(reliability_rig),
+        activation_callback=_passing_activation,
+    )
+    states = [
+        row["target_state"]
+        for row in jdb.list_transitions(reliability_rig.conn, reliability_rig.job_id)
+    ]
+
+    assert result.state == "FAILED"
+    assert result.reason == "REVIEW_NEEDS_CHANGES"
+    assert "VERIFIED" not in states
+    assert "COMPLETED" not in states
+
+
+def test_activation_callback_exception_settles_failed_without_stuck_verified(
+    reliability_rig,
+):
+    def raises(_context, _gate):
+        raise RuntimeError("activation callback exploded")
+
+    result = reliability_rig.run(
+        _passing_executor(reliability_rig),
+        gate_callback=_authoritative_gate(reliability_rig),
+        activation_callback=raises,
+    )
+    states = [
+        row["target_state"]
+        for row in jdb.list_transitions(reliability_rig.conn, reliability_rig.job_id)
+    ]
+
+    assert result.state == "FAILED"
+    assert result.journal_error == "RuntimeError"
+    assert states[-1] == "FAILED"
+    assert "VERIFIED" not in states
+    assert "COMPLETED" not in states
+    assert jdb.get_job(reliability_rig.conn, reliability_rig.job_id).claimed_by is None
+
+
+def test_malformed_activation_receipts_fail_before_verified(reliability_rig):
+    def malformed(context, gate):
+        return replace(
+            _passing_activation(context, gate),
+            activation_gate_digest="not-a-digest",
+        )
+
+    result = reliability_rig.run(
+        _passing_executor(reliability_rig),
+        gate_callback=_authoritative_gate(reliability_rig),
+        activation_callback=malformed,
+    )
+    states = [
+        row["target_state"]
+        for row in jdb.list_transitions(reliability_rig.conn, reliability_rig.job_id)
+    ]
+
+    assert result.state == "FAILED"
+    assert result.reason == "ACTIVATION_HANDOFF_INCOMPLETE"
+    assert "VERIFIED" not in states
+    assert "COMPLETED" not in states
+
+
 def test_lane_aware_happy_path_cleans_registered_worktree_before_idle(
     reliability_rig,
 ):

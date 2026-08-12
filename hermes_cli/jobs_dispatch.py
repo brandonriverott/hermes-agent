@@ -996,6 +996,7 @@ def dispatch_once(
         commit: str,
         force_blocked: bool = False,
         provider_handoff: object = None,
+        journal_error_override: Optional[str] = None,
     ) -> DispatchResult:
         decision = jobs_loop.classify_failure(signal)
         reported_reason = decision.reason_code
@@ -1116,9 +1117,10 @@ def dispatch_once(
                 "next_action": "Resolve the blocker and provide changed evidence.",
             }),
         )
-        journal_error = None
+        journal_error = journal_error_override
         try:
-            jobs_loop.append_failure_journal(
+            if journal_error is None:
+                jobs_loop.append_failure_journal(
                 jobs_loop.FailureJournalRecord(
                     job_id=job.id,
                     attempt_id=attempt_id,
@@ -1130,7 +1132,7 @@ def dispatch_once(
                     component_versions={"jobs_dispatch": "1"},
                 ),
                 path=failure_journal_path,
-            )
+                )
         except (OSError, ValueError) as exc:
             journal_error = type(exc).__name__
         return DispatchResult(
@@ -1468,15 +1470,25 @@ def dispatch_once(
         gate_evidence.commit != candidate
         or gate_evidence.themis_review_digest is None
         or gate_evidence.receipt_verification_digest is None
+        or not _DIGEST_RE.fullmatch(str(gate_evidence.themis_review_digest))
+        or not _DIGEST_RE.fullmatch(
+            str(gate_evidence.receipt_verification_digest)
+        )
     ):
-        return DispatchResult(
-            claimed=True,
-            reason="GATE_IDENTITY_MISMATCH",
-            job_id=job.id,
-            attempt_id=attempt_id,
-            state="REVIEWING",
-            failure_class="INFRA_FAILURE",
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="GATE_IDENTITY_MISMATCH", stage="review"
+            ),
+            evidence_digest=_digest(
+                {
+                    "gate_commit": gate_evidence.commit,
+                    "candidate": candidate,
+                    "themis_review": gate_evidence.themis_review_digest,
+                    "receipt_verification": gate_evidence.receipt_verification_digest,
+                }
+            ),
             commit=candidate,
+            provider_handoff=execution.reviewer_handoff,
         )
     if execution.reviewer_handoff is None:
         return fail(
@@ -1484,6 +1496,95 @@ def dispatch_once(
                 reason_code="HANDOFF_INCOMPLETE", stage="handoff"
             ),
             evidence_digest=_digest({"missing": "reviewer_handoff"}),
+            commit=candidate,
+            force_blocked=True,
+        )
+    if execution.reviewer_handoff.get("verdict") != "PASS":
+        verdict = str(execution.reviewer_handoff.get("verdict"))
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code=(
+                    "REVIEW_NEEDS_CHANGES"
+                    if verdict == "NEEDS_CHANGES"
+                    else "REVIEW_UNABLE_TO_VERIFY"
+                ),
+                stage="review",
+            ),
+            evidence_digest=_digest(
+                {
+                    "reviewer_handoff": execution.reviewer_handoff,
+                    "verdict": verdict,
+                }
+            ),
+            commit=candidate,
+            provider_handoff=execution.reviewer_handoff,
+        )
+    # Activation is evaluated while still REVIEWING so any callback refusal
+    # can settle a signed terminal edge without leaving VERIFIED custody.
+    try:
+        activation = activation_gate(context, gate_evidence)
+    except Exception as exc:  # noqa: BLE001 - preserve callback identity
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="ACTIVATION_GATE_EXCEPTION", safety_gate=True
+            ),
+            evidence_digest=_digest(
+                {"activation": "exception", "type": type(exc).__name__}
+            ),
+            commit=candidate,
+            force_blocked=True,
+            journal_error_override=type(exc).__name__,
+        )
+    if not isinstance(activation, ActivationDecision):
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="ACTIVATION_GATE_INVALID", safety_gate=True
+            ),
+            evidence_digest=_digest({"activation": "invalid"}),
+            commit=candidate,
+            force_blocked=True,
+        )
+    if activation.status != "PASS":
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code=activation.reason_code, safety_gate=True
+            ),
+            evidence_digest=activation.activation_gate_digest,
+            commit=candidate,
+            force_blocked=True,
+        )
+    required_completion_fields = {
+        "summary",
+        "next_action",
+        "observed_candidate",
+        "environment",
+        "gate_digest",
+        "rollback",
+    }
+    if (
+        not isinstance(activation.completion_handoff, Mapping)
+        or not required_completion_fields.issubset(activation.completion_handoff)
+        or any(
+            not isinstance(activation.completion_handoff.get(field), str)
+            or not activation.completion_handoff.get(field).strip()
+            or len(activation.completion_handoff.get(field)) > 700
+            for field in required_completion_fields
+        )
+        or _SHA_RE.fullmatch(
+            str(activation.completion_handoff.get("observed_candidate"))
+        ) is None
+        or not _DIGEST_RE.fullmatch(
+            str(activation.completion_handoff.get("gate_digest"))
+        )
+        or str(activation.completion_handoff.get("observed_candidate")) != candidate
+        or not _DIGEST_RE.fullmatch(str(activation.activation_gate_digest))
+        or not _DIGEST_RE.fullmatch(str(activation.completion_receipt_digest))
+    ):
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="ACTIVATION_HANDOFF_INCOMPLETE", safety_gate=True
+            ),
+            evidence_digest=_digest({"activation": "completion_handoff_invalid"}),
             commit=candidate,
             force_blocked=True,
         )
@@ -1534,82 +1635,6 @@ def dispatch_once(
                 commit=candidate,
             )
 
-    activation = activation_gate(context, gate_evidence)
-    if not isinstance(activation, ActivationDecision):
-        return fail(
-            jobs_loop.FailureSignal(
-                reason_code="ACTIVATION_GATE_INVALID", safety_gate=True
-            ),
-            evidence_digest=_digest({"activation": "invalid"}),
-            commit=candidate,
-            force_blocked=True,
-        )
-    if activation.status != "PASS":
-        return fail(
-            jobs_loop.FailureSignal(
-                reason_code=activation.reason_code, safety_gate=True
-            ),
-            evidence_digest=activation.activation_gate_digest,
-            commit=candidate,
-            force_blocked=True,
-        )
-    required_completion_fields = {
-        "summary",
-        "next_action",
-        "observed_candidate",
-        "environment",
-        "gate_digest",
-        "rollback",
-    }
-    if (
-        not isinstance(activation.completion_handoff, Mapping)
-        or not required_completion_fields.issubset(activation.completion_handoff)
-        or any(
-            not isinstance(activation.completion_handoff.get(field), str)
-            or not activation.completion_handoff.get(field).strip()
-            or len(activation.completion_handoff.get(field)) > 700
-            for field in required_completion_fields
-        )
-    ):
-        return fail(
-            jobs_loop.FailureSignal(
-                reason_code="ACTIVATION_HANDOFF_INCOMPLETE", safety_gate=True
-            ),
-            evidence_digest=_digest({"activation": "completion_handoff_missing"}),
-            commit=candidate,
-            force_blocked=True,
-        )
-    if (
-        _SHA_RE.fullmatch(str(activation.completion_handoff["observed_candidate"]))
-        is None
-        or not _DIGEST_RE.fullmatch(
-            str(activation.completion_handoff["gate_digest"])
-        )
-    ):
-        return fail(
-            jobs_loop.FailureSignal(
-                reason_code="ACTIVATION_HANDOFF_INCOMPLETE", safety_gate=True
-            ),
-            evidence_digest=_digest({"activation": "completion_handoff_malformed"}),
-            commit=candidate,
-            force_blocked=True,
-        )
-    if str(activation.completion_handoff.get("observed_candidate", candidate)) != candidate:
-        return fail(
-            jobs_loop.FailureSignal(
-                reason_code="ACTIVATION_CANDIDATE_MISMATCH", safety_gate=True
-            ),
-            evidence_digest=_digest(
-                {
-                    "observed_candidate": activation.completion_handoff.get(
-                        "observed_candidate"
-                    ),
-                    "candidate": candidate,
-                }
-            ),
-            commit=candidate,
-            force_blocked=True,
-        )
     advance(
         "COMPLETED",
         {

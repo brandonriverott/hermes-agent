@@ -193,8 +193,7 @@ def decide_retry(
         changed_evidence_digest is not None
         and not _DIGEST.fullmatch(changed_evidence_digest)
     ) or (
-        prior_failure_digest is not None
-        and not _DIGEST.fullmatch(prior_failure_digest)
+        prior_failure_digest is not None and not _DIGEST.fullmatch(prior_failure_digest)
     ):
         return RetryDecision("BLOCKED", "RETRY_REQUIRES_CHANGED_EVIDENCE", 0)
     if any(
