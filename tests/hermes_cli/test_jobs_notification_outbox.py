@@ -667,3 +667,38 @@ def test_unavailable_older_job_does_not_starve_a_new_job_notification(conn):
 
     assert claimed.notification_id == newer_row.notification_id
     assert claimed.notification_id != older_row.notification_id
+
+
+def test_no_progress_heartbeat_is_idempotent_and_retries_in_order(conn):
+    import time
+
+    job_id = _queued_job(conn)
+    row = jn.list_notifications(conn, job_id=job_id)[0]
+    base = int(time.time())
+
+    claimed = jn.claim_due(conn, owner="watcher", now=base, lease_seconds=30)
+    assert claimed.notification_id == row.notification_id
+    jn.acknowledge(conn, row.notification_id, owner="watcher", now=base + 1)
+
+    stagnant_at = base + jn.HEARTBEAT_AFTER_SECONDS + 1
+    assert jn.enqueue_due_heartbeats(conn, now=stagnant_at) == [
+        f"n:{job_id}:1:heartbeat"
+    ]
+    # A watcher restart in the same stagnant phase cannot create a duplicate.
+    assert jn.enqueue_due_heartbeats(conn, now=stagnant_at + 1) == []
+
+    heartbeat = jn.claim_due(conn, owner="watcher", now=stagnant_at)
+    assert heartbeat.milestone == jn.MILESTONE_HEARTBEAT
+    retry_at = stagnant_at + 60
+    jn.release_claim(
+        conn,
+        heartbeat.notification_id,
+        owner="watcher",
+        now=stagnant_at,
+        retry_at=retry_at,
+        error="origin temporarily unavailable",
+    )
+    assert jn.claim_due(conn, owner="watcher", now=retry_at - 1) is None
+    retried = jn.claim_due(conn, owner="watcher", now=retry_at)
+    assert retried.notification_id == heartbeat.notification_id
+    assert retried.delivery_attempts == 2

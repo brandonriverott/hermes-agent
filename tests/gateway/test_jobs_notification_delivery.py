@@ -465,13 +465,29 @@ def test_unavailable_session_remains_pending(jobs_path, session_db):
         conn.close()
     session_db.create_session("decoy", source="telegram")
 
-    assert _deliver(session_db, jobs_path) is not None
+    now = int(time.time())
+    assert _deliver(session_db, jobs_path, now=now) is not None
     assert _messages(session_db, "decoy") == []
     conn = jdb.connect(jobs_path)
     try:
         row = jn.list_notifications(conn)[0]
         assert row.delivered_at is None
-        assert row.next_attempt_at > int(time.time())
+        assert row.delivery_attempts == 1
+        assert row.next_attempt_at > now
+        retry_at = row.next_attempt_at
+    finally:
+        conn.close()
+
+    # A retry makes no progress while the exact origin is still unavailable;
+    # it remains pending and never falls back to the decoy session.
+    assert _deliver(session_db, jobs_path, now=retry_at) is not None
+    assert _messages(session_db, "decoy") == []
+    conn = jdb.connect(jobs_path)
+    try:
+        row = jn.list_notifications(conn)[0]
+        assert row.delivered_at is None
+        assert row.delivery_attempts == 2
+        assert row.next_attempt_at > retry_at
     finally:
         conn.close()
 
