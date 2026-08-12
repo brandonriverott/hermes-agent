@@ -30,26 +30,26 @@ MILESTONE_ASSIGNED = "assigned"
 MILESTONE_BUILDING = "building"
 MILESTONE_TESTING = "testing"
 MILESTONE_REVIEW = "review"
+MILESTONE_REVIEW_APPROVED = "review-approved"
 MILESTONE_CORRECTING = "correcting"
 MILESTONE_NEEDS_YOU = "needs-you"
 MILESTONE_FAILURE = "failure"
 MILESTONE_FINISHED = "finished"
 MILESTONE_HEARTBEAT = "heartbeat"
 
-ALL_MILESTONES = frozenset(
-    {
-        MILESTONE_QUEUED,
-        MILESTONE_ASSIGNED,
-        MILESTONE_BUILDING,
-        MILESTONE_TESTING,
-        MILESTONE_REVIEW,
-        MILESTONE_CORRECTING,
-        MILESTONE_NEEDS_YOU,
-        MILESTONE_FAILURE,
-        MILESTONE_FINISHED,
-        MILESTONE_HEARTBEAT,
-    }
-)
+ALL_MILESTONES = frozenset({
+    MILESTONE_QUEUED,
+    MILESTONE_ASSIGNED,
+    MILESTONE_BUILDING,
+    MILESTONE_TESTING,
+    MILESTONE_REVIEW,
+    MILESTONE_REVIEW_APPROVED,
+    MILESTONE_CORRECTING,
+    MILESTONE_NEEDS_YOU,
+    MILESTONE_FAILURE,
+    MILESTONE_FINISHED,
+    MILESTONE_HEARTBEAT,
+})
 
 # One heartbeat is emitted per stagnant phase episode, and only after this
 # many seconds have passed since the phase's milestone was delivered.
@@ -91,27 +91,25 @@ def milestone_for_state(
     """The user milestone for a graph target state, or ``None``.
 
     ``QUEUED`` milestones are emitted at Job creation, not per attempt;
-    ``VERIFIED`` and ``CANCELLED`` are durable graph states with no chat
-    milestone.  A ``FAILED`` attempt is ``failure`` only when it was declared
+    ``BUILDING`` is a signed internal edge and ``CANCELLED`` has no chat
+    milestone. A ``FAILED`` attempt is ``failure`` only when it was declared
     terminal; otherwise it is ``correcting`` (a retry/re-review is coming).
     """
     if target_state == "ASSIGNED":
         return MILESTONE_ASSIGNED
-    if target_state == "BUILDING":
-        return MILESTONE_BUILDING
     if target_state == "EVIDENCE_COLLECTING":
         return MILESTONE_TESTING
     if target_state == "REVIEWING":
         return MILESTONE_REVIEW
+    if target_state == "VERIFIED":
+        return MILESTONE_REVIEW_APPROVED
     if target_state == "BLOCKED":
         return MILESTONE_NEEDS_YOU
     if target_state == "COMPLETED":
         return MILESTONE_FINISHED
     if target_state == "FAILED":
         return (
-            MILESTONE_FAILURE
-            if attempt_terminal_failure == 1
-            else MILESTONE_CORRECTING
+            MILESTONE_FAILURE if attempt_terminal_failure == 1 else MILESTONE_CORRECTING
         )
     return None
 
@@ -426,14 +424,10 @@ def render_milestone_message(
         MILESTONE_QUEUED: f"Queued — {name} (#{number}) accepted",
         MILESTONE_ASSIGNED: f"Assigned — {name} (#{number}) started",
         MILESTONE_BUILDING: f"Building — {name} (#{number}) in progress",
-        MILESTONE_TESTING: (
-            f"Testing — {name} (#{number}) running tests and evidence"
-        ),
+        MILESTONE_TESTING: (f"Testing — {name} (#{number}) running tests and evidence"),
         MILESTONE_REVIEW: f"Review — {name} (#{number}) under review",
         MILESTONE_CORRECTING: f"Correcting — {name} (#{number}) fixing findings",
-        MILESTONE_NEEDS_YOU: (
-            f"Needs you — {name} (#{number}) requires your decision"
-        ),
+        MILESTONE_NEEDS_YOU: (f"Needs you — {name} (#{number}) requires your decision"),
         MILESTONE_FAILURE: f"Failed — {name} (#{number}) ended unsuccessfully",
         MILESTONE_FINISHED: f"Finished — {name} (#{number}) complete",
     }
@@ -500,9 +494,7 @@ def enqueue_due_heartbeats(
                 "name": anchor.payload.get("name"),
                 "phase": anchor.milestone,
             }
-            payload_json = json.dumps(
-                payload, ensure_ascii=False, sort_keys=True
-            )
+            payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             if len(payload_json) > MAX_PAYLOAD_CHARS:
                 raise ValueError("heartbeat payload exceeds size bound")
             cursor = conn.execute(
@@ -544,6 +536,7 @@ __all__ = [
     "MILESTONE_NEEDS_YOU",
     "MILESTONE_QUEUED",
     "MILESTONE_REVIEW",
+    "MILESTONE_REVIEW_APPROVED",
     "MILESTONE_TESTING",
     "NotificationClaimError",
     "NotificationRecord",

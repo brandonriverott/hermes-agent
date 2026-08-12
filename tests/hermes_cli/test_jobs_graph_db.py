@@ -5,6 +5,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from hermes_cli import jobs_db as jdb
+from hermes_cli import jobs_handoffs as handoffs
 from hermes_cli import jobs_receipts as receipts
 
 
@@ -22,14 +23,24 @@ def signing_key():
     return Ed25519PrivateKey.generate()
 
 
-def _signed(signing_key, *, receipt_id, job_id, attempt_id, state):
+def _signed(
+    signing_key,
+    *,
+    receipt_id,
+    job_id,
+    attempt_id,
+    state,
+    evidence=None,
+    handoff=None,
+):
     return receipts.sign_receipt(
         {
             "job_id": job_id,
             "attempt_id": attempt_id,
             "commit": "c" * 40,
             "state": state,
-            "evidence": {},
+            "evidence": {} if evidence is None else dict(evidence),
+            "handoff": handoff,
             "timestamp": "2026-08-09T00:00:00Z",
             "transitioned_by": "jobs_graph/1",
         },
@@ -41,7 +52,14 @@ def _signed(signing_key, *, receipt_id, job_id, attempt_id, state):
 
 def _attempt(conn):
     job_id = jdb.create_job(conn, requested_lane="claude", name="job", goal="goal")
-    claim = jdb.claim_job(conn, specialist="claude-builder", worker="worker", lease_seconds=60, job=job_id, now=1)
+    claim = jdb.claim_job(
+        conn,
+        specialist="claude-builder",
+        worker="worker",
+        lease_seconds=60,
+        job=job_id,
+        now=1,
+    )
     attempt_id = jdb.start_attempt(
         conn,
         job_id,
@@ -74,12 +92,42 @@ def _transition(conn, signing_key, *, idempotency_key="transition:queued"):
         idempotency_key=idempotency_key,
         created_at=3,
     )
+    transition_handoff = handoffs.normalize_handoff(
+        {
+            "summary": "Attempt entered the Job graph.",
+            "evidence_summary": [
+                {
+                    "label": "Attempt created",
+                    "result": "Recorded.",
+                    "digest": write.evidence["attempt_created"],
+                }
+            ],
+            "next_action": "Route this bounded Job attempt.",
+            "issues": [],
+            "decision_request": None,
+        },
+        job_id=job_id,
+        attempt_id=attempt_id,
+        speaker_id="test",
+        speaker_role="system",
+        speaker_executor="hermes",
+        from_phase="ATTEMPT_CREATED",
+        to_phase="QUEUED",
+        next_owner_role="router",
+        outcome="started",
+        artifact_identity=None,
+        transition_evidence=dict(write.evidence),
+        created_at=write.created_at,
+    )
+    write = replace(write, handoff=transition_handoff)
     envelope = _signed(
         signing_key,
         receipt_id=write.receipt_id,
         job_id=job_id,
         attempt_id=attempt_id,
         state="QUEUED",
+        evidence=write.evidence,
+        handoff=write.handoff,
     )
     return write, envelope
 
@@ -107,6 +155,119 @@ def test_reliability_schema_is_additive_and_idempotent(tmp_path):
         } <= tables
     finally:
         second.close()
+
+
+def test_transition_schema_adds_nullable_handoff_without_rewriting_history(conn):
+    columns = {
+        row["name"]: row
+        for row in conn.execute("PRAGMA table_info(job_attempt_transitions)")
+    }
+
+    assert columns["handoff_json"]["notnull"] == 0
+
+
+def test_transition_round_trip_carries_exact_validated_handoff(conn, signing_key):
+    write, envelope = _transition(conn, signing_key)
+
+    transition_id = jdb.record_transition(conn, write, envelope)
+
+    row = jdb.latest_transition(conn, write.attempt_id)
+    assert row["id"] == transition_id
+    assert row["handoff"] == write.handoff
+    assert jdb.list_transitions(conn, write.job_id)[0]["handoff"] == write.handoff
+    assert jdb.latest_handoff(conn, write.attempt_id) == write.handoff
+    stored = conn.execute(
+        "SELECT handoff_json FROM job_attempt_transitions WHERE id = ?",
+        (transition_id,),
+    ).fetchone()["handoff_json"]
+    assert stored.encode("utf-8") == receipts.canonical_json_bytes(write.handoff)
+
+
+def test_record_transition_rejects_signed_handoff_mismatch_before_mutation(
+    conn, signing_key
+):
+    write, _ = _transition(conn, signing_key)
+    changed = dict(write.handoff)
+    changed["summary"] = "Different signed facts."
+    envelope = _signed(
+        signing_key,
+        receipt_id=write.receipt_id,
+        job_id=write.job_id,
+        attempt_id=write.attempt_id,
+        state=write.target_state,
+        evidence=write.evidence,
+        handoff=changed,
+    )
+    revision = jdb.get_job(conn, write.job_id).revision
+
+    with pytest.raises(
+        receipts.ReceiptVerificationError,
+        match="receipt handoff identity mismatch",
+    ):
+        jdb.record_transition(conn, write, envelope)
+
+    assert jdb.get_job(conn, write.job_id).revision == revision
+    assert jdb.list_transitions(conn, write.job_id) == []
+    assert jdb.get_receipts(conn, write.job_id) == []
+
+
+def test_historical_transition_migrates_to_null_handoff_without_inference(
+    tmp_path, signing_key
+):
+    path = tmp_path / "historical.db"
+    first = jdb.connect(path)
+    write, envelope = _transition(first, signing_key)
+    jdb.record_transition(first, write, envelope)
+    first.execute("ALTER TABLE job_attempt_transitions DROP COLUMN handoff_json")
+    first.commit()
+    first.close()
+    jdb._INITIALIZED_PATHS.discard(str(path.resolve()))
+
+    reopened = jdb.connect(path)
+    try:
+        raw = reopened.execute(
+            "SELECT handoff_json FROM job_attempt_transitions"
+        ).fetchone()
+        assert raw["handoff_json"] is None
+        assert jdb.latest_handoff(reopened, write.attempt_id) is None
+        assert jdb.latest_transition(reopened, write.attempt_id)["handoff"] is None
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "match"),
+    [
+        ("handoff_json", "{", "persisted handoff.*canonical JSON"),
+        (
+            "handoff_json",
+            receipts.canonical_json_bytes({"unknown": "field"}).decode("utf-8"),
+            "persisted handoff.*unknown",
+        ),
+        ("evidence_json", "{", "transition evidence.*canonical JSON"),
+        ("evidence_json", "[]", "transition evidence.*exact JSON object"),
+        (
+            "evidence_json",
+            receipts.canonical_json_bytes({
+                "attempt_created": "sha256:" + "f" * 64
+            }).decode("utf-8"),
+            "evidence_summary.*not bound",
+        ),
+    ],
+)
+def test_latest_handoff_rejects_malformed_persisted_handoff_or_evidence(
+    conn, signing_key, column, value, match
+):
+    write, envelope = _transition(conn, signing_key)
+    jdb.record_transition(conn, write, envelope)
+    conn.execute(
+        f"UPDATE job_attempt_transitions SET {column} = ? WHERE attempt_id = ?",
+        (value, write.attempt_id),
+    )
+    conn.commit()
+
+    with pytest.raises(handoffs.HandoffValidationError, match=match):
+        jdb.latest_handoff(conn, write.attempt_id)
 
 
 def test_transition_and_receipt_rollback_together(conn, signing_key):
@@ -184,8 +345,29 @@ def test_transition_idempotency_requires_an_exact_material_match(conn, signing_k
         transition_id
     ]
     with pytest.raises(jdb.GraphConflict):
-        jdb.record_transition(conn, replace(write, target_state="ASSIGNED"), envelope)
-    assert conn.execute("SELECT COUNT(*) FROM job_attempt_transitions").fetchone()[0] == 1
+        jdb.record_transition(
+            conn, replace(write, initiator_type="different"), envelope
+        )
+    changed_handoff = dict(write.handoff)
+    changed_handoff["summary"] = "Different canonical facts."
+    changed_envelope = _signed(
+        signing_key,
+        receipt_id=write.receipt_id,
+        job_id=write.job_id,
+        attempt_id=write.attempt_id,
+        state=write.target_state,
+        evidence=write.evidence,
+        handoff=changed_handoff,
+    )
+    with pytest.raises(jdb.GraphConflict):
+        jdb.record_transition(
+            conn,
+            replace(write, handoff=changed_handoff),
+            changed_envelope,
+        )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM job_attempt_transitions").fetchone()[0] == 1
+    )
     assert conn.execute("SELECT COUNT(*) FROM job_receipts").fetchone()[0] == 1
 
 

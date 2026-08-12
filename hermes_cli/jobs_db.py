@@ -41,7 +41,18 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from hermes_cli import jobs_identity as ji
 from hermes_cli import jobs_notifications as jnotif
@@ -436,6 +447,7 @@ CREATE TABLE IF NOT EXISTS job_attempt_transitions (
     initiator_id          TEXT NOT NULL,
     expected_job_revision INTEGER NOT NULL,
     evidence_json         TEXT NOT NULL,
+    handoff_json          TEXT,
     failure_class         TEXT,
     blocker_code          TEXT,
     receipt_id            TEXT NOT NULL REFERENCES job_receipts(id),
@@ -971,6 +983,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "job_notifications", "blocked_reason", "blocked_reason TEXT"
     )
+    # Historical graph rows predate substantive handoffs. Preserve that truth:
+    # NULL means no handoff was recorded, and migration never infers one.
+    add_column_if_missing(
+        conn, "job_attempt_transitions", "handoff_json", "handoff_json TEXT"
+    )
     # A response stored before these existed cannot be re-sealed from the row
     # alone, so it arrives NULL and :func:`_validated_response_locked` refuses
     # it rather than inventing a seal for bytes nobody can vouch for.
@@ -988,20 +1005,24 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # with ADD COLUMN, so a rewritten row is bounded on the way in.
     for table, name, ddl in (
         (
-            "job_attempts", "base_commit",
+            "job_attempts",
+            "base_commit",
             "base_commit TEXT CHECK "
             "(base_commit IS NULL OR length(base_commit) BETWEEN 7 AND 64)",
         ),
         (
-            "job_run_requests", "route",
+            "job_run_requests",
+            "route",
             "route TEXT CHECK (route IS NULL OR length(route) <= 200)",
         ),
         (
-            "job_run_requests", "reason",
+            "job_run_requests",
+            "reason",
             "reason TEXT CHECK (reason IS NULL OR length(reason) BETWEEN 1 AND 64)",
         ),
         (
-            "job_run_requests", "error",
+            "job_run_requests",
+            "error",
             "error TEXT CHECK (error IS NULL OR length(error) <= 4096)",
         ),
     ):
@@ -1091,9 +1112,7 @@ def _new_claim_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def _bump_revision_locked(
-    conn: sqlite3.Connection, job_id: str, now: int
-) -> None:
+def _bump_revision_locked(conn: sqlite3.Connection, job_id: str, now: int) -> None:
     """Increment a Job's monotonic revision. Caller holds the write txn.
 
     Used by mutators that don't already ``UPDATE jobs`` (attempt/receipt
@@ -1144,6 +1163,7 @@ class TransitionWrite:
     idempotency_key: str
     created_at: int
     commit: Optional[str] = None
+    handoff: Optional[Mapping[str, object]] = None
 
 
 @dataclass(frozen=True)
@@ -1292,7 +1312,9 @@ def _append_event_locked(
         if existing is not None:
             return _event_to_dict(existing)
     now = _now() if now is None else now
-    payload = None if data is None else json.dumps(data, ensure_ascii=False, sort_keys=True)
+    payload = (
+        None if data is None else json.dumps(data, ensure_ascii=False, sort_keys=True)
+    )
     cur = conn.execute(
         "INSERT INTO job_events (job_id, kind, data, idempotency_key, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -1486,9 +1508,9 @@ def _create_job_locked(
     # deleted Job row must not free its number for reuse. Atomic with the INSERT
     # because both run inside this one IMMEDIATE transaction.
     conn.execute("UPDATE job_number_seq SET last = last + 1 WHERE id = 1")
-    number = conn.execute(
-        "SELECT last FROM job_number_seq WHERE id = 1"
-    ).fetchone()["last"]
+    number = conn.execute("SELECT last FROM job_number_seq WHERE id = 1").fetchone()[
+        "last"
+    ]
     conn.execute(
         "INSERT INTO jobs "
         "(id, number, name, goal, status, step, requested_lane, executor, "
@@ -1534,8 +1556,7 @@ def _create_job_locked(
                 )
             }
             conn.execute(
-                "INSERT INTO job_origins (job_id, origin, created_at) "
-                "VALUES (?, ?, ?)",
+                "INSERT INTO job_origins (job_id, origin, created_at) VALUES (?, ?, ?)",
                 (jid, json.dumps(allowed, ensure_ascii=False, sort_keys=True), now),
             )
             # The exact-origin Job's ``queued`` milestone commits in this same
@@ -1607,9 +1628,7 @@ def get_job(conn: sqlite3.Connection, id_or_number) -> Optional[Job]:
 
     number = _resolve_number(id_or_number)
     if number is not None:
-        row = conn.execute(
-            "SELECT * FROM jobs WHERE number = ?", (number,)
-        ).fetchone()
+        row = conn.execute("SELECT * FROM jobs WHERE number = ?", (number,)).fetchone()
         if row is not None:
             return _attach_correlations(conn, _job_from_row(row))
 
@@ -1632,9 +1651,7 @@ def _attach_correlations(conn: sqlite3.Connection, job: Job) -> Job:
     return job
 
 
-def list_jobs(
-    conn: sqlite3.Connection, *, status: Optional[str] = None
-) -> List[Job]:
+def list_jobs(conn: sqlite3.Connection, *, status: Optional[str] = None) -> List[Job]:
     """All jobs, newest number last. Optionally filter by public status."""
     if status is not None and status not in PUBLIC_STATUSES:
         raise ValueError(f"invalid status filter: {status!r}")
@@ -1673,7 +1690,9 @@ def transition(
     ``job_transition`` event is appended in the same transaction as the update.
     """
     if status not in PUBLIC_STATUSES:
-        raise ValueError(f"invalid status: {status!r} (expected one of {PUBLIC_STATUSES})")
+        raise ValueError(
+            f"invalid status: {status!r} (expected one of {PUBLIC_STATUSES})"
+        )
     if step not in JOB_STEPS:
         raise ValueError(f"invalid step: {step!r} (expected one of {JOB_STEPS})")
 
@@ -1684,7 +1703,9 @@ def transition(
             raise ValueError(f"no such job: {id_or_number!r}")
         # Operation-level idempotency: a seen key no-ops the whole op, before any
         # state change, returning the state the first operation left behind.
-        if idempotency_key is not None and _event_key_seen(conn, job.id, idempotency_key):
+        if idempotency_key is not None and _event_key_seen(
+            conn, job.id, idempotency_key
+        ):
             return job
         if status not in VALID_TRANSITIONS[job.status]:
             raise InvalidTransition(
@@ -1779,7 +1800,9 @@ def reassign_specialist(
         job = get_job(conn, id_or_number)
         if job is None:
             raise ValueError(f"no such job: {id_or_number!r}")
-        if idempotency_key is not None and _event_key_seen(conn, job.id, idempotency_key):
+        if idempotency_key is not None and _event_key_seen(
+            conn, job.id, idempotency_key
+        ):
             return job
         if job.status == "finished":
             raise InvalidTransition(
@@ -1857,7 +1880,9 @@ def set_step(
         job = get_job(conn, id_or_number)
         if job is None:
             raise ValueError(f"no such job: {id_or_number!r}")
-        if idempotency_key is not None and _event_key_seen(conn, job.id, idempotency_key):
+        if idempotency_key is not None and _event_key_seen(
+            conn, job.id, idempotency_key
+        ):
             return job
         conn.execute(
             "UPDATE jobs SET step = ?, updated_at = ?, revision = revision + 1 "
@@ -2088,9 +2113,12 @@ def start_attempt(
         )
         if request_id is not None:
             _bind_request_locked(
-                conn, _clean_request_id(request_id),
+                conn,
+                _clean_request_id(request_id),
                 owner=_clean_owner(request_owner),
-                job_id=job.id, attempt_id=aid, now=now,
+                job_id=job.id,
+                attempt_id=aid,
+                now=now,
             )
         _append_event_locked(
             conn,
@@ -2265,8 +2293,7 @@ def _validate_finish_arguments(
         raise ValueError("a succeeded attempt must not carry a failure_class")
     if terminal_failure and status != "failed":
         raise ValueError(
-            "terminal_failure is only valid on a 'failed' attempt, "
-            f"got {status!r}"
+            f"terminal_failure is only valid on a 'failed' attempt, got {status!r}"
         )
     return status
 
@@ -2420,7 +2447,9 @@ def _finish_attempt_locked(
     wrote rather than from the running row it started with.
     """
     sets = [
-        "status = ?", "failure_class = ?", "finished_at = ?",
+        "status = ?",
+        "failure_class = ?",
+        "finished_at = ?",
         "terminal_failure = ?",
     ]
     params: List[Any] = [status, failure_class, now, 1 if terminal_failure else 0]
@@ -2434,9 +2463,7 @@ def _finish_attempt_locked(
             sets.append(f"{col} = ?")
             params.append(val)
     params.append(attempt["id"])
-    conn.execute(
-        f"UPDATE job_attempts SET {', '.join(sets)} WHERE id = ?", params
-    )
+    conn.execute(f"UPDATE job_attempts SET {', '.join(sets)} WHERE id = ?", params)
     if outcome is None:
         # Bump revision and detach this attempt from the Job if it was the
         # current one — a CASE keeps a concurrently-started newer attempt's
@@ -2498,7 +2525,8 @@ def _finish_attempt_locked(
             receipt,
             now=now,
             authoritative=(
-                None if v3_narrative is None
+                None
+                if v3_narrative is None
                 else _v3_receipt_envelope(settled, **v3_narrative)
             ),
         )
@@ -2538,12 +2566,30 @@ def _canonical(data: dict) -> str:
 V3_RECEIPT_SCHEMA_VERSION = 3
 V3_RECEIPT_KIND = "jobs-attempt-final"
 V3_RECEIPT_EVIDENCE_KEYS = (
-    "repository", "base_commit", "branch", "worktree", "commit",
+    "repository",
+    "base_commit",
+    "branch",
+    "worktree",
+    "commit",
 )
 V3_RECEIPT_REQUIRED_KEYS = (
-    "schema_version", "kind", "request_id", "job_id", "attempt_id", "ordinal",
-    "repository", "base_commit", "branch", "worktree", "commit", "status",
-    "failure_class", "route", "reason", "error", "evidence",
+    "schema_version",
+    "kind",
+    "request_id",
+    "job_id",
+    "attempt_id",
+    "ordinal",
+    "repository",
+    "base_commit",
+    "branch",
+    "worktree",
+    "commit",
+    "status",
+    "failure_class",
+    "route",
+    "reason",
+    "error",
+    "evidence",
 )
 
 
@@ -2623,7 +2669,8 @@ def _add_final_receipt_locked(
                 )
         receipt = {**receipt, **authoritative}
     if (receipt.get("status"), receipt.get("failure_class")) != (
-        attempt["status"], attempt["failure_class"],
+        attempt["status"],
+        attempt["failure_class"],
     ):
         raise ValueError(
             f"final receipt disagrees with attempt {attempt['id']}: receipt says "
@@ -2718,9 +2765,7 @@ def settle_attempt(
     transaction and are restated in the final receipt, so neither document is
     the only place they exist.
     """
-    _validate_finish_arguments(
-        status, failure_class, terminal_failure=terminal_failure
-    )
+    _validate_finish_arguments(status, failure_class, terminal_failure=terminal_failure)
     if get_attempt(conn, attempt_id) is None:
         raise ValueError(f"no such attempt: {attempt_id!r}")
 
@@ -2749,19 +2794,33 @@ def settle_attempt(
         # never supplied stays absent rather than becoming an empty string a
         # bounds constraint would have to argue with.
         narrative = _screen_settlement(
-            {k: v for k, v in (
-                ("route", route), ("reason", reason), ("error", error),
-            ) if v is not None},
+            {
+                k: v
+                for k, v in (
+                    ("route", route),
+                    ("reason", reason),
+                    ("error", error),
+                )
+                if v is not None
+            },
             capabilities,
         )
         narrative = {k: narrative.get(k) for k in ("route", "reason", "error")}
-        v3_narrative = None if request_id is None else {
-            "request_id": _clean_request_id(request_id), **narrative,
-        }
+        v3_narrative = (
+            None
+            if request_id is None
+            else {
+                "request_id": _clean_request_id(request_id),
+                **narrative,
+            }
+        )
         if request_id is not None:
             request_row = _owned_request_locked(
-                conn, request_id, owner=request_owner,
-                job_id=row["job_id"], attempt_id=attempt_id,
+                conn,
+                request_id,
+                owner=request_owner,
+                job_id=row["job_id"],
+                attempt_id=attempt_id,
             )
             if request_row["response"] is not None:
                 # Already settled under this request. An idempotent repeat is a
@@ -2779,8 +2838,10 @@ def settle_attempt(
                 failure_class=failure_class,
                 terminal_failure=terminal_failure,
                 evidence={
-                    "commit": commit, "branch": branch,
-                    "worktree": worktree, "repository": repository,
+                    "commit": commit,
+                    "branch": branch,
+                    "worktree": worktree,
+                    "repository": repository,
                 },
             )
             if conflict is not None:
@@ -2789,14 +2850,21 @@ def settle_attempt(
                     f"conflicts on {conflict}"
                 )
             settled = _attempt_to_dict(row)
-            had_receipt = conn.execute(
-                "SELECT 1 FROM job_receipts WHERE job_id = ? AND idempotency_key = ?",
-                (row["job_id"], final_receipt_key(attempt_id)),
-            ).fetchone() is not None
+            had_receipt = (
+                conn.execute(
+                    "SELECT 1 FROM job_receipts WHERE job_id = ? AND idempotency_key = ?",
+                    (row["job_id"], final_receipt_key(attempt_id)),
+                ).fetchone()
+                is not None
+            )
             receipt_id = _add_final_receipt_locked(
-                conn, settled, receipt, now=now,
+                conn,
+                settled,
+                receipt,
+                now=now,
                 authoritative=(
-                    None if v3_narrative is None
+                    None
+                    if v3_narrative is None
                     else _v3_receipt_envelope(settled, **v3_narrative)
                 ),
             )
@@ -2807,16 +2875,25 @@ def settle_attempt(
                 # writes nothing and leaves it exactly where it was.
                 _bump_revision_locked(conn, row["job_id"], now)
             record = _run_record(
-                conn, settled, receipt_id,
-                request_id=request_id, request_data=request_data,
+                conn,
+                settled,
+                receipt_id,
+                request_id=request_id,
+                request_data=request_data,
                 narrative=narrative,
             )
             if request_id is not None:
                 record = _store_response_locked(
-                    conn, request_id, owner=request_owner,
-                    job_id=row["job_id"], attempt_id=attempt_id,
-                    receipt_id=receipt_id, record=record, now=now,
-                    capabilities=capabilities, narrative=v3_narrative,
+                    conn,
+                    request_id,
+                    owner=request_owner,
+                    job_id=row["job_id"],
+                    attempt_id=attempt_id,
+                    receipt_id=receipt_id,
+                    record=record,
+                    now=now,
+                    capabilities=capabilities,
+                    narrative=v3_narrative,
                 )
             return {
                 "attempt": settled,
@@ -2853,21 +2930,32 @@ def settle_attempt(
             (row["job_id"], final_receipt_key(attempt_id)),
         ).fetchone()["id"]
         record = _run_record(
-            conn, settled, receipt_id,
-            request_id=request_id, request_data=request_data,
+            conn,
+            settled,
+            receipt_id,
+            request_id=request_id,
+            request_data=request_data,
             narrative=narrative,
         )
         if request_id is not None:
             # Stored, then read back out of the column: an idempotent repeat
             # hands back the response this settlement wrote, never a fresher one.
             record = _store_response_locked(
-                conn, request_id, owner=request_owner,
-                job_id=row["job_id"], attempt_id=attempt_id,
-                receipt_id=receipt_id, record=record, now=now,
-                capabilities=capabilities, narrative=v3_narrative,
+                conn,
+                request_id,
+                owner=request_owner,
+                job_id=row["job_id"],
+                attempt_id=attempt_id,
+                receipt_id=receipt_id,
+                record=record,
+                now=now,
+                capabilities=capabilities,
+                narrative=v3_narrative,
             )
         return {
-            "attempt": settled, "receipt_id": receipt_id, "run_record": record,
+            "attempt": settled,
+            "receipt_id": receipt_id,
+            "run_record": record,
         }
 
 
@@ -2919,12 +3007,16 @@ def _run_record(
         "receipt_id": receipt_id,
         # The narrative this settlement is about to persist in typed columns,
         # not whatever the caller's ``request_data`` happened to say.
-        **({} if not narrative else {
-            "route": narrative["route"],
-            "routing_reason": narrative["route"],
-            "reason": narrative["reason"],
-            "error": narrative["error"],
-        }),
+        **(
+            {}
+            if not narrative
+            else {
+                "route": narrative["route"],
+                "routing_reason": narrative["route"],
+                "reason": narrative["reason"],
+                "error": narrative["error"],
+            }
+        ),
     }
 
 
@@ -3028,9 +3120,7 @@ def _loads_response(encoded: str):
     return jobs_exec.loads_strict(encoded)
 
 
-def _validated_response_locked(
-    conn: sqlite3.Connection, row: sqlite3.Row
-) -> dict:
+def _validated_response_locked(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     """The stored response, checked against everything it claims to be.
 
     A response is only an answer if the world still agrees with it, and matching
@@ -3062,8 +3152,7 @@ def _validated_response_locked(
 
     def fail(why: str):
         raise ReplayIntegrity(
-            f"stored response for request {request_id!r} {why}; refusing to "
-            "return it"
+            f"stored response for request {request_id!r} {why}; refusing to return it"
         )
 
     if row["job_id"] is None or row["attempt_id"] is None or row["receipt_id"] is None:
@@ -3096,7 +3185,8 @@ def _validated_response_locked(
     if receipt is None:
         fail("names a receipt that does not exist")
     if (receipt["job_id"], receipt["attempt_id"]) != (
-        row["job_id"], row["attempt_id"],
+        row["job_id"],
+        row["attempt_id"],
     ):
         fail("names a receipt belonging to a different job or attempt")
     if receipt["idempotency_key"] != final_receipt_key(row["attempt_id"]):
@@ -3120,9 +3210,7 @@ def _validated_response_locked(
     return response
 
 
-def _v3_authority(
-    row: sqlite3.Row, job: "Job", attempt: dict, fail
-) -> Dict[str, Any]:
+def _v3_authority(row: sqlite3.Row, job: "Job", attempt: dict, fail) -> Dict[str, Any]:
     """Every field a V3 replay is *required* to reproduce, read from live rows.
 
     Mandatory, not best-effort: a validator that only checks the keys it happens
@@ -3204,11 +3292,25 @@ def _validate_final_receipt(
     if data["kind"] != V3_RECEIPT_KIND:
         fail(f"names a final receipt of kind {data['kind']!r}")
     expected = {
-        **{k: authority[k] for k in (
-            "request_id", "job_id", "attempt_id", "ordinal", "status",
-            "failure_class", "repository", "base_commit", "branch", "worktree",
-            "commit", "route", "reason", "error",
-        )},
+        **{
+            k: authority[k]
+            for k in (
+                "request_id",
+                "job_id",
+                "attempt_id",
+                "ordinal",
+                "status",
+                "failure_class",
+                "repository",
+                "base_commit",
+                "branch",
+                "worktree",
+                "commit",
+                "route",
+                "reason",
+                "error",
+            )
+        },
         "evidence": {k: attempt[k] for k in V3_RECEIPT_EVIDENCE_KEYS},
     }
     for field_name, want in expected.items():
@@ -3219,9 +3321,7 @@ def _validate_final_receipt(
             )
 
 
-def find_run_response(
-    conn: sqlite3.Connection, request_id: str
-) -> Optional[dict]:
+def find_run_response(conn: sqlite3.Connection, request_id: str) -> Optional[dict]:
     """The settled response for ``request_id``, or ``None`` if it never settled.
 
     A pure read of the protected row — no event is scanned and none is trusted.
@@ -3343,13 +3443,16 @@ def _reconcile_request_locked(
         )
     narrative = {"request_id": request_id, **RECOVERED_NARRATIVE}
     record = _run_record(
-        conn, attempt, receipt["id"],
+        conn,
+        attempt,
+        receipt["id"],
         request_id=request_id,
         request_data={"ran": True, "recovered": []},
         narrative=narrative,
     )
     response = _store_response_locked(
-        conn, request_id,
+        conn,
+        request_id,
         owner=row["owner"],
         job_id=attempt["job_id"],
         attempt_id=attempt["id"],
@@ -3361,9 +3464,7 @@ def _reconcile_request_locked(
     return _request_from_row(_request_row(conn, request_id), response)
 
 
-def release_request(
-    conn: sqlite3.Connection, request_id: str, *, owner: str
-) -> bool:
+def release_request(conn: sqlite3.Connection, request_id: str, *, owner: str) -> bool:
     """Give back a reservation nothing was ever bound to. Idempotent.
 
     Only an unbound, unsettled reservation held by ``owner`` is released, so a
@@ -3408,8 +3509,7 @@ def _bind_request_locked(
         )
     if row["attempt_id"] is not None and row["attempt_id"] != attempt_id:
         raise ReplayIntegrity(
-            f"request {request_id!r} is already bound to attempt "
-            f"{row['attempt_id']!r}"
+            f"request {request_id!r} is already bound to attempt {row['attempt_id']!r}"
         )
     conn.execute(
         "UPDATE job_run_requests SET job_id = ?, attempt_id = ?, updated_at = ? "
@@ -3489,9 +3589,9 @@ def _store_response_locked(
     # The Job's own column plus whatever the settling caller was holding: by the
     # time this runs the settlement has already handed custody back and cleared
     # the column, so reading it alone would screen against nothing.
-    encoded = _canonical(_screen_settlement(
-        record, _capabilities_locked(conn, job_id, *capabilities)
-    ))
+    encoded = _canonical(
+        _screen_settlement(record, _capabilities_locked(conn, job_id, *capabilities))
+    )
     receipt = conn.execute(
         "SELECT data FROM job_receipts WHERE id = ?", (receipt_id,)
     ).fetchone()
@@ -3507,9 +3607,20 @@ def _store_response_locked(
         "route = ?, reason = ?, error = ?, "
         "lease_expires_at = NULL, updated_at = ? WHERE request_id = ? "
         "AND response IS NULL",
-        (owner, job_id, attempt_id, receipt_id, encoded, _digest(encoded),
-         _digest(receipt["data"]), narrative.get("route"),
-         narrative.get("reason"), narrative.get("error"), now, request_id),
+        (
+            owner,
+            job_id,
+            attempt_id,
+            receipt_id,
+            encoded,
+            _digest(encoded),
+            _digest(receipt["data"]),
+            narrative.get("route"),
+            narrative.get("reason"),
+            narrative.get("error"),
+            now,
+            request_id,
+        ),
     )
     if cur.rowcount != 1:
         raise ReplayIntegrity(
@@ -3571,9 +3682,7 @@ def add_receipt(
         if attempt is None:
             raise ValueError(f"no such attempt: {attempt_id!r}")
         if attempt["job_id"] != job.id:
-            raise ValueError(
-                f"attempt {attempt_id!r} belongs to a different job"
-            )
+            raise ValueError(f"attempt {attempt_id!r} belongs to a different job")
 
     now = _now()
     with write_txn(conn):
@@ -3750,9 +3859,7 @@ def record_preflight(
         record.created_at,
     )
     with write_txn(conn):
-        _require_job_revision_locked(
-            conn, record.job_id, record.expected_job_revision
-        )
+        _require_job_revision_locked(conn, record.job_id, record.expected_job_revision)
         _require_attempt_job_locked(conn, record.attempt_id, record.job_id)
         existing = conn.execute(
             "SELECT * FROM job_preflights WHERE job_id = ? AND idempotency_key = ?",
@@ -3811,6 +3918,7 @@ def _transition_material(row: sqlite3.Row) -> tuple:
             "initiator_id",
             "expected_job_revision",
             "evidence_json",
+            "handoff_json",
             "failure_class",
             "blocker_code",
             "receipt_id",
@@ -3820,6 +3928,82 @@ def _transition_material(row: sqlite3.Row) -> tuple:
             "created_at",
         )
     )
+
+
+_HANDOFF_TARGET_STATES = frozenset({
+    "QUEUED",
+    "ASSIGNED",
+    "BUILDING",
+    "EVIDENCE_COLLECTING",
+    "REVIEWING",
+    "VERIFIED",
+    "COMPLETED",
+    "FAILED",
+    "BLOCKED",
+})
+
+
+def canonical_transition_handoff(
+    request: TransitionWrite,
+) -> Optional[dict[str, object]]:
+    """Validate and bind a substantive handoff to one graph edge."""
+
+    from hermes_cli import jobs_handoffs
+
+    if request.handoff is None:
+        if request.target_state in _HANDOFF_TARGET_STATES:
+            raise jobs_handoffs.HandoffValidationError(
+                f"{request.target_state} transition requires a handoff"
+            )
+        return None
+    handoff = jobs_handoffs.validate_persisted_handoff(
+        request.handoff,
+        target_state=request.target_state,
+        transition_evidence=dict(request.evidence),
+    )
+    expected_from = (
+        "ATTEMPT_CREATED"
+        if request.source_state is None and request.target_state == "QUEUED"
+        else request.source_state
+    )
+    for field, expected in (
+        ("job_id", request.job_id),
+        ("attempt_id", request.attempt_id),
+        ("speaker_id", request.initiator_id),
+        ("from_phase", expected_from),
+        ("created_at", request.created_at),
+    ):
+        if handoff[field] != expected:
+            label = field.removesuffix("_id").replace("_", " ")
+            raise jobs_handoffs.HandoffValidationError(
+                f"handoff {label} identity mismatch"
+            )
+    artifact = handoff["artifact_identity"]
+    if (
+        artifact is not None
+        and artifact["kind"] == "commit"
+        and artifact["value"] != request.commit
+    ):
+        raise jobs_handoffs.HandoffValidationError("handoff commit identity mismatch")
+    return handoff
+
+
+def require_transition_handoff_identity(
+    envelope: Mapping[str, object],
+    handoff: Optional[Mapping[str, object]],
+) -> None:
+    """Require the receipt payload to carry the exact canonical handoff."""
+
+    from hermes_cli import jobs_receipts
+
+    payload = envelope.get("payload")
+    if not isinstance(payload, Mapping):
+        raise jobs_receipts.ReceiptVerificationError("receipt payload is missing")
+    matches = "handoff" in payload and payload["handoff"] == handoff
+    if not matches:
+        raise jobs_receipts.ReceiptVerificationError(
+            "receipt handoff identity mismatch"
+        )
 
 
 def _graph_public_state_locked(
@@ -3871,6 +4055,9 @@ def record_transition(
     if not request.idempotency_key:
         raise ValueError("transition idempotency_key must not be empty")
     evidence_json = _reliability_json(dict(request.evidence))
+    handoff = canonical_transition_handoff(request)
+    require_transition_handoff_identity(envelope, handoff)
+    handoff_json = None if handoff is None else _reliability_json(handoff)
     receipt_blob = _receipt_blob(envelope, request.receipt_id)
     expected_material = (
         request.job_id,
@@ -3881,6 +4068,7 @@ def record_transition(
         request.initiator_id,
         request.expected_job_revision,
         evidence_json,
+        handoff_json,
         request.failure_class,
         request.blocker_code,
         request.receipt_id,
@@ -3914,8 +4102,7 @@ def record_transition(
             "SELECT * FROM job_attempts WHERE id = ?", (request.attempt_id,)
         ).fetchone()
         if (
-            request.target_state
-            in {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}
+            request.target_state in {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}
             and attempt_row["status"] != "running"
         ):
             raise GraphConflict("terminal graph edge requires a running attempt")
@@ -3954,10 +4141,10 @@ def record_transition(
         cursor = conn.execute(
             "INSERT INTO job_attempt_transitions "
             "(job_id, attempt_id, source_state, target_state, initiator_type, "
-            " initiator_id, expected_job_revision, evidence_json, failure_class, "
+            " initiator_id, expected_job_revision, evidence_json, handoff_json, failure_class, "
             " blocker_code, receipt_id, component, component_version, "
             " idempotency_key, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             expected_material,
         )
         transition_id = int(cursor.lastrowid)
@@ -3990,9 +4177,7 @@ def record_transition(
                     "status": attempt_status,
                     "failure_class": request.failure_class,
                 },
-                idempotency_key=(
-                    f"reliability-attempt-finished:{request.attempt_id}"
-                ),
+                idempotency_key=(f"reliability-attempt-finished:{request.attempt_id}"),
                 now=request.created_at,
             )
             conn.execute(
@@ -4030,34 +4215,97 @@ def record_transition(
                 (request.attempt_id,),
             ).fetchone()
             terminal_failure = (
-                failure_row["terminal_failure"]
-                if failure_row is not None
-                else None
+                failure_row["terminal_failure"] if failure_row is not None else None
             )
         milestone = jnotif.milestone_for_state(
             request.target_state, attempt_terminal_failure=terminal_failure
         )
         if milestone is not None:
-            jnotif.enqueue_locked(
+            notification_payload = {
+                "number": job_row["number"],
+                "name": job_row["name"],
+                "target_state": request.target_state,
+                "failure_class": request.failure_class,
+                "blocker_code": request.blocker_code,
+                "handoff": handoff,
+            }
+            notification = jnotif.enqueue_locked(
                 conn,
                 job_id=request.job_id,
                 attempt_id=request.attempt_id,
                 job_revision=request.expected_job_revision + 1,
                 milestone=milestone,
                 transition_id=transition_id,
-                payload={
-                    "number": job_row["number"],
-                    "name": job_row["name"],
-                    "target_state": request.target_state,
-                    "failure_class": request.failure_class,
-                    "blocker_code": request.blocker_code,
-                },
+                payload=notification_payload,
                 now=request.created_at,
             )
+            if (
+                notification.transition_id != transition_id
+                or dict(notification.payload) != notification_payload
+            ):
+                raise GraphConflict(
+                    "transition notification intent stores different facts"
+                )
     return transition_id
 
 
-def _transition_to_dict(row: sqlite3.Row) -> dict:
+def _stored_transition_evidence(value: str) -> dict[str, str]:
+    from hermes_cli import jobs_handoffs, jobs_receipts
+
+    try:
+        evidence = jobs_receipts.loads_canonical(value)
+    except jobs_receipts.CanonicalJSONError as exc:
+        raise jobs_handoffs.HandoffValidationError(
+            "persisted transition evidence is not canonical JSON"
+        ) from exc
+    if type(evidence) is not dict:
+        raise jobs_handoffs.HandoffValidationError(
+            "persisted transition evidence must be an exact JSON object"
+        )
+    if jobs_receipts.canonical_json_bytes(evidence).decode("utf-8") != value:
+        raise jobs_handoffs.HandoffValidationError(
+            "persisted transition evidence is not canonical JSON"
+        )
+    return evidence
+
+
+def _stored_transition_handoff(
+    value: str,
+    *,
+    transition_evidence: Mapping[str, str],
+    target_state: str,
+) -> dict[str, object]:
+    from hermes_cli import jobs_handoffs, jobs_receipts
+
+    try:
+        loaded = jobs_receipts.loads_canonical(value)
+    except jobs_receipts.CanonicalJSONError as exc:
+        raise jobs_handoffs.HandoffValidationError(
+            "persisted handoff is not canonical JSON"
+        ) from exc
+    if jobs_receipts.canonical_json_bytes(loaded).decode("utf-8") != value:
+        raise jobs_handoffs.HandoffValidationError(
+            "persisted handoff is not canonical JSON"
+        )
+    return jobs_handoffs.validate_persisted_handoff(
+        loaded,
+        transition_evidence=transition_evidence,
+        target_state=target_state,
+    )
+
+
+def _transition_to_dict(row: Mapping[str, object]) -> dict:
+    evidence = _stored_transition_evidence(str(row["evidence_json"]))
+    handoff_json = row["handoff_json"]
+    handoff = (
+        None
+        if handoff_json is None
+        else _stored_transition_handoff(
+            str(handoff_json),
+            transition_evidence=evidence,
+            target_state=str(row["target_state"]),
+        )
+    )
     return {
         "id": row["id"],
         "job_id": row["job_id"],
@@ -4067,7 +4315,8 @@ def _transition_to_dict(row: sqlite3.Row) -> dict:
         "initiator_type": row["initiator_type"],
         "initiator_id": row["initiator_id"],
         "expected_job_revision": row["expected_job_revision"],
-        "evidence": json.loads(row["evidence_json"]),
+        "evidence": evidence,
+        "handoff": handoff,
         "failure_class": row["failure_class"],
         "blocker_code": row["blocker_code"],
         "receipt_id": row["receipt_id"],
@@ -4078,9 +4327,7 @@ def _transition_to_dict(row: sqlite3.Row) -> dict:
     }
 
 
-def latest_transition(
-    conn: sqlite3.Connection, attempt_id: str
-) -> Optional[dict]:
+def latest_transition(conn: sqlite3.Connection, attempt_id: str) -> Optional[dict]:
     row = conn.execute(
         "SELECT * FROM job_attempt_transitions WHERE attempt_id = ? "
         "ORDER BY id DESC LIMIT 1",
@@ -4095,6 +4342,27 @@ def list_transitions(conn: sqlite3.Connection, job_id: str) -> List[dict]:
         (job_id,),
     ).fetchall()
     return [_transition_to_dict(row) for row in rows]
+
+
+def latest_handoff(
+    conn: sqlite3.Connection, attempt_id: str
+) -> Optional[dict[str, object]]:
+    """Return the latest edge's validated handoff, preserving legacy NULL."""
+
+    row = conn.execute(
+        "SELECT handoff_json, evidence_json, target_state "
+        "FROM job_attempt_transitions WHERE attempt_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (attempt_id,),
+    ).fetchone()
+    if row is None or row["handoff_json"] is None:
+        return None
+    evidence = _stored_transition_evidence(row["evidence_json"])
+    return _stored_transition_handoff(
+        row["handoff_json"],
+        transition_evidence=evidence,
+        target_state=row["target_state"],
+    )
 
 
 _RELIABILITY_DIGEST_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
@@ -4123,9 +4391,7 @@ def _duplicate_retry_decision(row: sqlite3.Row) -> dict:
     return result
 
 
-def record_retry_decision(
-    conn: sqlite3.Connection, record: RetryEvidenceWrite
-) -> dict:
+def record_retry_decision(conn: sqlite3.Connection, record: RetryEvidenceWrite) -> dict:
     """Persist retry evidence before returning authorization to retry."""
 
     if record.ordinal <= 0:
@@ -4212,8 +4478,7 @@ def list_retry_evidence(
         params = (job_id, chain_id)
     sql += " ORDER BY ordinal ASC, id ASC"
     return [
-        _retry_evidence_to_dict(row)
-        for row in conn.execute(sql, params).fetchall()
+        _retry_evidence_to_dict(row) for row in conn.execute(sql, params).fetchall()
     ]
 
 
@@ -4480,7 +4745,10 @@ def record_lane_health(conn: sqlite3.Connection, health) -> str:
             "SELECT * FROM job_lane_health WHERE id = ?", (health_id,)
         ).fetchone()
         if existing is not None:
-            if existing["id"] == health_id and _lane_health_material(existing) == material:
+            if (
+                existing["id"] == health_id
+                and _lane_health_material(existing) == material
+            ):
                 return health_id
             raise GraphConflict("lane health observation id stores different facts")
         conn.execute(
@@ -4801,9 +5069,7 @@ def _lane_placement_to_dict(row: sqlite3.Row) -> dict:
     }
 
 
-def get_lane_placement(
-    conn: sqlite3.Connection, placement_id: str
-) -> Optional[dict]:
+def get_lane_placement(conn: sqlite3.Connection, placement_id: str) -> Optional[dict]:
     row = conn.execute(
         "SELECT * FROM job_lane_placements WHERE id = ?", (placement_id,)
     ).fetchone()
@@ -4833,10 +5099,11 @@ def _resolved_lane_child(root: Path, category: str, value: Path) -> str:
     try:
         candidate.relative_to(category_root)
     except ValueError as exc:
-        raise ValueError(
-            f"registered lane path must be beneath {category}/"
-        ) from exc
-    if candidate == category_root or "auth" in candidate.parts[len(root_resolved.parts):]:
+        raise ValueError(f"registered lane path must be beneath {category}/") from exc
+    if (
+        candidate == category_root
+        or "auth" in candidate.parts[len(root_resolved.parts) :]
+    ):
         raise ValueError("registered lane path must be an attempt-scoped non-auth path")
     return str(candidate)
 
@@ -4925,9 +5192,10 @@ def transition_lane_placement(
         raise ValueError("lane placement reason code is invalid")
     if isinstance(now, bool) or not isinstance(now, int):
         raise TypeError("now must be an integer Unix timestamp")
-    if evidence_digest is not None and re.fullmatch(
-        r"sha256:[0-9a-f]{64}", evidence_digest
-    ) is None:
+    if (
+        evidence_digest is not None
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", evidence_digest) is None
+    ):
         raise ValueError("lane cleanup evidence digest is invalid")
     with write_txn(conn):
         row = conn.execute(
@@ -5303,9 +5571,7 @@ def _recovery_narrative_locked(
     return {"request_id": row["request_id"], **RECOVERED_NARRATIVE}
 
 
-def recover_expired_claims(
-    conn: sqlite3.Connection, *, now: int
-) -> List[str]:
+def recover_expired_claims(conn: sqlite3.Connection, *, now: int) -> List[str]:
     """Reclaim every Job whose lease has expired. Deterministic + idempotent.
 
     For each expired claim, in its own transaction and oldest number first:
@@ -5462,9 +5728,7 @@ def create_or_get_job(
         if existing is not None:
             jid = existing["job_id"]
             job = get_job(conn, jid)
-            conflict = job is not None and (
-                job.name != clean_name or job.goal != goal
-            )
+            conflict = job is not None and (job.name != clean_name or job.goal != goal)
             if job is not None:
                 try:
                     conflict = conflict or ji.effective_identity(job) != identity

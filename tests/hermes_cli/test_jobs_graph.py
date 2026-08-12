@@ -5,6 +5,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_graph as graph
+from hermes_cli import jobs_handoffs as handoffs
 from hermes_cli import jobs_receipts as receipts
 
 
@@ -67,7 +68,9 @@ class GraphRig:
         self.verifier = graph.ReceiptVerifier(
             trusted_keys={"lane:test:v1": self.private_key.public_key()}
         )
-        self.job_id = jdb.create_job(conn, requested_lane="claude", name="graph", goal="goal")
+        self.job_id = jdb.create_job(
+            conn, requested_lane="claude", name="graph", goal="goal"
+        )
         claim = jdb.claim_job(
             conn,
             specialist="claude-builder",
@@ -97,8 +100,7 @@ class GraphRig:
         if evidence is None:
             names = REQUIRED.get((source, target), {"terminal_evidence"})
             evidence = {
-                name: "sha256:" + f"{self.counter:064x}"[-64:]
-                for name in names
+                name: "sha256:" + f"{self.counter:064x}"[-64:] for name in names
             }
         failure_class = "TASK_FAILURE" if target == "FAILED" else None
         blocker_code = None
@@ -107,7 +109,8 @@ class GraphRig:
         elif target == "CANCELLED":
             blocker_code = "CANCELLED_BY_TEST"
         idempotency_key = f"{source or 'NONE'}:{target}:{self.counter}"
-        return graph.TransitionRequest(
+        created_at = 10 + self.counter
+        request = graph.TransitionRequest(
             job_id=self.job_id,
             attempt_id=self.attempt_id,
             source_state=source,
@@ -127,10 +130,95 @@ class GraphRig:
             component="jobs_graph",
             component_version="1",
             idempotency_key=idempotency_key,
-            created_at=10 + self.counter,
+            created_at=created_at,
         )
 
-    def sign(self, request, *, private_key=None, key_id="lane:test:v1"):
+        if target not in graph.LEGAL.get(source, frozenset()) or target == "CANCELLED":
+            return request
+        outcomes = {
+            "QUEUED": "started",
+            "ASSIGNED": "handed_off",
+            "BUILDING": "started",
+            "EVIDENCE_COLLECTING": "handed_off",
+            "REVIEWING": "handed_off",
+            "VERIFIED": "passed",
+            "COMPLETED": "completed",
+            "FAILED": "rejected",
+            "BLOCKED": "blocked",
+        }
+        outcome = outcomes[target]
+        digest = next(iter(evidence.values()))
+        raw = {
+            "summary": f"Transitioned to {target}.",
+            "evidence_summary": [
+                {
+                    "label": "Transition evidence",
+                    "result": "Recorded.",
+                    "digest": digest,
+                }
+            ],
+            "next_action": "Continue the bounded Job workflow.",
+            "issues": (
+                [
+                    {
+                        "requirement": "The transition must succeed.",
+                        "finding": "The attempt failed.",
+                        "required_fix": "Correct the failure before retrying.",
+                    }
+                ]
+                if outcome == "rejected"
+                else []
+            ),
+            "decision_request": (
+                {
+                    "question": "How should this Job continue?",
+                    "options": [
+                        {
+                            "id": "retry",
+                            "label": "Retry",
+                            "consequence": "Retry after the blocker is cleared.",
+                        },
+                        {
+                            "id": "stop",
+                            "label": "Stop",
+                            "consequence": "Leave the Job blocked.",
+                        },
+                    ],
+                    "recommendation": "retry",
+                    "recommendation_reason": "The bounded retry is safe.",
+                    "blocked_scope": "Only this Job is blocked.",
+                    "safe_state": "No additional mutation occurred.",
+                    "next_owner_role": "builder",
+                }
+                if outcome == "blocked"
+                else None
+            ),
+        }
+        handoff = handoffs.normalize_handoff(
+            raw,
+            job_id=self.job_id,
+            attempt_id=self.attempt_id,
+            speaker_id="test",
+            speaker_role="system",
+            speaker_executor="hermes",
+            from_phase="ATTEMPT_CREATED" if source is None else source,
+            to_phase=target,
+            next_owner_role=None if outcome == "completed" else "next-worker",
+            outcome=outcome,
+            artifact_identity=None,
+            transition_evidence=dict(evidence),
+            created_at=created_at,
+        )
+        return replace(request, handoff=handoff)
+
+    def sign(
+        self,
+        request,
+        *,
+        private_key=None,
+        key_id="lane:test:v1",
+        handoff=None,
+    ):
         return receipts.sign_receipt(
             {
                 "job_id": request.job_id,
@@ -138,6 +226,7 @@ class GraphRig:
                 "commit": request.commit,
                 "state": request.target_state,
                 "evidence": dict(request.evidence),
+                "handoff": request.handoff if handoff is None else handoff,
                 "timestamp": "2026-08-09T00:00:00Z",
                 "transitioned_by": "jobs_graph/1",
             },
@@ -285,9 +374,7 @@ def test_untrusted_receipts_fail_without_transition(graph_rig, failure):
 def test_receipt_evidence_must_match_transition_evidence(graph_rig):
     request = graph_rig.request("QUEUED")
     envelope = graph_rig.sign(request)
-    envelope["payload"]["evidence"] = {
-        "attempt_created": "sha256:" + "f" * 64
-    }
+    envelope["payload"]["evidence"] = {"attempt_created": "sha256:" + "f" * 64}
 
     with pytest.raises(receipts.ReceiptVerificationError):
         graph.transition_attempt(
@@ -296,6 +383,61 @@ def test_receipt_evidence_must_match_transition_evidence(graph_rig):
             envelope=envelope,
             verifier=graph_rig.verifier,
         )
+
+
+def test_missing_handoff_fails_before_revision_or_transition_mutation(graph_rig):
+    request = replace(graph_rig.request("QUEUED"), handoff=None)
+    revision = jdb.get_job(graph_rig.conn, graph_rig.job_id).revision
+
+    with pytest.raises(handoffs.HandoffValidationError, match="requires a handoff"):
+        graph.transition_attempt(
+            graph_rig.conn,
+            request,
+            envelope=graph_rig.sign(request),
+            verifier=graph_rig.verifier,
+        )
+
+    assert jdb.get_job(graph_rig.conn, graph_rig.job_id).revision == revision
+    assert graph_rig.rows() == []
+    assert graph_rig.receipt_count() == 0
+
+
+def test_signed_handoff_must_match_request_handoff(graph_rig):
+    request = graph_rig.request("QUEUED")
+    changed = dict(request.handoff)
+    changed["summary"] = "Different signed facts."
+
+    with pytest.raises(
+        receipts.ReceiptVerificationError,
+        match="receipt handoff identity mismatch",
+    ):
+        graph.transition_attempt(
+            graph_rig.conn,
+            request,
+            envelope=graph_rig.sign(request, handoff=changed),
+            verifier=graph_rig.verifier,
+        )
+
+    assert graph_rig.rows() == []
+    assert graph_rig.receipt_count() == 0
+
+
+def test_contradictory_handoff_fails_before_envelope_trust_or_mutation(graph_rig):
+    request = graph_rig.request("QUEUED")
+    changed = dict(request.handoff)
+    changed["job_id"] = "different-job"
+    request = replace(request, handoff=changed)
+
+    with pytest.raises(handoffs.HandoffValidationError, match="job identity"):
+        graph.transition_attempt(
+            graph_rig.conn,
+            request,
+            envelope=graph_rig.sign(request),
+            verifier=graph.ReceiptVerifier(trusted_keys={}),
+        )
+
+    assert graph_rig.rows() == []
+    assert graph_rig.receipt_count() == 0
 
 
 def test_idempotent_replay_requires_exact_facts_and_receipt(graph_rig):
@@ -318,7 +460,7 @@ def test_idempotent_replay_requires_exact_facts_and_receipt(graph_rig):
     with pytest.raises(jdb.GraphConflict):
         graph.transition_attempt(
             graph_rig.conn,
-            replace(request, initiator_id="other"),
+            replace(request, initiator_type="other"),
             envelope=envelope,
             verifier=graph_rig.verifier,
         )
