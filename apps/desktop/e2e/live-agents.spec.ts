@@ -137,6 +137,21 @@ test.describe('Live Agents — real isolated sources', () => {
     ).toContain(STEER_TEXT)
 
     fixture.mock.releaseHeldStream()
+    await activeRun.getByRole('button', { name: `stop ${ACTIVE_TITLE}` }).click()
+    await expect.poll(
+      () => JSON.parse(runHermes(fixture, ['kanban', 'show', taskId, '--json'])) as {
+        task: { status: string }
+        runs: Array<{ ended_at: number | null }>
+      },
+      { message: 'the exact worker should stop before the terminal-state projection is completed', timeout: 30_000 },
+    ).toMatchObject({ task: { status: 'ready' }, runs: [{ ended_at: expect.any(Number) }] })
+    runHermes(fixture, [
+      'kanban',
+      'complete',
+      taskId,
+      '--summary',
+      'Completed the isolated Live Agents terminal-state projection.',
+    ])
     await expect.poll(
       () => JSON.parse(runHermes(fixture, ['kanban', 'show', taskId, '--json'])) as { task: { status: string } },
       { message: 'the real Kanban worker should finish', timeout: 45_000 },
