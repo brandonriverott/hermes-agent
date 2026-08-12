@@ -23,9 +23,12 @@ import time
 import pytest
 
 from hermes_cli import jobs_db as jdb
+from hermes_cli import jobs_handoffs
 from hermes_cli import jobs_notifications as jn
 from hermes_state import SessionDB
 from gateway.jobs_notifications import deliver_due_notification_once
+
+TEST_DIGEST = "sha256:" + "a" * 64
 
 
 @pytest.fixture
@@ -65,6 +68,32 @@ def _job(conn, *, origin=None):
 
 def _messages(session_db, session_id):
     return session_db.get_messages(session_id)
+
+
+def _handoff(job_id):
+    return jobs_handoffs.normalize_handoff(
+        {
+            "summary": "Builder completed the scoped change.",
+            "evidence_summary": [
+                {"label": "Focused tests", "result": "42 passed", "digest": TEST_DIGEST}
+            ],
+            "next_action": "Review the committed change.",
+            "issues": [],
+            "decision_request": None,
+        },
+        job_id=job_id,
+        attempt_id="attempt-1",
+        speaker_id="builder-1",
+        speaker_role="builder",
+        speaker_executor="claude",
+        from_phase="BUILDING",
+        to_phase="EVIDENCE_COLLECTING",
+        next_owner_role="reviewer",
+        outcome="handed_off",
+        artifact_identity=None,
+        transition_evidence={"tests": TEST_DIGEST},
+        created_at=1,
+    )
 
 
 def _deliver(session_db, jobs_path, *, now=None, busy_check=None):
@@ -155,6 +184,88 @@ def test_ordered_delivery_across_milestones(jobs_path, session_db):
     assert len(msgs) == 2
     assert msgs[0]["platform_message_id"].endswith(":queued")
     assert msgs[1]["platform_message_id"].endswith(":assigned")
+
+
+def test_substantive_handoff_replaces_generic_milestone_and_sets_metadata(
+    jobs_path, session_db
+):
+    conn = jdb.connect(jobs_path)
+    try:
+        job_id = _job(conn)
+        from hermes_cli.sqlite_util import write_txn
+
+        handoff = _handoff(job_id)
+        with write_txn(conn):
+            jn.enqueue_locked(
+                conn,
+                job_id=job_id,
+                attempt_id=None,
+                job_revision=2,
+                milestone=jn.MILESTONE_TESTING,
+                payload={
+                    "number": 1,
+                    "name": "job",
+                    "target_state": "EVIDENCE_COLLECTING",
+                    "handoff": handoff,
+                    "evidence_json": {"tests": TEST_DIGEST},
+                },
+                now=int(time.time()),
+            )
+    finally:
+        conn.close()
+    session_db.create_session("session-1", source="telegram")
+    assert _deliver(session_db, jobs_path) is not None  # legacy queued
+    assert _deliver(session_db, jobs_path) is not None  # substantive testing
+    msg = _messages(session_db, "session-1")[-1]
+    assert msg["content"].startswith("builder → reviewer")
+    assert "Legacy Jobs update" not in msg["content"]
+    metadata = (
+        msg["display_metadata"]
+        if isinstance(msg["display_metadata"], dict)
+        else json.loads(msg["display_metadata"])
+    )
+    assert metadata["speaker_role"] == "builder"
+    assert metadata["speaker_executor"] == "claude"
+    assert metadata["next_owner_role"] == "reviewer"
+    assert metadata["outcome"] == "handed_off"
+
+
+def test_missing_trusted_evidence_is_bounded_diagnostic_without_claimed_owner(
+    jobs_path, session_db
+):
+    conn = jdb.connect(jobs_path)
+    try:
+        job_id = _job(conn)
+        from hermes_cli.sqlite_util import write_txn
+
+        with write_txn(conn):
+            jn.enqueue_locked(
+                conn,
+                job_id=job_id,
+                attempt_id=None,
+                job_revision=2,
+                milestone=jn.MILESTONE_TESTING,
+                payload={
+                    "number": 1,
+                    "name": "job",
+                    "target_state": "EVIDENCE_COLLECTING",
+                    "handoff": {"summary": "do not echo this"},
+                },
+                now=int(time.time()),
+            )
+    finally:
+        conn.close()
+    session_db.create_session("session-1", source="telegram")
+    assert _deliver(session_db, jobs_path) is not None
+    assert _deliver(session_db, jobs_path) is not None
+    msg = _messages(session_db, "session-1")[-1]
+    assert msg["content"].startswith("Hermes could not explain this handoff")
+    assert "do not echo this" not in msg["content"]
+    metadata = msg["display_metadata"]
+    assert "speaker_role" not in metadata
+    assert "speaker_executor" not in metadata
+    assert "next_owner_role" not in metadata
+    assert "outcome" not in metadata
 
 
 def test_restart_idempotency_does_not_duplicate_visible_message(jobs_path, session_db):
@@ -415,11 +526,13 @@ def test_message_is_structured_and_preserves_origin_metadata(jobs_path, session_
     assert msg["role"] == "system"
     # Task 8 wording: concise user-facing lifecycle message, structured and
     # stable (the raw job id lives in display_metadata, not the chat text).
-    assert msg["content"] == "Queued — job (#1) accepted"
+    assert msg["content"] == "Legacy Jobs update — Queued — job (#1) accepted"
     assert msg["display_kind"] == "jobs_update"
-    meta = json.loads(msg["display_metadata"]) if isinstance(
-        msg["display_metadata"], str
-    ) else (msg["display_metadata"] or {})
+    meta = (
+        json.loads(msg["display_metadata"])
+        if isinstance(msg["display_metadata"], str)
+        else (msg["display_metadata"] or {})
+    )
     assert meta["platform"] == "telegram"
     assert meta["chat_id"] == "chat-1"
     assert meta["thread_id"] == "thread-1"

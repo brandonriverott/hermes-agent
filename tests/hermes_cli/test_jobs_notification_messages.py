@@ -11,6 +11,7 @@ correcting milestone preceded it.
 import pytest
 
 from hermes_cli import jobs_notifications as jn
+from hermes_cli import jobs_handoffs
 from hermes_cli.jobs_notifications import NotificationRecord
 
 
@@ -39,23 +40,23 @@ def _record(milestone, **payload_overrides):
 
 def test_exact_wording_per_milestone():
     expected = {
-        jn.MILESTONE_QUEUED: "Queued — landing page (#3) accepted",
-        jn.MILESTONE_ASSIGNED: "Assigned — landing page (#3) started",
-        jn.MILESTONE_BUILDING: "Building — landing page (#3) in progress",
+        jn.MILESTONE_QUEUED: "Legacy Jobs update — Queued — landing page (#3) accepted",
+        jn.MILESTONE_ASSIGNED: "Legacy Jobs update — Assigned — landing page (#3) started",
+        jn.MILESTONE_BUILDING: "Legacy Jobs update — Building — landing page (#3) in progress",
         jn.MILESTONE_TESTING: (
-            "Testing — landing page (#3) running tests and evidence"
+            "Legacy Jobs update — Testing — landing page (#3) running tests and evidence"
         ),
-        jn.MILESTONE_REVIEW: "Review — landing page (#3) under review",
+        jn.MILESTONE_REVIEW: "Legacy Jobs update — Review — landing page (#3) under review",
         jn.MILESTONE_CORRECTING: (
-            "Correcting — landing page (#3) fixing findings"
+            "Legacy Jobs update — Correcting — landing page (#3) fixing findings"
         ),
         jn.MILESTONE_NEEDS_YOU: (
-            "Needs you — landing page (#3) requires your decision"
+            "Legacy Jobs update — Needs you — landing page (#3) requires your decision"
         ),
         jn.MILESTONE_FAILURE: (
-            "Failed — landing page (#3) ended unsuccessfully"
+            "Legacy Jobs update — Failed — landing page (#3) ended unsuccessfully"
         ),
-        jn.MILESTONE_FINISHED: "Finished — landing page (#3) complete",
+        jn.MILESTONE_FINISHED: "Legacy Jobs update — Finished — landing page (#3) complete",
     }
     for milestone, wording in expected.items():
         assert jn.render_milestone_message(_record(milestone)) == wording
@@ -65,17 +66,17 @@ def test_re_review_wording_only_applies_to_review():
     record = _record(jn.MILESTONE_REVIEW)
     assert (
         jn.render_milestone_message(record)
-        == "Review — landing page (#3) under review"
+        == "Legacy Jobs update — Review — landing page (#3) under review"
     )
     assert (
         jn.render_milestone_message(record, re_review=True)
-        == "Re-review — landing page (#3) back under review"
+        == "Legacy Jobs update — Re-review — landing page (#3) back under review"
     )
     # The flag must never change another milestone's wording.
     corrected = _record(jn.MILESTONE_CORRECTING)
     assert (
         jn.render_milestone_message(corrected, re_review=True)
-        == "Correcting — landing page (#3) fixing findings"
+        == "Legacy Jobs update — Correcting — landing page (#3) fixing findings"
     )
 
 
@@ -83,7 +84,7 @@ def test_heartbeat_wording_identifies_the_stagnant_phase():
     record = _record(jn.MILESTONE_HEARTBEAT, phase=jn.MILESTONE_BUILDING)
     assert (
         jn.render_milestone_message(record)
-        == "Still working — landing page (#3) (still building)"
+        == "Legacy Jobs update — Still working — landing page (#3) (still building)"
     )
 
 
@@ -118,3 +119,60 @@ def test_name_falls_back_to_job_id():
     text = jn.render_milestone_message(record)
     assert "job-1" in text
     assert "landing page" not in text
+
+
+def _handoff(
+    *, outcome="handed_off", from_phase="BUILDING", to_phase="EVIDENCE_COLLECTING"
+):
+    digest = "sha256:" + "a" * 64
+    return jobs_handoffs.normalize_handoff(
+        {
+            "summary": "Builder completed the scoped change.",
+            "evidence_summary": [
+                {"label": "Focused tests", "result": "42 passed", "digest": digest}
+            ],
+            "next_action": "Review the committed change.",
+            "issues": [],
+            "decision_request": None,
+        },
+        job_id="job-1",
+        attempt_id="attempt-1",
+        speaker_id="builder-1",
+        speaker_role="builder",
+        speaker_executor="claude",
+        from_phase=from_phase,
+        to_phase=to_phase,
+        next_owner_role="reviewer",
+        outcome=outcome,
+        artifact_identity=None,
+        transition_evidence={"tests": digest},
+        created_at=1,
+    )
+
+
+def test_valid_handoff_renders_one_substantive_agent_message():
+    digest = "sha256:" + "a" * 64
+    record = _record(
+        jn.MILESTONE_TESTING,
+        target_state="EVIDENCE_COLLECTING",
+        handoff=_handoff(),
+    )
+    text = jn.render_milestone_message(record, transition_evidence={"tests": digest})
+    assert text.startswith("builder → reviewer\nBuilder completed")
+    assert "Legacy Jobs update" not in text
+
+
+def test_malformed_handoff_fails_closed_without_echoing_facts():
+    record = _record(
+        jn.MILESTONE_REVIEW,
+        target_state="VERIFIED",
+        handoff={"summary": "secret outcome", "speaker_role": "builder"},
+    )
+    text = jn.render_milestone_message(record, transition_evidence={})
+    assert text == "Hermes could not explain this handoff — Job #3 is VERIFIED."
+    assert "secret outcome" not in text
+
+
+def test_review_approved_milestone_is_exported_and_maps_verified():
+    assert jn.MILESTONE_REVIEW_APPROVED in jn.ALL_MILESTONES
+    assert jn.milestone_for_state("VERIFIED") == jn.MILESTONE_REVIEW_APPROVED

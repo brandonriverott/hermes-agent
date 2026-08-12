@@ -25,9 +25,9 @@ Contract:
 
 This worker is passive: it never wakes an LLM turn.  Task 8 owns the
 user-facing phase wording (rendered from the bounded payload by
-:func:`hermes_cli.jobs_notifications.render_milestone_message`) and the
-one-per-episode ten-minute heartbeat, which is enqueued before claiming so
-it participates in normal per-Job delivery order.
+:func:`hermes_cli.jobs_notifications.render_milestone_message`). Historical
+heartbeat rows remain deliverable, but this worker never creates a time-only
+heartbeat intent.
 """
 
 from __future__ import annotations
@@ -141,13 +141,81 @@ def _format_message(conn, record, *, re_review: bool) -> str:
     """User-facing lifecycle message for a milestone (Task 8 wording)."""
     from hermes_cli import jobs_notifications as jn
 
-    return jn.render_milestone_message(record, re_review=re_review)
+    return jn.render_milestone_message(
+        record,
+        re_review=re_review,
+        transition_evidence=_trusted_transition_evidence(conn, record),
+    )
+
+
+def _trusted_transition_evidence(conn, record) -> Optional[dict[str, str]]:
+    """Load evidence from durable transition storage or durable payload context.
+
+    Handoff facts themselves are never used as evidence. A transition row is
+    preferred and must belong to this Job; payload evidence is accepted only
+    as canonical persisted context for legacy/test rows that have no reference.
+    """
+    from hermes_cli import jobs_db as jdb, jobs_handoffs
+
+    raw = None
+    if record.transition_id is not None:
+        row = conn.execute(
+            "SELECT job_id, evidence_json FROM job_attempt_transitions WHERE id = ?",
+            (record.transition_id,),
+        ).fetchone()
+        if row is None or str(row["job_id"]) != record.job_id:
+            return None
+        raw = row["evidence_json"]
+    else:
+        payload = record.payload
+        raw = payload.get("evidence_json")
+        if raw is None:
+            raw = payload.get("transition_evidence")
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, str):
+            return jdb._stored_transition_evidence(raw)
+        if type(raw) is dict:
+            return jdb._stored_transition_evidence(jdb._reliability_json(raw))
+    except (
+        jobs_handoffs.HandoffValidationError,
+        TypeError,
+        ValueError,
+        KeyError,
+        json.JSONDecodeError,
+    ):
+        return None
+    return None
+
+
+def _validated_handoff(
+    conn, record, evidence: Optional[Mapping[str, str]]
+) -> Optional[dict]:
+    """Return a handoff only when strict validation succeeds with trusted evidence."""
+    from hermes_cli import jobs_handoffs
+
+    if "handoff" not in record.payload:
+        return None
+    target_state = record.payload.get("target_state")
+    try:
+        return jobs_handoffs.validate_persisted_handoff(
+            record.payload["handoff"],
+            target_state=target_state if isinstance(target_state, str) else None,
+            transition_evidence=evidence,
+        )
+    except (jobs_handoffs.HandoffValidationError, TypeError, ValueError):
+        return None
 
 
 def _display_metadata(
-    origin: Mapping[str, object], record, target_session_id: str
+    origin: Mapping[str, object],
+    record,
+    target_session_id: str,
+    *,
+    handoff: Optional[Mapping[str, object]] = None,
 ) -> dict:
-    return {
+    metadata = {
         "kind": "jobs_update",
         "notification_id": record.notification_id,
         "job_id": record.job_id,
@@ -161,6 +229,14 @@ def _display_metadata(
         "profile": str(origin.get("profile") or ""),
         "session_id": target_session_id,
     }
+    if handoff is not None:
+        metadata.update({
+            "speaker_role": handoff["speaker_role"],
+            "speaker_executor": handoff["speaker_executor"],
+            "next_owner_role": handoff["next_owner_role"],
+            "outcome": handoff["outcome"],
+        })
+    return metadata
 
 
 def _release_for_retry(
@@ -236,23 +312,28 @@ def _deliver_one(
 
     # Destination idempotency: a prior append that crashed before acknowledge
     # already carries this notification_id as platform_message_id.
-    if session_db.has_platform_message_id(
-        target_session_id, record.notification_id
-    ):
+    if session_db.has_platform_message_id(target_session_id, record.notification_id):
         jn.acknowledge(conn, record.notification_id, owner=owner, now=now)
         return
 
+    evidence = _trusted_transition_evidence(conn, record)
+    handoff = _validated_handoff(conn, record, evidence)
     session_db.append_message(
         target_session_id,
         role="system",
-        content=_format_message(
-            conn,
+        content=jn.render_milestone_message(
             record,
             re_review=_is_re_review(conn, record),
+            transition_evidence=evidence,
         ),
         platform_message_id=record.notification_id,
         display_kind="jobs_update",
-        display_metadata=_display_metadata(origin, record, target_session_id),
+        display_metadata=_display_metadata(
+            origin,
+            record,
+            target_session_id,
+            handoff=handoff,
+        ),
     )
     # Acknowledge only after the append succeeded.
     jn.acknowledge(conn, record.notification_id, owner=owner, now=now)
@@ -279,10 +360,6 @@ def deliver_due_notification_once(
     now = int(now) if now is not None else int(time.time())
     conn = jdb.connect(jobs_path)
     try:
-        # Task 8: enqueue one heartbeat per stagnant phase episode (≥10
-        # minutes without a delivered phase change) before claiming rows, so
-        # the heartbeat participates in normal per-Job delivery order.
-        jn.enqueue_due_heartbeats(conn, now=now)
         record = jn.claim_due(conn, owner=owner, now=now)
         if record is None:
             return None

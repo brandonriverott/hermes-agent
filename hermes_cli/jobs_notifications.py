@@ -399,23 +399,60 @@ def render_milestone_message(
     record: NotificationRecord,
     *,
     re_review: bool = False,
+    transition_evidence: Mapping[str, str] | None = None,
 ) -> str:
-    """One concise, stable user-facing message for a milestone record.
+    """Render one bounded Jobs update.
 
-    Pure over the bounded outbox payload: it reads only ``number``, ``name``
-    and (for heartbeats) ``phase``.  Raw goal text, stdout, stack traces,
-    token counts, and full review text are never part of the payload or the
-    rendered message.
+    New rows carrying a handoff render the validated substantive handoff. Old
+    rows retain one bounded compatibility line. A handoff without trusted
+    transition evidence, or one that no longer validates, fails closed.
 
     The stable ``review`` milestone renders as a re-review only when the
     caller passes ``re_review=True`` (the delivery worker derives that from
     the job's delivered history); the milestone type itself stays ``review``.
     """
-    number = record.payload.get("number") or ""
-    name = record.payload.get("name") or record.job_id
+    number = _safe_label(record.payload.get("number"))
+
+    if "handoff" in record.payload:
+        from hermes_cli import jobs_handoffs
+
+        try:
+            handoff = jobs_handoffs.validate_persisted_handoff(
+                record.payload["handoff"],
+                target_state=(
+                    record.payload.get("target_state")
+                    if isinstance(record.payload.get("target_state"), str)
+                    else None
+                ),
+                transition_evidence=transition_evidence,
+            )
+            return jobs_handoffs.render_handoff(
+                handoff,
+                transition_evidence=transition_evidence,
+            )
+        except (jobs_handoffs.HandoffValidationError, TypeError, ValueError):
+            # Never repeat untrusted handoff facts in a diagnostic. Job number
+            # and current milestone are the only safe context available here.
+            state = record.payload.get("target_state")
+            if not isinstance(state, str) or not state:
+                state = record.milestone
+            safe_state = _safe_label(" ".join(state.split()))[:80]
+            return f"Hermes could not explain this handoff — Job #{number} is {safe_state}."
+
+    # Historical rows predate substantive handoffs. Keep exactly one visible,
+    # bounded compatibility line rather than pretending an agent spoke.
+    legacy = _legacy_milestone_message(record, re_review=re_review)
+    return f"Legacy Jobs update — {legacy}"
+
+
+def _legacy_milestone_message(record: NotificationRecord, *, re_review: bool) -> str:
+    """Render the pre-handoff milestone wording without claiming authorship."""
+
+    number = _safe_label(record.payload.get("number"))
+    name = _safe_label(record.payload.get("name") or record.job_id)
 
     if record.milestone == MILESTONE_HEARTBEAT:
-        phase = record.payload.get("phase") or "working"
+        phase = _safe_label(record.payload.get("phase") or "working")
         return f"Still working — {name} (#{number}) (still {phase})"
     if record.milestone == MILESTONE_REVIEW and re_review:
         return f"Re-review — {name} (#{number}) back under review"
@@ -435,6 +472,13 @@ def render_milestone_message(
         record.milestone,
         f"Update — {name} (#{number}) ({record.milestone})",
     )
+
+
+def _safe_label(value: object) -> str:
+    """Bound labels and remove structural/control characters from legacy data."""
+    text = str(value or "")
+    text = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in text)
+    return text[:160]
 
 
 def enqueue_due_heartbeats(
