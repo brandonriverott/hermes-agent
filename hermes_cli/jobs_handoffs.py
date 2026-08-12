@@ -582,6 +582,10 @@ def validate_persisted_handoff(
 ) -> dict:
     """Strictly revalidate a canonical handoff already loaded from storage."""
 
+    if transition_evidence is None:
+        raise HandoffValidationError(
+            "persisted handoff requires trusted transition_evidence"
+        )
     _require_exact_json_tree(value, field="persisted handoff")
     _screen_json_strings(value, field="persisted handoff")
     persisted = _exact_mapping(value, _CANONICAL_FIELD_SET, field="persisted handoff")
@@ -601,13 +605,6 @@ def validate_persisted_handoff(
             )
 
     evidence_summary = persisted["evidence_summary"]
-    if type(evidence_summary) is list and evidence_summary:
-        if transition_evidence is None:
-            raise HandoffValidationError(
-                "evidence_summary requires trusted transition_evidence"
-            )
-    elif transition_evidence is None:
-        transition_evidence = {}
 
     raw = {
         "summary": persisted["summary"],

@@ -596,7 +596,7 @@ def test_persisted_handoff_rejects_json_scalar_and_container_subclasses(field, f
     receipt[field] = factory(receipt)
 
     with pytest.raises(HandoffValidationError, match="exact JSON"):
-        validate_persisted_handoff(receipt)
+        validate_persisted_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
 
 
 def test_cyclic_values_raise_handoff_validation_error_at_both_boundaries():
@@ -608,7 +608,7 @@ def test_cyclic_values_raise_handoff_validation_error_at_both_boundaries():
     receipt = _normalize()
     receipt["issues"] = [receipt]
     with pytest.raises(HandoffValidationError, match="JSON"):
-        validate_persisted_handoff(receipt)
+        validate_persisted_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
 
 
 def test_completed_handoff_may_have_no_next_owner():
@@ -1172,11 +1172,40 @@ def test_renderer_requires_and_enforces_trusted_transition_evidence():
         render_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
 
 
-def test_evidence_free_persisted_and_rendered_receipts_need_no_trusted_evidence():
+@pytest.mark.parametrize(
+    "consumer",
+    [validate_persisted_handoff, render_handoff],
+    ids=["validate", "render"],
+)
+def test_deleting_receipt_facts_cannot_remove_trusted_evidence_requirement(consumer):
+    receipt = _normalize()
+    receipt["evidence_summary"] = []
+
+    with pytest.raises(HandoffValidationError, match="trusted transition_evidence"):
+        consumer(receipt)
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [validate_persisted_handoff, render_handoff],
+    ids=["validate", "render"],
+)
+def test_deleting_receipt_facts_conflicts_with_nonempty_trusted_evidence(consumer):
+    receipt = _normalize()
+    receipt["evidence_summary"] = []
+
+    with pytest.raises(HandoffValidationError, match="evidence_summary"):
+        consumer(receipt, transition_evidence={"tests": TEST_DIGEST})
+
+
+def test_evidence_free_persisted_and_rendered_receipts_require_explicit_empty_evidence():
     receipt = _normalize(_raw(evidence_summary=[]), transition_evidence={})
 
-    assert validate_persisted_handoff(receipt) == receipt
-    assert render_handoff(receipt).splitlines()[0] == "builder → reviewer"
+    assert validate_persisted_handoff(receipt, transition_evidence={}) == receipt
+    assert (
+        render_handoff(receipt, transition_evidence={}).splitlines()[0]
+        == "builder → reviewer"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1205,14 +1234,14 @@ def test_persisted_handoff_rejects_every_missing_canonical_field(missing):
     receipt = _normalize()
     del receipt[missing]
     with pytest.raises(HandoffValidationError, match=missing):
-        validate_persisted_handoff(receipt)
+        validate_persisted_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
 
 
 def test_persisted_handoff_rejects_unknown_top_level_field():
     receipt = _normalize()
     receipt["hostile"] = "must not survive"
     with pytest.raises(HandoffValidationError, match="unknown"):
-        validate_persisted_handoff(receipt)
+        validate_persisted_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
 
 
 @pytest.mark.parametrize(
@@ -1242,7 +1271,11 @@ def test_persisted_handoff_rejects_mutated_canonical_facts(mutation, match):
 
 def test_persisted_handoff_rejects_target_state_mismatch():
     with pytest.raises(HandoffValidationError, match="target_state"):
-        validate_persisted_handoff(_normalize(), target_state="REVIEWING")
+        validate_persisted_handoff(
+            _normalize(),
+            target_state="REVIEWING",
+            transition_evidence={"tests": TEST_DIGEST},
+        )
 
 
 def test_persisted_target_state_requires_an_exact_plain_string():
@@ -1261,7 +1294,7 @@ def test_persisted_handoff_does_not_fill_optional_canonical_fields():
     del receipt["issues"]
     del receipt["decision_request"]
     with pytest.raises(HandoffValidationError):
-        validate_persisted_handoff(receipt)
+        validate_persisted_handoff(receipt, transition_evidence={"tests": TEST_DIGEST})
 
 
 def test_intake_helper_builds_a_deterministic_job_created_handoff():
