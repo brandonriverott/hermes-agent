@@ -68,6 +68,72 @@ def remote_configuration() -> Optional[tuple[str, Path, Path]]:
     return host, Path(runtime), Path(lanes)
 
 
+def _pc_failure_health(
+    *,
+    now: int,
+    reason_code: str,
+    failure_class: str,
+    remote_configured: bool,
+):
+    """Return bounded failure evidence for every registered PC seat."""
+
+    from hermes_cli import jobs_lanes
+
+    registry = jobs_lanes.load_lane_registry()
+    return [
+        jobs_lanes.LaneHealth(
+            lane_id=lane.id,
+            state="BLOCKED",
+            status="BLOCKED",
+            failure_class=failure_class,
+            reason_code=reason_code,
+            observed_at=int(now),
+            expires_at=int(now) + registry.health_ttl_seconds,
+            executor_version=None,
+            available_capacity=0,
+            safe_detail={"remote_configured": remote_configured},
+        )
+        for lane in registry.lanes
+        if lane.host_id == "pc"
+    ]
+
+
+def _remote_transport_failure(*, now: int, stderr: bytes):
+    """Classify only known SSH transport failures; unknown output fails closed."""
+
+    detail = stderr[:8192].decode("utf-8", errors="replace").lower()
+    auth_markers = (
+        "permission denied",
+        "authentication failed",
+        "publickey",
+        "host key verification failed",
+    )
+    if any(marker in detail for marker in auth_markers):
+        return _pc_failure_health(
+            now=now,
+            reason_code="SSH_AUTH_FAILED",
+            failure_class="AUTH_INFRA",
+            remote_configured=True,
+        )
+    unreachable_markers = (
+        "connection timed out",
+        "operation timed out",
+        "connection refused",
+        "no route to host",
+        "host is down",
+        "network is unreachable",
+        "could not resolve hostname",
+    )
+    if any(marker in detail for marker in unreachable_markers):
+        return _pc_failure_health(
+            now=now,
+            reason_code="HOST_UNREACHABLE",
+            failure_class="INFRA_FAILURE",
+            remote_configured=True,
+        )
+    return []
+
+
 def collect_remote_lane_health(
     *,
     now: int,
@@ -90,9 +156,18 @@ def collect_remote_lane_health(
             check=False,
             timeout=45,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.TimeoutExpired):
+        return _pc_failure_health(
+            now=now,
+            reason_code="HOST_UNREACHABLE",
+            failure_class="INFRA_FAILURE",
+            remote_configured=True,
+        )
+    except subprocess.SubprocessError:
         return []
-    if completed.returncode not in {0, 2} or len(completed.stdout) > 128 * 1024:
+    if completed.returncode not in {0, 2}:
+        return _remote_transport_failure(now=now, stderr=completed.stderr)
+    if len(completed.stdout) > 128 * 1024:
         return []
     try:
         raw = json.loads(completed.stdout.decode("utf-8"))
@@ -123,6 +198,20 @@ def collect_fleet_lane_health(*, lane_root: Path, now: int):
     remote = remote_configuration()
     if remote is not None:
         local.extend(collect_remote_lane_health(now=now, configuration=remote))
+    else:
+        from hermes_cli import jobs_lanes
+
+        registry = jobs_lanes.load_lane_registry()
+        pc_lane_ids = {lane.id for lane in registry.lanes if lane.host_id == "pc"}
+        if not pc_lane_ids.intersection(item.lane_id for item in local):
+            local.extend(
+                _pc_failure_health(
+                    now=now,
+                    reason_code="HOST_UNREACHABLE",
+                    failure_class="INFRA_FAILURE",
+                    remote_configured=False,
+                )
+            )
     return local
 
 

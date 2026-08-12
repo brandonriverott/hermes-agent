@@ -156,6 +156,22 @@ class CodexOriginRig:
     def select_codex_lane(self):
         registry = jobs_lanes.load_lane_registry()
         lane = next(item for item in registry.lanes if item.id == "codex-mac-1")
+        for pc_lane in (item for item in registry.lanes if item.host_id == "pc"):
+            jdb.record_lane_health(
+                self.conn,
+                jobs_lanes.LaneHealth(
+                    lane_id=pc_lane.id,
+                    state="BLOCKED",
+                    status="BLOCKED",
+                    failure_class="INFRA_FAILURE",
+                    reason_code="HOST_UNREACHABLE",
+                    observed_at=self.clock,
+                    expires_at=self.clock + 1_000,
+                    executor_version=None,
+                    available_capacity=0,
+                    safe_detail={"remote_configured": False},
+                ),
+            )
         lane_root = self.root / "lanes" / lane.id
         for name in ("auth", "worktrees", "handoffs", "receipts", "health"):
             (lane_root / name).mkdir(parents=True, exist_ok=True)

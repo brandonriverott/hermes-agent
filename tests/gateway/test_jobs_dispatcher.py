@@ -195,3 +195,101 @@ def test_remote_health_is_policy_bound_and_requires_all_pc_seats(tmp_path):
         + "c" * 40
         + "/scripts/jobs_lane_health.py",
     ]
+
+
+def test_missing_pc_route_records_all_pc_seats_as_unreachable(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(
+        jobs_dispatcher,
+        "collect_local_lane_health",
+        lambda **_kwargs: _health(100),
+    )
+    monkeypatch.setattr(jobs_dispatcher, "remote_configuration", lambda: None)
+
+    health = jobs_dispatcher.collect_fleet_lane_health(
+        lane_root=tmp_path / "lanes",
+        now=100,
+    )
+    pc = [item for item in health if "-pc-" in item.lane_id]
+
+    assert len(pc) == 6
+    assert all(item.status == "BLOCKED" for item in pc)
+    assert all(item.failure_class == "INFRA_FAILURE" for item in pc)
+    assert all(item.reason_code == "HOST_UNREACHABLE" for item in pc)
+    assert all(item.safe_detail == {"remote_configured": False} for item in pc)
+
+    registry = jobs_lanes.load_lane_registry()
+    decision = jobs_lanes.select_lane(
+        registry,
+        health,
+        jobs_lanes.RoutingRequest(
+            job_id="j_mac_fallback",
+            executor="codex",
+            model="gpt-5.6-sol",
+        ),
+        now=100,
+        active_load={},
+    )
+    assert decision.status == "SELECTED"
+    assert decision.lane_id == "codex-mac-1"
+    assert decision.reason_code == "MAC_FALLBACK_SELECTED"
+
+
+def test_pc_transport_timeout_records_bounded_unreachable_evidence(tmp_path):
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["ssh", "gpu-pc"], timeout=45)
+
+    health = jobs_dispatcher.collect_remote_lane_health(
+        now=100,
+        configuration=(
+            "gpu-pc",
+            Path("/home/brandon/.hermes/releases/hermes-agent-" + "c" * 40),
+            Path("/home/brandon/jobs/lanes"),
+        ),
+        subprocess_run=timeout,
+    )
+
+    assert len(health) == 6
+    assert all(item.failure_class == "INFRA_FAILURE" for item in health)
+    assert all(item.reason_code == "HOST_UNREACHABLE" for item in health)
+    assert all(item.safe_detail == {"remote_configured": True} for item in health)
+
+
+def test_pc_ssh_auth_failure_does_not_authorize_mac_fallback(tmp_path):
+    def denied(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            255,
+            stdout=b"",
+            stderr=b"Permission denied (publickey).",
+        )
+
+    pc = jobs_dispatcher.collect_remote_lane_health(
+        now=100,
+        configuration=(
+            "gpu-pc",
+            Path("/home/brandon/.hermes/releases/hermes-agent-" + "c" * 40),
+            Path("/home/brandon/jobs/lanes"),
+        ),
+        subprocess_run=denied,
+    )
+    health = [*_health(100), *pc]
+    registry = jobs_lanes.load_lane_registry()
+    decision = jobs_lanes.select_lane(
+        registry,
+        health,
+        jobs_lanes.RoutingRequest(
+            job_id="j_no_auth_fallback",
+            executor="codex",
+            model="gpt-5.6-sol",
+        ),
+        now=100,
+        active_load={},
+    )
+
+    assert len(pc) == 6
+    assert all(item.failure_class == "AUTH_INFRA" for item in pc)
+    assert all(item.reason_code == "SSH_AUTH_FAILED" for item in pc)
+    assert decision.status == "BLOCKED"
+    assert decision.reason_code == "PC_FALLBACK_NOT_AUTHORIZED"
