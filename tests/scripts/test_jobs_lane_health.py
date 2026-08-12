@@ -54,6 +54,42 @@ def test_linux_memory_fallback_keeps_health_check_dependency_free(tmp_path, monk
     assert result.reason_code == "OK"
 
 
+def test_macos_memory_fallback_keeps_health_check_dependency_free(
+    tmp_path, monkeypatch,
+):
+    module = _health_module()
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    vm_stat = subprocess.CompletedProcess(
+        args=["vm_stat"],
+        returncode=0,
+        stdout=(
+            "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+            "Pages free: 1000.\n"
+            "Pages inactive: 64000.\n"
+            "Pages speculative: 1000.\n"
+            "Pages purgeable: 0.\n"
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(module.shutil, "which", lambda name, **_kw: f"/usr/bin/{name}")
+    monkeypatch.setattr(module, "_run_private", lambda *_a, **_kw: vm_stat)
+    assert module._macos_mem_available() == 66_000 * 16_384
+
+    original_import = builtins.__import__
+
+    def _no_psutil(name, *args, **kwargs):
+        if name == "psutil":
+            raise ImportError("not installed")
+        return original_import(name, *args, **kwargs)
+
+    lane = tmp_path / "lane"
+    lane.mkdir()
+    monkeypatch.setattr(builtins, "__import__", _no_psutil)
+    result = module._probe_resources(lane)
+    assert result.passed is True
+    assert result.reason_code == "OK"
+
+
 def test_git_probe_does_not_require_immutable_runtime_to_be_a_git_checkout(
     tmp_path, monkeypatch
 ):

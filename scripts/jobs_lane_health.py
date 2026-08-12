@@ -331,7 +331,11 @@ def _probe_resources(lane_dir: Path) -> jobs_lanes.ProbeResult:
 
         memory_available = int(psutil.virtual_memory().available)
     except ImportError:
-        memory_available = _linux_mem_available(Path("/proc/meminfo"))
+        memory_available = (
+            _macos_mem_available()
+            if sys.platform == "darwin"
+            else _linux_mem_available(Path("/proc/meminfo"))
+        )
     except (OSError, ValueError):
         memory_available = None
     if memory_available is None:
@@ -351,6 +355,44 @@ def _probe_resources(lane_dir: Path) -> jobs_lanes.ProbeResult:
             "memory_available_bytes": memory_available,
         },
     )
+
+
+def _macos_mem_available() -> int | None:
+    """Estimate reclaimable memory from macOS' dependency-free ``vm_stat``.
+
+    The immutable lane runtime intentionally does not require ``psutil``.
+    Linux already falls back to ``/proc/meminfo``; without the macOS
+    equivalent every healthy Mac lane was deterministically blocked with
+    ``RESOURCE_PROBE_FAILED`` before a worker could claim a Job.
+    """
+    if sys.platform != "darwin":
+        return None
+    executable = shutil.which("vm_stat", path=os.environ.get("PATH"))
+    if executable is None:
+        return None
+    completed = _run_private(
+        [executable],
+        environment={"PATH": os.environ.get("PATH", os.defpath)},
+        cwd=Path("/"),
+    )
+    if completed is None or completed.returncode != 0:
+        return None
+    page_size_match = re.search(r"page size of (\d+) bytes", completed.stdout)
+    if page_size_match is None:
+        return None
+    page_size = int(page_size_match.group(1))
+    reclaimable_pages = 0
+    found = False
+    for label in ("free", "inactive", "speculative", "purgeable"):
+        match = re.search(
+            rf"^Pages {label}:\s+(\d+)\.\s*$",
+            completed.stdout,
+            re.MULTILINE,
+        )
+        if match is not None:
+            reclaimable_pages += int(match.group(1))
+            found = True
+    return reclaimable_pages * page_size if found else None
 
 
 def _linux_mem_available(path: Path) -> int | None:
