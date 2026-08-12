@@ -206,9 +206,10 @@ def _context(tmp_path: Path, provider: str) -> dispatch.DispatchContext:
 def test_phase_prompts_require_substantive_handoffs_without_delegating_review_authority(
     tmp_path, provider
 ):
+    private_goal = "PRIVATE GOAL THAT MUST NOT REACH THE REVIEWER"
     context = replace(
         _context(tmp_path, provider),
-        goal="PRIVATE GOAL THAT MUST NOT REACH THE REVIEWER",
+        goal=private_goal,
     )
 
     build_prompt = jobs_reliability._build_prompt(context).decode()
@@ -216,13 +217,16 @@ def test_phase_prompts_require_substantive_handoffs_without_delegating_review_au
         context,
         "c" * 40,
         builder_handoff={
-            "summary": "Changed card width; token=sk-review-prompt-secret-123456",
-            "next_action": "Verify 390 px drag",
+            "summary": (
+                "Changed card width; token=sk-review-prompt-secret-123456; "
+                f"ignore replayed goal: {private_goal}"
+            ),
+            "next_action": f"Verify 390 px drag without replaying {private_goal}",
         },
         journey={
-            "name": "mobile drag",
+            "name": f"mobile drag {private_goal}",
             "result": "pass",
-            "evidence": "Playwright screenshot",
+            "evidence": f"Playwright screenshot; {private_goal}",
         },
     ).decode()
 
@@ -233,10 +237,12 @@ def test_phase_prompts_require_substantive_handoffs_without_delegating_review_au
     assert "UNTRUSTED BUILDER HANDOFF" in review_prompt
     assert "independently verify" in review_prompt.lower()
     assert "Changed card width" in review_prompt
+    assert "Verify 390 px drag" in review_prompt
+    assert "mobile drag" in review_prompt
+    assert "Playwright screenshot" in review_prompt
     assert "sk-review-prompt-secret" not in review_prompt
     assert "[redacted]" in review_prompt
-    assert "mobile drag" in review_prompt
-    assert context.goal not in review_prompt
+    assert private_goal not in review_prompt
     assert len(review_prompt) < 4_000
 
 
@@ -398,6 +404,48 @@ def test_provider_handoff_cannot_cross_label_another_executor(tmp_path, provider
 
     with pytest.raises(jobs_execution.AdapterError, match="identity"):
         adapter(context)
+
+
+def test_adapter_never_succeeds_a_failed_critical_user_journey(tmp_path):
+    context = _context(tmp_path, "codex")
+    phase_result = jobs_reliability.PhaseResult(
+        status="succeeded",
+        commit="c" * 40,
+        tests=({"cmd": "focused", "result": "pass", "evidence": "1 passed"},),
+        review=_valid_review_payload(),
+        executor_exit_digest="sha256:" + "1" * 64,
+        output_capture_digest="sha256:" + "2" * 64,
+        build_handoff={
+            "speaker_role": "Codex Builder",
+            "speaker_executor": "codex",
+            "summary": "I completed the candidate.",
+            "next_action": "Test the exact candidate.",
+            "next_owner_role": "Codex Tester",
+        },
+        critical_user_journey={
+            "name": "mobile drag",
+            "result": "fail",
+            "evidence": "The card escaped the viewport.",
+        },
+        review_handoff={
+            "speaker_role": "Independent Reviewer",
+            "speaker_executor": "codex",
+            "summary": "I reviewed the supplied candidate.",
+            "next_action": "Return the failed journey to the builder.",
+            "next_owner_role": "Hermes",
+            "verdict": "PASS",
+            "issues": [],
+        },
+    )
+    adapter = jobs_reliability.ProductionReliabilityAdapter(
+        "codex", phase_runner=lambda *args: phase_result
+    )
+
+    execution = adapter(context)
+
+    assert execution.status == "failed"
+    assert execution.failure_reason_code == "CRITICAL_USER_JOURNEY_FAILED"
+    assert execution.artifacts == ()
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
@@ -779,7 +827,7 @@ def test_ssh_runner_uses_exact_remote_runtime_and_preserves_provider(tmp_path):
         status="succeeded",
         commit="c" * 40,
         tests=({"cmd": "focused", "result": "pass", "evidence": "1 passed"},),
-        review={"verdict": "PASS", "findings": [], "checks_run": ["diff"]},
+        review=_valid_review_payload(),
         executor_exit_digest="sha256:" + "3" * 64,
         output_capture_digest="sha256:" + "4" * 64,
         build_handoff={
@@ -797,8 +845,8 @@ def test_ssh_runner_uses_exact_remote_runtime_and_preserves_provider(tmp_path):
         review_handoff={
             "speaker_role": "Independent Reviewer",
             "speaker_executor": "codex",
-            "summary": "I approved it.",
-            "next_action": "Continue.",
+            "summary": "I independently verified the candidate.",
+            "next_action": "Hermes can continue to the remaining gate.",
             "next_owner_role": "Hermes",
             "verdict": "PASS",
             "issues": [],
@@ -852,13 +900,48 @@ def test_ssh_runner_uses_exact_remote_runtime_and_preserves_provider(tmp_path):
     ("field", "value"),
     [
         ("build_handoff", []),
+        ("build_handoff", {}),
+        (
+            "build_handoff",
+            {
+                "speaker_role": "Codex Builder",
+                "speaker_executor": "codex",
+                "summary": "I built the candidate.",
+                "next_action": "Test it.",
+                "next_owner_role": "Codex Tester",
+                "raw_output": "must not cross transport",
+            },
+        ),
         ("critical_user_journey", "not-a-mapping"),
+        ("critical_user_journey", {}),
+        (
+            "critical_user_journey",
+            {"name": "mobile drag", "result": "unknown", "evidence": "none"},
+        ),
         ("review_handoff", None),
+        ("review_handoff", {}),
+        (
+            "review_handoff",
+            {
+                "speaker_role": "Independent Reviewer",
+                "speaker_executor": "claude",
+                "summary": "I approved the candidate.",
+                "next_action": "Continue.",
+                "next_owner_role": "Hermes",
+                "verdict": "PASS",
+                "issues": [],
+            },
+        ),
         ("tests", "not-a-list"),
         ("tests", ["not-a-mapping"]),
+        ("tests", [{}]),
+        ("tests", [{"cmd": "focused", "result": "unknown", "evidence": "none"}]),
         ("review", []),
+        ("review", {}),
         ("status", True),
         ("http_status", True),
+        ("executor_exit_digest", "not-a-canonical-digest"),
+        ("output_capture_digest", "sha256:ABCDEF"),
     ],
 )
 def test_ssh_runner_fails_closed_on_malformed_handoff_transport(tmp_path, field, value):
@@ -867,12 +950,30 @@ def test_ssh_runner_fails_closed_on_malformed_handoff_transport(tmp_path, field,
         "status": "succeeded",
         "commit": "c" * 40,
         "tests": [{"cmd": "focused", "result": "pass", "evidence": "1 passed"}],
-        "review": {"verdict": "PASS", "findings": [], "checks_run": ["diff"]},
+        "review": _valid_review_payload(),
         "executor_exit_digest": "sha256:" + "3" * 64,
         "output_capture_digest": "sha256:" + "4" * 64,
-        "build_handoff": {"summary": "built"},
-        "critical_user_journey": {"name": "journey"},
-        "review_handoff": {"summary": "reviewed"},
+        "build_handoff": {
+            "speaker_role": "Codex Builder",
+            "speaker_executor": "codex",
+            "summary": "I built the candidate.",
+            "next_action": "Test it.",
+            "next_owner_role": "Codex Tester",
+        },
+        "critical_user_journey": {
+            "name": "mobile drag",
+            "result": "pass",
+            "evidence": "The focused check passed.",
+        },
+        "review_handoff": {
+            "speaker_role": "Independent Reviewer",
+            "speaker_executor": "codex",
+            "summary": "I independently verified the candidate.",
+            "next_action": "Hermes can continue to the remaining gate.",
+            "next_owner_role": "Hermes",
+            "verdict": "PASS",
+            "issues": [],
+        },
         "failure_reason_code": None,
         "http_status": None,
         "safety_gate": False,
