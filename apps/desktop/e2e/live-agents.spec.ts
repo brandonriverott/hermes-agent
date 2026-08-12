@@ -158,7 +158,7 @@ test.describe('Live Agents — real isolated sources', () => {
     ).toMatchObject({ task: { status: 'done' } })
 
     await page.getByRole('button', { name: 'Refresh' }).click()
-    await expect(activeRun.getByText('finished', { exact: true })).toBeVisible({ timeout: 30_000 })
+    await expect(activeRun.getByText('finished', { exact: true }).first()).toBeVisible({ timeout: 30_000 })
     await expect(activeRun).toBeVisible()
     await page.screenshot({ path: 'test-results/live-agents-finished-retained.png', fullPage: true })
   })
