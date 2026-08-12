@@ -21,7 +21,9 @@ Rows are immutable intents plus delivery state:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -54,6 +56,12 @@ ALL_MILESTONES = frozenset({
 # One heartbeat is emitted per stagnant phase episode, and only after this
 # many seconds have passed since the phase's milestone was delivered.
 HEARTBEAT_AFTER_SECONDS = 600
+
+_UNSET = object()
+_SECRET_LABEL = re.compile(
+    r"authorization\s*:|bearer\s+|token\s*=|api[\s_-]*key|private\s+key|(?<!\w)sk\s*-\s*",
+    re.IGNORECASE,
+)
 
 MAX_PAYLOAD_CHARS = 4096
 MAX_ERROR_CHARS = 512
@@ -400,6 +408,10 @@ def render_milestone_message(
     *,
     re_review: bool = False,
     transition_evidence: Mapping[str, str] | None = None,
+    expected_job_id: str | None = None,
+    expected_attempt_id: object = _UNSET,
+    expected_target_state: str | None = None,
+    expected_speaker_id: str | None = None,
 ) -> str:
     """Render one bounded Jobs update.
 
@@ -417,6 +429,15 @@ def render_milestone_message(
         from hermes_cli import jobs_handoffs
 
         try:
+            if (
+                expected_job_id is None
+                or expected_attempt_id is _UNSET
+                or expected_target_state is None
+                or expected_speaker_id is None
+            ):
+                raise jobs_handoffs.HandoffValidationError(
+                    "handoff lacks trusted transition binding"
+                )
             handoff = jobs_handoffs.validate_persisted_handoff(
                 record.payload["handoff"],
                 target_state=(
@@ -426,6 +447,23 @@ def render_milestone_message(
                 ),
                 transition_evidence=transition_evidence,
             )
+            expected_milestone = milestone_for_state(expected_target_state)
+            milestone_matches = (
+                record.milestone in {MILESTONE_CORRECTING, MILESTONE_FAILURE}
+                if expected_target_state == "FAILED"
+                else expected_milestone is None
+                or record.milestone == expected_milestone
+            )
+            if (
+                handoff["job_id"] != expected_job_id
+                or handoff["attempt_id"] != expected_attempt_id
+                or handoff["to_phase"] != expected_target_state
+                or handoff["speaker_id"] != expected_speaker_id
+                or not milestone_matches
+            ):
+                raise jobs_handoffs.HandoffValidationError(
+                    "handoff identity does not match trusted transition"
+                )
             return jobs_handoffs.render_handoff(
                 handoff,
                 transition_evidence=transition_evidence,
@@ -433,10 +471,7 @@ def render_milestone_message(
         except (jobs_handoffs.HandoffValidationError, TypeError, ValueError):
             # Never repeat untrusted handoff facts in a diagnostic. Job number
             # and current milestone are the only safe context available here.
-            state = record.payload.get("target_state")
-            if not isinstance(state, str) or not state:
-                state = record.milestone
-            safe_state = _safe_label(" ".join(state.split()))[:80]
+            safe_state = _safe_label(expected_target_state or "current state")[:80]
             return f"Hermes could not explain this handoff — Job #{number} is {safe_state}."
 
     # Historical rows predate substantive handoffs. Keep exactly one visible,
@@ -477,7 +512,17 @@ def _legacy_milestone_message(record: NotificationRecord, *, re_review: bool) ->
 def _safe_label(value: object) -> str:
     """Bound labels and remove structural/control characters from legacy data."""
     text = str(value or "")
-    text = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in text)
+    if _SECRET_LABEL.search(unicodedata.normalize("NFKC", text)):
+        return "[redacted]"
+    text = "".join(
+        " "
+        if ord(char) < 32
+        or ord(char) == 127
+        or ord(char) in {0x2028, 0x2029}
+        or unicodedata.category(char) in {"Cf", "Cs"}
+        else char
+        for char in text
+    )
     return text[:160]
 
 

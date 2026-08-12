@@ -157,7 +157,14 @@ def test_valid_handoff_renders_one_substantive_agent_message():
         target_state="EVIDENCE_COLLECTING",
         handoff=_handoff(),
     )
-    text = jn.render_milestone_message(record, transition_evidence={"tests": digest})
+    text = jn.render_milestone_message(
+        record,
+        transition_evidence={"tests": digest},
+        expected_job_id="job-1",
+        expected_attempt_id="attempt-1",
+        expected_target_state="EVIDENCE_COLLECTING",
+        expected_speaker_id="builder-1",
+    )
     assert text.startswith("builder → reviewer\nBuilder completed")
     assert "Legacy Jobs update" not in text
 
@@ -169,10 +176,59 @@ def test_malformed_handoff_fails_closed_without_echoing_facts():
         handoff={"summary": "secret outcome", "speaker_role": "builder"},
     )
     text = jn.render_milestone_message(record, transition_evidence={})
-    assert text == "Hermes could not explain this handoff — Job #3 is VERIFIED."
+    assert text == "Hermes could not explain this handoff — Job #3 is current state."
     assert "secret outcome" not in text
+
+
+def test_malformed_diagnostic_does_not_echo_untrusted_state_or_milestone():
+    record = _record(
+        "token=supersecret",
+        target_state="authorization: leaked",
+        handoff={"summary": "do not echo"},
+    )
+    text = jn.render_milestone_message(record)
+    assert text == "Hermes could not explain this handoff — Job #3 is current state."
+    assert "supersecret" not in text
+    assert "leaked" not in text
 
 
 def test_review_approved_milestone_is_exported_and_maps_verified():
     assert jn.MILESTONE_REVIEW_APPROVED in jn.ALL_MILESTONES
     assert jn.milestone_for_state("VERIFIED") == jn.MILESTONE_REVIEW_APPROVED
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"job_id": "job-foreign"},
+        {"attempt_id": "attempt-foreign"},
+        {"to_phase": "REVIEWING"},
+        {"speaker_id": "reviewer-foreign"},
+    ],
+)
+def test_handoff_identity_tampering_fails_closed(override):
+    digest = "sha256:" + "a" * 64
+    handoff = _handoff()
+    if "job_id" in override:
+        handoff["job_id"] = override["job_id"]
+    elif "attempt_id" in override:
+        handoff["attempt_id"] = override["attempt_id"]
+    elif "to_phase" in override:
+        handoff["to_phase"] = override["to_phase"]
+    else:
+        handoff["speaker_id"] = override["speaker_id"]
+    record = _record(
+        jn.MILESTONE_TESTING,
+        target_state="EVIDENCE_COLLECTING",
+        handoff=handoff,
+    )
+    text = jn.render_milestone_message(
+        record,
+        transition_evidence={"tests": digest},
+        expected_job_id="job-1",
+        expected_attempt_id="attempt-1",
+        expected_target_state="EVIDENCE_COLLECTING",
+        expected_speaker_id="builder-1",
+    )
+    assert text.startswith("Hermes could not explain this handoff")
+    assert "builder → reviewer" not in text

@@ -141,10 +141,15 @@ def _format_message(conn, record, *, re_review: bool) -> str:
     """User-facing lifecycle message for a milestone (Task 8 wording)."""
     from hermes_cli import jobs_notifications as jn
 
+    binding = _transition_binding(conn, record)
     return jn.render_milestone_message(
         record,
         re_review=re_review,
         transition_evidence=_trusted_transition_evidence(conn, record),
+        expected_job_id=None if binding is None else binding["job_id"],
+        expected_attempt_id=None if binding is None else binding["attempt_id"],
+        expected_target_state=None if binding is None else binding["target_state"],
+        expected_speaker_id=None if binding is None else binding["speaker_id"],
     )
 
 
@@ -190,22 +195,63 @@ def _trusted_transition_evidence(conn, record) -> Optional[dict[str, str]]:
 
 
 def _validated_handoff(
-    conn, record, evidence: Optional[Mapping[str, str]]
+    conn,
+    record,
+    evidence: Optional[Mapping[str, str]],
+    binding: Optional[Mapping[str, object]],
 ) -> Optional[dict]:
     """Return a handoff only when strict validation succeeds with trusted evidence."""
-    from hermes_cli import jobs_handoffs
+    from hermes_cli import jobs_handoffs, jobs_notifications as jn
 
-    if "handoff" not in record.payload:
+    if "handoff" not in record.payload or binding is None:
         return None
     target_state = record.payload.get("target_state")
     try:
-        return jobs_handoffs.validate_persisted_handoff(
+        handoff = jobs_handoffs.validate_persisted_handoff(
             record.payload["handoff"],
             target_state=target_state if isinstance(target_state, str) else None,
             transition_evidence=evidence,
         )
+        expected_milestone = jn.milestone_for_state(binding["target_state"])
+        milestone_matches = (
+            record.milestone in {jn.MILESTONE_CORRECTING, jn.MILESTONE_FAILURE}
+            if binding["target_state"] == "FAILED"
+            else expected_milestone is None or record.milestone == expected_milestone
+        )
+        if (
+            handoff["job_id"] != binding["job_id"]
+            or handoff["attempt_id"] != binding["attempt_id"]
+            or handoff["to_phase"] != binding["target_state"]
+            or handoff["speaker_id"] != binding["speaker_id"]
+            or not milestone_matches
+        ):
+            raise jobs_handoffs.HandoffValidationError(
+                "handoff identity does not match trusted transition"
+            )
+        return handoff
     except (jobs_handoffs.HandoffValidationError, TypeError, ValueError):
         return None
+
+
+def _transition_binding(conn, record) -> Optional[dict[str, object]]:
+    """Return trusted identity fields for the notification's durable edge."""
+    if record.transition_id is None:
+        return None
+    row = conn.execute(
+        "SELECT job_id, attempt_id, target_state, initiator_id "
+        "FROM job_attempt_transitions WHERE id = ?",
+        (record.transition_id,),
+    ).fetchone()
+    if row is None or str(row["job_id"]) != record.job_id:
+        return None
+    if row["attempt_id"] != record.attempt_id:
+        return None
+    return {
+        "job_id": str(row["job_id"]),
+        "attempt_id": row["attempt_id"],
+        "target_state": str(row["target_state"]),
+        "speaker_id": str(row["initiator_id"]),
+    }
 
 
 def _display_metadata(
@@ -317,7 +363,8 @@ def _deliver_one(
         return
 
     evidence = _trusted_transition_evidence(conn, record)
-    handoff = _validated_handoff(conn, record, evidence)
+    binding = _transition_binding(conn, record)
+    handoff = _validated_handoff(conn, record, evidence, binding)
     session_db.append_message(
         target_session_id,
         role="system",
@@ -325,6 +372,12 @@ def _deliver_one(
             record,
             re_review=_is_re_review(conn, record),
             transition_evidence=evidence,
+            expected_job_id=None if binding is None else binding["job_id"],
+            expected_attempt_id=(None if binding is None else binding["attempt_id"]),
+            expected_target_state=(
+                None if binding is None else binding["target_state"]
+            ),
+            expected_speaker_id=(None if binding is None else binding["speaker_id"]),
         ),
         platform_message_id=record.notification_id,
         display_kind="jobs_update",

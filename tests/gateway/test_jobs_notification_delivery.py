@@ -19,6 +19,7 @@ Task 7 contract under test:
 
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,7 +27,11 @@ from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_handoffs
 from hermes_cli import jobs_notifications as jn
 from hermes_state import SessionDB
-from gateway.jobs_notifications import deliver_due_notification_once
+from gateway.jobs_notifications import (
+    _transition_binding,
+    _validated_handoff,
+    deliver_due_notification_once,
+)
 
 TEST_DIGEST = "sha256:" + "a" * 64
 
@@ -186,7 +191,7 @@ def test_ordered_delivery_across_milestones(jobs_path, session_db):
     assert msgs[1]["platform_message_id"].endswith(":assigned")
 
 
-def test_substantive_handoff_replaces_generic_milestone_and_sets_metadata(
+def test_payload_only_handoff_fails_closed_without_durable_transition_binding(
     jobs_path, session_db
 ):
     conn = jdb.connect(jobs_path)
@@ -217,17 +222,17 @@ def test_substantive_handoff_replaces_generic_milestone_and_sets_metadata(
     assert _deliver(session_db, jobs_path) is not None  # legacy queued
     assert _deliver(session_db, jobs_path) is not None  # substantive testing
     msg = _messages(session_db, "session-1")[-1]
-    assert msg["content"].startswith("builder → reviewer")
-    assert "Legacy Jobs update" not in msg["content"]
+    assert msg["content"].startswith("Hermes could not explain this handoff")
+    assert "builder → reviewer" not in msg["content"]
     metadata = (
         msg["display_metadata"]
         if isinstance(msg["display_metadata"], dict)
         else json.loads(msg["display_metadata"])
     )
-    assert metadata["speaker_role"] == "builder"
-    assert metadata["speaker_executor"] == "claude"
-    assert metadata["next_owner_role"] == "reviewer"
-    assert metadata["outcome"] == "handed_off"
+    assert "speaker_role" not in metadata
+    assert "speaker_executor" not in metadata
+    assert "next_owner_role" not in metadata
+    assert "outcome" not in metadata
 
 
 def test_missing_trusted_evidence_is_bounded_diagnostic_without_claimed_owner(
@@ -266,6 +271,51 @@ def test_missing_trusted_evidence_is_bounded_diagnostic_without_claimed_owner(
     assert "speaker_executor" not in metadata
     assert "next_owner_role" not in metadata
     assert "outcome" not in metadata
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("job_id", "foreign-job"),
+        ("attempt_id", "foreign-attempt"),
+        ("to_phase", "REVIEWING"),
+        ("speaker_id", "foreign-speaker"),
+    ],
+)
+def test_gateway_rejects_handoff_foreign_to_durable_transition(field, value):
+    job_id = "job-1"
+    handoff = _handoff(job_id)
+    handoff[field] = value
+    record = SimpleNamespace(
+        job_id=job_id,
+        attempt_id="attempt-1",
+        transition_id=7,
+        milestone=jn.MILESTONE_TESTING,
+        payload={"target_state": "EVIDENCE_COLLECTING", "handoff": handoff},
+    )
+
+    class _Conn:
+        def execute(self, *_args):
+            return SimpleNamespace(
+                fetchone=lambda: {
+                    "job_id": job_id,
+                    "attempt_id": "attempt-1",
+                    "target_state": "EVIDENCE_COLLECTING",
+                    "initiator_id": "builder-1",
+                }
+            )
+
+    binding = _transition_binding(_Conn(), record)
+    assert binding is not None
+    assert (
+        _validated_handoff(
+            _Conn(),
+            record,
+            {"tests": TEST_DIGEST},
+            binding,
+        )
+        is None
+    )
 
 
 def test_restart_idempotency_does_not_duplicate_visible_message(jobs_path, session_db):
