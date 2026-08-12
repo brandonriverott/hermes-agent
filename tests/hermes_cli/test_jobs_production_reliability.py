@@ -6,6 +6,7 @@ import json
 import subprocess
 import base64
 import io
+import unicodedata
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from hermes_cli import jobs_reliability
 from hermes_cli import jobs_receipts
 from hermes_cli import jobs_runtime
 from hermes_cli import jobs_lanes
+from hermes_cli import jobs_loop
 from scripts import jobs_remote_worker
 
 
@@ -60,6 +62,7 @@ def _valid_build_payload(**overrides) -> dict:
 def _valid_review_payload(**overrides) -> dict:
     payload = {
         "verdict": "PASS",
+        "finding_type": "none",
         "findings": [],
         "checks_run": ["Reviewed the candidate diff and focused evidence."],
         "handoff": {
@@ -69,6 +72,58 @@ def _valid_review_payload(**overrides) -> dict:
     }
     payload.update(overrides)
     return payload
+
+
+def _valid_transport_payload(provider: str = "codex", *, status: str = "succeeded"):
+    display = provider.capitalize()
+    if status == "failed":
+        return {
+            "status": "failed",
+            "commit": None,
+            "tests": [],
+            "review": {},
+            "executor_exit_digest": "sha256:" + "3" * 64,
+            "output_capture_digest": "sha256:" + "4" * 64,
+            "build_handoff": None,
+            "critical_user_journey": None,
+            "review_handoff": None,
+            "failure_reason_code": "PROCESS_CRASHED",
+            "http_status": None,
+            "safety_gate": False,
+        }
+    review = _valid_review_payload()
+    return {
+        "status": "succeeded",
+        "commit": "c" * 40,
+        "tests": _valid_build_payload()["tests"],
+        "review": review,
+        "executor_exit_digest": "sha256:" + "3" * 64,
+        "output_capture_digest": "sha256:" + "4" * 64,
+        "build_handoff": {
+            "speaker_role": f"{display} Builder",
+            "speaker_executor": provider,
+            "summary": "I built the candidate.",
+            "next_action": "Test it.",
+            "next_owner_role": f"{display} Tester",
+        },
+        "critical_user_journey": {
+            "name": "mobile drag",
+            "result": "pass",
+            "evidence": "The focused check passed.",
+        },
+        "review_handoff": {
+            "speaker_role": "Independent Reviewer",
+            "speaker_executor": provider,
+            "summary": review["handoff"]["summary"],
+            "next_action": review["handoff"]["next_action"],
+            "next_owner_role": "Hermes",
+            "verdict": "PASS",
+            "issues": [],
+        },
+        "failure_reason_code": None,
+        "http_status": None,
+        "safety_gate": False,
+    }
 
 
 @pytest.mark.parametrize(
@@ -121,6 +176,11 @@ def test_review_schema_requires_handoff_and_unable_to_verify_verdict():
     ]
     assert schema["properties"]["findings"]["items"]["minLength"] == 1
     assert schema["properties"]["checks_run"]["items"]["minLength"] == 1
+    assert schema["properties"]["finding_type"]["enum"] == [
+        "none",
+        "defect",
+        "missing_evidence",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -151,6 +211,86 @@ def test_phase_schemas_reject_extra_missing_and_oversized_handoff_fields(
     oversized["handoff"]["summary"] = "x" * 701
     with pytest.raises(jsonschema.ValidationError):
         validator.validate(oversized)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.update(extra="unknown"),
+        lambda payload: payload["handoff"].update(extra="unknown"),
+        lambda payload: payload["critical_user_journey"].update(extra="unknown"),
+        lambda payload: payload["tests"][0].update(extra="unknown"),
+        lambda payload: payload["tests"][0].pop("classification"),
+        lambda payload: payload["tests"][0].pop("note"),
+        lambda payload: payload.update(outcome=[]),
+        lambda payload: payload.update(failure_class="implementation"),
+        lambda payload: payload.update(failure_class="safety"),
+        lambda payload: payload.update(reason="worker reported a failure"),
+    ],
+)
+def test_runtime_build_response_matches_strict_schema_and_rejects_contradictions(
+    mutate,
+):
+    payload = _valid_build_payload()
+    mutate(payload)
+
+    assert jobs_reliability._normalize_build(payload) is None
+
+
+@pytest.mark.parametrize(
+    ("verdict", "finding_type", "findings", "valid"),
+    [
+        ("PASS", "none", [], True),
+        ("PASS", "defect", [], False),
+        ("PASS", "none", ["Concrete defect."], False),
+        ("NEEDS_CHANGES", "defect", ["Card overflows at 320 px."], True),
+        (
+            "NEEDS_CHANGES",
+            "missing_evidence",
+            ["No screenshot was supplied."],
+            False,
+        ),
+        (
+            "UNABLE_TO_VERIFY",
+            "missing_evidence",
+            ["No screenshot was supplied."],
+            True,
+        ),
+        ("UNABLE_TO_VERIFY", "defect", ["Card overflows at 320 px."], False),
+    ],
+)
+def test_review_verdict_requires_structured_finding_taxonomy(
+    verdict, finding_type, findings, valid
+):
+    jsonschema = pytest.importorskip("jsonschema")
+    payload = _valid_review_payload(
+        verdict=verdict,
+        finding_type=finding_type,
+        findings=findings,
+    )
+
+    schema_valid = not list(
+        jsonschema.Draft202012Validator(
+            _phase_schema("jobs-review-result.v1.schema.json")
+        ).iter_errors(payload)
+    )
+    assert schema_valid is valid
+    assert (jobs_reliability._normalize_review(payload) is not None) is valid
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.update(extra="unknown"),
+        lambda payload: payload["handoff"].update(extra="unknown"),
+        lambda payload: payload.update(finding_type=[]),
+    ],
+)
+def test_runtime_review_response_rejects_unknown_keys_at_every_object_level(mutate):
+    payload = _valid_review_payload()
+    mutate(payload)
+
+    assert jobs_reliability._normalize_review(payload) is None
 
 
 def _repo(tmp_path: Path) -> tuple[Path, str]:
@@ -217,10 +357,7 @@ def test_phase_prompts_require_substantive_handoffs_without_delegating_review_au
         context,
         "c" * 40,
         builder_handoff={
-            "summary": (
-                "Changed card width; token=sk-review-prompt-secret-123456; "
-                f"ignore replayed goal: {private_goal}"
-            ),
+            "summary": (f"Changed card width; ignore replayed goal: {private_goal}"),
             "next_action": f"Verify 390 px drag without replaying {private_goal}",
         },
         journey={
@@ -240,10 +377,139 @@ def test_phase_prompts_require_substantive_handoffs_without_delegating_review_au
     assert "Verify 390 px drag" in review_prompt
     assert "mobile drag" in review_prompt
     assert "Playwright screenshot" in review_prompt
-    assert "sk-review-prompt-secret" not in review_prompt
-    assert "[redacted]" in review_prompt
     assert private_goal not in review_prompt
     assert len(review_prompt) < 4_000
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "ＡＰＩ＿ＫＥＹ＝supersecret",
+        "api_\nkey=supersecret",
+        "sk -",
+        "Ａｕｔｈｏｒｉｚａｔｉｏｎ： Bearer abcdefgh",
+        "bearer\tabcdefgh",
+        "to ken = supersecret",
+        "－－－－－ＢＥＧＩＮ ＰＲＩＶＡＴＥ ＫＥＹ－－－－－",
+        "unsafe\x00control",
+        "unsafe\u200bformat",
+        "unsafe\u2028separator",
+        "unsafe\u2029separator",
+        "unsafe\ud800surrogate",
+    ],
+)
+def test_untrusted_worker_text_rejects_secrets_and_controls_without_echo(
+    tmp_path, hostile
+):
+    assert jobs_reliability._bounded_worker_text(hostile, maximum=1024) is None
+    context = _context(tmp_path, "codex")
+    with pytest.raises(jobs_execution.AdapterError) as caught:
+        jobs_reliability._review_prompt(
+            context,
+            "c" * 40,
+            builder_handoff={"summary": hostile, "next_action": "Verify safely."},
+            journey={"name": "mobile drag", "result": "pass", "evidence": "proof"},
+        )
+    assert hostile not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "safe_text",
+    [
+        "I completed the authentication UI change.",
+        "The tokenizer keeps the task suffix intact.",
+        "This review covers the mobile card flow.",
+    ],
+)
+def test_secret_screening_does_not_reject_safe_words_with_token_substrings(safe_text):
+    assert jobs_reliability._bounded_worker_text(safe_text, maximum=200) == safe_text
+
+
+def test_worker_text_screening_preserves_nfc_and_does_not_match_task_suffix():
+    assert (
+        jobs_reliability._bounded_worker_text(
+            "task - completed Cafe\u0301", maximum=100
+        )
+        == "task - completed Café"
+    )
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("handoff", "summary"),
+        ("handoff", "next_action"),
+        ("critical_user_journey", "name"),
+        ("critical_user_journey", "evidence"),
+        ("tests", "cmd"),
+        ("tests", "evidence"),
+        ("tests", "note"),
+    ],
+)
+def test_build_normalization_recursively_rejects_hostile_text(section, field):
+    payload = _valid_build_payload()
+    if section == "tests":
+        payload[section][0][field] = "ＡＰＩ＿ＫＥＹ＝do-not-store"
+    else:
+        payload[section][field] = "ＡＰＩ＿ＫＥＹ＝do-not-store"
+
+    assert jobs_reliability._normalize_build(payload) is None
+
+
+@pytest.mark.parametrize(
+    ("section", "field"),
+    [
+        ("handoff", "summary"),
+        ("handoff", "next_action"),
+        ("root", "findings"),
+        ("root", "checks_run"),
+    ],
+)
+def test_review_normalization_recursively_rejects_hostile_text(section, field):
+    payload = _valid_review_payload()
+    if section == "handoff":
+        payload[section][field] = "ＡＰＩ＿ＫＥＹ＝do-not-store"
+    else:
+        if field == "findings":
+            payload["verdict"] = "NEEDS_CHANGES"
+            payload["finding_type"] = "defect"
+        payload[field] = ["ＡＰＩ＿ＫＥＹ＝do-not-store"]
+
+    assert jobs_reliability._normalize_review(payload) is None
+
+
+@pytest.mark.parametrize(
+    ("goal", "replayed"),
+    [
+        ("g", "g"),
+        ("a", "a"),
+        ("review", "review"),
+        ("Café", "Cafe\u0301"),
+    ],
+)
+def test_review_prompt_scrubs_short_and_canonical_equivalent_goal_replays(
+    tmp_path, goal, replayed
+):
+    context = replace(_context(tmp_path, "codex"), goal=goal)
+
+    prompt = jobs_reliability._review_prompt(
+        context,
+        "c" * 40,
+        builder_handoff={
+            "summary": f"I completed the mobile card fix. {replayed}",
+            "next_action": "Independently verify the candidate.",
+        },
+        journey={
+            "name": "mobile drag",
+            "result": "pass",
+            "evidence": f"Focused proof passed. {replayed}",
+        },
+    ).decode()
+
+    assert prompt
+    assert unicodedata.normalize("NFC", goal).strip() not in unicodedata.normalize(
+        "NFC", prompt
+    )
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
@@ -296,9 +562,10 @@ def test_reliability_adapter_preserves_provider_and_materializes_evidence(
         return jobs_reliability.PhaseResult(
             status="succeeded",
             commit=commit,
-            tests=({"cmd": "focused", "result": "pass", "evidence": "1 passed"},),
+            tests=tuple(_valid_build_payload()["tests"]),
             review={
                 "verdict": "PASS",
+                "finding_type": "none",
                 "findings": [],
                 "checks_run": ["diff"],
                 "raw_output": "review transcript must not be persisted",
@@ -411,7 +678,7 @@ def test_adapter_never_succeeds_a_failed_critical_user_journey(tmp_path):
     phase_result = jobs_reliability.PhaseResult(
         status="succeeded",
         commit="c" * 40,
-        tests=({"cmd": "focused", "result": "pass", "evidence": "1 passed"},),
+        tests=tuple(_valid_build_payload()["tests"]),
         review=_valid_review_payload(),
         executor_exit_digest="sha256:" + "1" * 64,
         output_capture_digest="sha256:" + "2" * 64,
@@ -481,9 +748,7 @@ def test_local_phase_runner_uses_two_fresh_same_provider_sessions(
             )
             payload = _valid_build_payload(
                 handoff={
-                    "summary": (
-                        "I completed the candidate; token=sk-in-test-secret-0123456789"
-                    ),
+                    "summary": "I completed the candidate.",
                     "next_action": "Test the exact commit.",
                 }
             )
@@ -534,6 +799,8 @@ def test_local_phase_runner_uses_two_fresh_same_provider_sessions(
         assert "plan" in calls[1]
     handoff = context.lane_root / "handoffs" / context.attempt_id
     assert "sk-in-test-secret" not in (handoff / "build-stderr.log").read_text()
+    assert not (handoff / "build-result.json").exists()
+    assert not (handoff / "review-result.json").exists()
 
 
 def test_local_phase_runner_refuses_remote_physical_lane_before_provider(
@@ -547,6 +814,142 @@ def test_local_phase_runner_refuses_remote_physical_lane_before_provider(
             process_runner=lambda *args, **kwargs: calls.append(args)
         )("codex", context)
     assert calls == []
+
+
+def test_structured_implementation_failure_remains_task_failure_without_backoff(
+    tmp_path, monkeypatch
+):
+    context = _context(tmp_path, "codex")
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/codex"
+    )
+
+    def process_runner(argv, *, stdout_path, stderr_path, **kwargs):
+        payload = _valid_build_payload(
+            outcome="failed",
+            failure_class="implementation",
+            reason="The requested behavior is not implemented yet.",
+        )
+        target = Path(argv[argv.index("--output-last-message") + 1])
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        stdout_path.touch()
+        stderr_path.touch()
+        return jobs_reliability.ProcessResult(0)
+
+    result = jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
+        "codex", context
+    )
+    decision = jobs_loop.classify_failure(
+        jobs_loop.FailureSignal(
+            reason_code=result.failure_reason_code,
+            stage="executor",
+        )
+    )
+    retry = jobs_loop.decide_retry(
+        [],
+        evidence_digest=result.output_capture_digest,
+        failure_class=decision.failure_class,
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason_code == "IMPLEMENTATION_FAILED"
+    assert decision.failure_class == "TASK_FAILURE"
+    assert decision.recovery_decision == "CORRECT"
+    assert retry.backoff_seconds == 0
+
+
+@pytest.mark.parametrize("failure_mode", ["nonzero", "exception"])
+def test_codex_build_result_is_unlinked_even_on_early_failure(
+    tmp_path, monkeypatch, failure_mode
+):
+    context = _context(tmp_path, "codex")
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/codex"
+    )
+    result_path = (
+        context.lane_root / "handoffs" / context.attempt_id / "build-result.json"
+    )
+
+    def process_runner(argv, *, stdout_path, stderr_path, **kwargs):
+        target = Path(argv[argv.index("--output-last-message") + 1])
+        target.write_text(
+            json.dumps({"secret": "sk-result-secret-0123456789"}),
+            encoding="utf-8",
+        )
+        stdout_path.touch()
+        stderr_path.touch()
+        if failure_mode == "exception":
+            raise RuntimeError("synthetic provider crash")
+        return jobs_reliability.ProcessResult(1)
+
+    runner = jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)
+    if failure_mode == "exception":
+        with pytest.raises(RuntimeError, match="synthetic"):
+            runner("codex", context)
+    else:
+        assert runner("codex", context).status == "failed"
+
+    assert not result_path.exists()
+
+
+def test_codex_review_result_is_unlinked_on_reviewer_failure(tmp_path, monkeypatch):
+    context = _context(tmp_path, "codex")
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/codex"
+    )
+    calls = 0
+
+    def process_runner(argv, *, cwd, stdout_path, stderr_path, **kwargs):
+        nonlocal calls
+        calls += 1
+        target = Path(argv[argv.index("--output-last-message") + 1])
+        if calls == 1:
+            (cwd / "built.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(cwd), "add", "built.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(cwd), "commit", "-qm", "candidate"], check=True
+            )
+            target.write_text(json.dumps(_valid_build_payload()), encoding="utf-8")
+        else:
+            target.write_text(
+                json.dumps({"secret": "sk-review-result-0123456789"}),
+                encoding="utf-8",
+            )
+        stdout_path.touch()
+        stderr_path.touch()
+        return jobs_reliability.ProcessResult(0 if calls == 1 else 1)
+
+    result = jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
+        "codex", context
+    )
+    handoff = context.lane_root / "handoffs" / context.attempt_id
+
+    assert result.failure_reason_code == "REVIEWER_PROCESS_FAILED"
+    assert not (handoff / "build-result.json").exists()
+    assert not (handoff / "review-result.json").exists()
+
+
+def test_result_unlink_failure_does_not_mask_original_provider_failure(
+    tmp_path, monkeypatch
+):
+    context = _context(tmp_path, "codex")
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/codex"
+    )
+    monkeypatch.setattr(
+        Path, "unlink", lambda *args, **kwargs: (_ for _ in ()).throw(OSError())
+    )
+
+    def process_runner(argv, *, stdout_path, stderr_path, **kwargs):
+        stdout_path.touch()
+        stderr_path.touch()
+        return jobs_reliability.ProcessResult(1)
+
+    result = jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
+        "codex", context
+    )
+
+    assert result.failure_reason_code == "PROCESS_CRASHED"
 
 
 @pytest.mark.parametrize(
@@ -675,6 +1078,7 @@ def test_failed_critical_user_journey_cannot_produce_a_successful_phase(
         (
             _valid_review_payload(
                 verdict="NEEDS_CHANGES",
+                finding_type="defect",
                 findings=[],
             ),
             "HANDOFF_INCOMPLETE",
@@ -682,6 +1086,7 @@ def test_failed_critical_user_journey_cannot_produce_a_successful_phase(
         (
             _valid_review_payload(
                 verdict="NEEDS_CHANGES",
+                finding_type="defect",
                 findings=["Card overflows at 320 px."],
                 handoff={
                     "summary": "I found a blocking responsive defect.",
@@ -693,6 +1098,7 @@ def test_failed_critical_user_journey_cannot_produce_a_successful_phase(
         (
             _valid_review_payload(
                 verdict="UNABLE_TO_VERIFY",
+                finding_type="missing_evidence",
                 findings=[],
             ),
             "HANDOFF_INCOMPLETE",
@@ -705,6 +1111,7 @@ def test_failed_critical_user_journey_cannot_produce_a_successful_phase(
         (
             _valid_review_payload(
                 verdict="NEEDS_CHANGES",
+                finding_type="defect",
                 findings=["Concrete defect."] * 65,
                 handoff={
                     "summary": "I found blocking defects.",
@@ -716,6 +1123,7 @@ def test_failed_critical_user_journey_cannot_produce_a_successful_phase(
         (
             _valid_review_payload(
                 verdict="UNABLE_TO_VERIFY",
+                finding_type="missing_evidence",
                 findings=["Missing the real 390 px drag evidence."],
                 handoff={
                     "summary": "I could not verify the critical journey.",
@@ -820,13 +1228,75 @@ def test_runtime_production_preflight_refuses_non_idle_health(tmp_path):
     assert (result.status, result.code) == ("BLOCKED", "AUTH_REQUIRED")
 
 
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+@pytest.mark.parametrize("response_status", ["succeeded", "failed"])
+def test_ssh_runner_refuses_provider_context_and_lane_mismatch_before_send(
+    tmp_path, provider, response_status
+):
+    other = "claude" if provider == "codex" else "codex"
+    context = replace(_context(tmp_path, other), lane_id=f"{other}-pc-1")
+    calls = []
+    payload = _valid_transport_payload(provider, status=response_status)
+    runner = jobs_reliability.SSHProviderPhaseRunner(
+        host="gpu-pc",
+        runtime_root=Path("/home/brandon/.hermes/releases/hermes-agent-" + "d" * 40),
+        lane_root=Path("/home/brandon/jobs/lanes"),
+        subprocess_run=lambda argv, **kwargs: (
+            calls.append((argv, kwargs))
+            or subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps(payload).encode(), stderr=b""
+            )
+        ),
+    )
+
+    with pytest.raises(jobs_execution.AdapterError, match="identity"):
+        runner(provider, context)
+    assert calls == []
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_remote_worker_independently_refuses_provider_context_lane_mismatch(
+    tmp_path, monkeypatch, provider
+):
+    other = "claude" if provider == "codex" else "codex"
+    context = _context(tmp_path, other)
+    lane_root = tmp_path / f"{other}-pc-1"
+    lane_root.mkdir()
+    raw = {
+        "schema_version": 1,
+        "provider": provider,
+        "context": {
+            **asdict(context),
+            "repository": str(context.repository),
+            "worktree": str(lane_root / "worktrees" / "j_test-1"),
+            "lane_root": str(lane_root),
+            "lane_id": f"{other}-pc-1",
+        },
+    }
+    calls = []
+    monkeypatch.setattr(
+        jobs_remote_worker.jobs_reliability,
+        "LocalProviderPhaseRunner",
+        lambda: lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        jobs_remote_worker, "_atomic_lease", lambda *args, **kwargs: calls.append(args)
+    )
+    stdin = io.TextIOWrapper(io.BytesIO(json.dumps(raw).encode()), encoding="utf-8")
+    monkeypatch.setattr(jobs_remote_worker.sys, "stdin", stdin)
+    monkeypatch.setattr(jobs_remote_worker.sys, "stdout", io.StringIO())
+
+    assert jobs_remote_worker.execute() == 2
+    assert calls == []
+
+
 def test_ssh_runner_uses_exact_remote_runtime_and_preserves_provider(tmp_path):
     context = replace(_context(tmp_path, "codex"), lane_id="codex-pc-1")
     calls = []
     response = jobs_reliability.PhaseResult(
         status="succeeded",
         commit="c" * 40,
-        tests=({"cmd": "focused", "result": "pass", "evidence": "1 passed"},),
+        tests=tuple(_valid_build_payload()["tests"]),
         review=_valid_review_payload(),
         executor_exit_digest="sha256:" + "3" * 64,
         output_capture_digest="sha256:" + "4" * 64,
@@ -949,7 +1419,7 @@ def test_ssh_runner_fails_closed_on_malformed_handoff_transport(tmp_path, field,
     payload = {
         "status": "succeeded",
         "commit": "c" * 40,
-        "tests": [{"cmd": "focused", "result": "pass", "evidence": "1 passed"}],
+        "tests": _valid_build_payload()["tests"],
         "review": _valid_review_payload(),
         "executor_exit_digest": "sha256:" + "3" * 64,
         "output_capture_digest": "sha256:" + "4" * 64,
@@ -1027,6 +1497,73 @@ def test_ssh_runner_preserves_early_failure_without_inventing_handoffs(tmp_path)
     assert result.review_handoff is None
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("commit", "C" * 40),
+        ("commit", "short"),
+        ("executor_exit_digest", "sha256:" + "A" * 64),
+        ("output_capture_digest", "short"),
+        ("failure_reason_code", "lowercase reason"),
+        ("failure_reason_code", "X" * 65),
+        ("http_status", 99),
+        ("http_status", 600),
+        ("safety_gate", 1),
+    ],
+)
+def test_ssh_runner_rejects_malformed_failure_transport(tmp_path, field, value):
+    context = replace(_context(tmp_path, "codex"), lane_id="codex-pc-1")
+    payload = _valid_transport_payload("codex", status="failed")
+    payload[field] = value
+    runner = jobs_reliability.SSHProviderPhaseRunner(
+        host="gpu-pc",
+        runtime_root=Path("/home/brandon/.hermes/releases/hermes-agent-" + "d" * 40),
+        lane_root=Path("/home/brandon/jobs/lanes"),
+        subprocess_run=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(payload).encode(), stderr=b""
+        ),
+    )
+
+    with pytest.raises(jobs_execution.AdapterError, match="malformed"):
+        runner("codex", context)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("executor_exit_digest", "sha256:" + "A" * 64),
+        ("output_capture_digest", "short"),
+        ("http_status", 99),
+        ("http_status", 600),
+        ("safety_gate", 1),
+    ],
+)
+def test_local_adapter_rejects_noncanonical_success_metadata(tmp_path, field, value):
+    context = _context(tmp_path, "codex")
+    payload = _valid_transport_payload("codex")
+    phase_result = jobs_reliability.PhaseResult(
+        status=payload["status"],
+        commit=payload["commit"],
+        tests=tuple(payload["tests"]),
+        review=payload["review"],
+        executor_exit_digest=payload["executor_exit_digest"],
+        output_capture_digest=payload["output_capture_digest"],
+        build_handoff=payload["build_handoff"],
+        critical_user_journey=payload["critical_user_journey"],
+        review_handoff=payload["review_handoff"],
+        failure_reason_code=payload["failure_reason_code"],
+        http_status=payload["http_status"],
+        safety_gate=payload["safety_gate"],
+    )
+    phase_result = replace(phase_result, **{field: value})
+    adapter = jobs_reliability.ProductionReliabilityAdapter(
+        "codex", phase_runner=lambda *args: phase_result
+    )
+
+    with pytest.raises(jobs_execution.AdapterError, match="metadata"):
+        adapter(context)
+
+
 def test_fleet_transport_does_not_cross_provider_or_host(tmp_path, monkeypatch):
     local_calls = []
     remote_calls = []
@@ -1094,8 +1631,8 @@ def test_remote_cleanup_failure_preserves_all_handoff_fields(tmp_path, monkeypat
     result = jobs_reliability.PhaseResult(
         status="succeeded",
         commit="c" * 40,
-        tests=({"cmd": "focused", "result": "pass", "evidence": "1 passed"},),
-        review={"verdict": "PASS", "findings": [], "checks_run": ["diff"]},
+        tests=tuple(_valid_build_payload()["tests"]),
+        review=_valid_review_payload(),
         executor_exit_digest="sha256:" + "3" * 64,
         output_capture_digest="sha256:" + "4" * 64,
         build_handoff={"summary": "built"},
@@ -1120,8 +1657,8 @@ def test_remote_cleanup_failure_preserves_all_handoff_fields(tmp_path, monkeypat
             "requested_lane": "codex",
             "lane_id": "codex-pc-1",
             "executor": "codex",
-            "specialist": "codex",
-            "model": "gpt-5",
+            "specialist": "codex-builder",
+            "model": "gpt-5.6-sol",
             "effort": "high",
             "max_turns": 120,
         },

@@ -50,5 +50,25 @@
         "next_action": {"type": "string", "minLength": 1, "maxLength": 500}
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"const": "succeeded"}}},
+      "then": {
+        "properties": {
+          "failure_class": {"const": null},
+          "reason": {"const": null}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "failed"}}},
+      "then": {
+        "properties": {
+          "failure_class": {"type": "string", "enum": ["implementation", "infrastructure", "timeout", "safety", "cancelled"]},
+          "reason": {"type": "string", "minLength": 1, "maxLength": 512}
+        }
+      }
+    }
+  ]
 }

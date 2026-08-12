@@ -20,9 +20,23 @@ from hermes_cli import jobs_reliability  # noqa: E402
 
 
 _CONTEXT_KEYS = {
-    "job_id", "job_number", "job_name", "goal", "attempt_id", "ordinal",
-    "repository", "base_commit", "branch", "worktree", "lane_root",
-    "requested_lane", "lane_id", "executor", "specialist", "model", "effort",
+    "job_id",
+    "job_number",
+    "job_name",
+    "goal",
+    "attempt_id",
+    "ordinal",
+    "repository",
+    "base_commit",
+    "branch",
+    "worktree",
+    "lane_root",
+    "requested_lane",
+    "lane_id",
+    "executor",
+    "specialist",
+    "model",
+    "effort",
     "max_turns",
 }
 
@@ -57,8 +71,13 @@ def _cleanup(context: SimpleNamespace) -> bool:
         if worktree.exists():
             subprocess.run(
                 [
-                    "git", "-C", str(context.repository), "worktree", "remove",
-                    "--force", str(worktree),
+                    "git",
+                    "-C",
+                    str(context.repository),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(worktree),
                 ],
                 check=True,
                 capture_output=True,
@@ -74,7 +93,11 @@ def _cleanup(context: SimpleNamespace) -> bool:
 def execute() -> int:
     try:
         raw = json.loads(sys.stdin.buffer.read(128 * 1024).decode("utf-8"))
-        if not isinstance(raw, dict) or set(raw) != {"schema_version", "provider", "context"}:
+        if not isinstance(raw, dict) or set(raw) != {
+            "schema_version",
+            "provider",
+            "context",
+        }:
             raise ValueError("request shape")
         if raw["schema_version"] != 1 or raw["provider"] not in {"claude", "codex"}:
             raise ValueError("request identity")
@@ -82,10 +105,13 @@ def execute() -> int:
         if not isinstance(values, dict) or set(values) != _CONTEXT_KEYS:
             raise ValueError("context shape")
         context = SimpleNamespace(**values)
+        jobs_reliability._require_provider_context(raw["provider"], context, host="pc")
         lane_root = Path(context.lane_root)
         if not lane_root.is_dir() or lane_root.is_symlink():
             raise ValueError("lane root")
-        _atomic_lease(lane_root, state="BUILDING", reason_code="REMOTE_EXECUTOR_STARTED")
+        _atomic_lease(
+            lane_root, state="BUILDING", reason_code="REMOTE_EXECUTOR_STARTED"
+        )
         result = jobs_reliability.LocalProviderPhaseRunner()(raw["provider"], context)
         if not _cleanup(context):
             _atomic_lease(lane_root, state="FAILED", reason_code="CLEANUP_FAILED")
@@ -100,10 +126,14 @@ def execute() -> int:
                 critical_user_journey=result.critical_user_journey,
                 review_handoff=result.review_handoff,
                 failure_reason_code="CLEANUP_FAILED",
+                http_status=result.http_status,
+                safety_gate=result.safety_gate,
             )
         else:
             _atomic_lease(lane_root, state="IDLE", reason_code="OK")
-        sys.stdout.write(json.dumps(asdict(result), sort_keys=True, separators=(",", ":")))
+        sys.stdout.write(
+            json.dumps(asdict(result), sort_keys=True, separators=(",", ":"))
+        )
         return 0
     except Exception as exc:
         sys.stderr.write(f"remote worker refused: {type(exc).__name__}\n")
@@ -114,14 +144,25 @@ def preflight() -> int:
     try:
         raw = json.loads(sys.stdin.buffer.read(64 * 1024).decode("utf-8"))
         expected = {
-            "schema_version", "provider", "repository", "base_commit", "branch",
-            "lane_root", "lane_id",
+            "schema_version",
+            "provider",
+            "repository",
+            "base_commit",
+            "branch",
+            "lane_root",
+            "lane_id",
         }
-        if not isinstance(raw, dict) or set(raw) != expected or raw["schema_version"] != 1:
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != expected
+            or raw["schema_version"] != 1
+        ):
             raise ValueError("request shape")
         provider = raw["provider"]
         lane_id = raw["lane_id"]
-        if provider not in {"claude", "codex"} or not str(lane_id).startswith(provider + "-pc-"):
+        if provider not in {"claude", "codex"} or not str(lane_id).startswith(
+            provider + "-pc-"
+        ):
             raise ValueError("provider identity")
         repository = Path(raw["repository"])
         lane_root = Path(raw["lane_root"])
@@ -132,13 +173,28 @@ def preflight() -> int:
             if not path.is_dir() or path.is_symlink():
                 raise ValueError("lane layout")
         base = subprocess.run(
-            ["git", "-C", str(repository), "cat-file", "-e", f"{raw['base_commit']}^{{commit}}"],
+            [
+                "git",
+                "-C",
+                str(repository),
+                "cat-file",
+                "-e",
+                f"{raw['base_commit']}^{{commit}}",
+            ],
             check=False,
             capture_output=True,
             timeout=120,
         )
         branch = subprocess.run(
-            ["git", "-C", str(repository), "show-ref", "--verify", "--quiet", f"refs/heads/{raw['branch']}"],
+            [
+                "git",
+                "-C",
+                str(repository),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{raw['branch']}",
+            ],
             check=False,
             capture_output=True,
             timeout=120,

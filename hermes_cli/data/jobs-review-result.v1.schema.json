@@ -3,9 +3,10 @@
   "title": "Jobs independent review result (v1)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "findings", "checks_run", "handoff"],
+  "required": ["verdict", "finding_type", "findings", "checks_run", "handoff"],
   "properties": {
     "verdict": {"type": "string", "enum": ["PASS", "NEEDS_CHANGES", "UNABLE_TO_VERIFY"]},
+    "finding_type": {"type": "string", "enum": ["none", "defect", "missing_evidence"]},
     "findings": {
       "type": "array",
       "maxItems": 64,
@@ -26,5 +27,34 @@
         "next_action": {"type": "string", "minLength": 1, "maxLength": 500}
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"verdict": {"const": "PASS"}}},
+      "then": {
+        "properties": {
+          "finding_type": {"const": "none"},
+          "findings": {"maxItems": 0}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verdict": {"const": "NEEDS_CHANGES"}}},
+      "then": {
+        "properties": {
+          "finding_type": {"const": "defect"},
+          "findings": {"minItems": 1}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verdict": {"const": "UNABLE_TO_VERIFY"}}},
+      "then": {
+        "properties": {
+          "finding_type": {"const": "missing_evidence"},
+          "findings": {"minItems": 1}
+        }
+      }
+    }
+  ]
 }

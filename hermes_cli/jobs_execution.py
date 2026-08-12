@@ -61,9 +61,7 @@ def claim_artifact(path: Path, *, name: str) -> ArtifactClaim:
     )
 
 
-def bounded_text(
-    path: Path, *, maximum: int = MAX_PRESERVED_BYTES
-) -> Optional[str]:
+def bounded_text(path: Path, *, maximum: int = MAX_PRESERVED_BYTES) -> Optional[str]:
     """Read a bounded UTF-8 tail, dropping any first partial line."""
 
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
