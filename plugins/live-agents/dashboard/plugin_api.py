@@ -7,6 +7,7 @@ paths, raw event payloads, prompts, credentials, or worker command arguments.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import re
 from typing import Any
@@ -38,6 +39,13 @@ def _milliseconds(value: Any) -> int | None:
         return None
     # Kanban timestamps are Unix seconds. Keep already-normalized fixtures safe.
     return int(value if value > 10_000_000_000 else value * 1000)
+
+
+def _worker_identity(value: Any) -> str:
+    """Return a stable opaque worker key without releasing an assignee name."""
+    raw = str(value or "").strip()
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"kanban-worker-{digest}"
 
 
 _EVENT_LABELS = {
@@ -100,7 +108,7 @@ def _runs_for_board(slug: str) -> list[dict[str, Any]]:
                         "id": f"task:{task.id}",
                         "task_id": task.id,
                         "title": _safe_text(task.title),
-                        "assignee": task.assignee,
+                        "identity_key": _worker_identity(task.assignee),
                         "board": slug,
                         "status": task.status,
                         "started_at": _milliseconds(task.started_at),
@@ -119,7 +127,7 @@ def _runs_for_board(slug: str) -> list[dict[str, Any]]:
                         "id": str(run.id),
                         "task_id": task.id,
                         "title": _safe_text(task.title),
-                        "assignee": run.profile or task.assignee,
+                        "identity_key": _worker_identity(run.profile or task.assignee),
                         "board": slug,
                         "status": run.status or task.status,
                         "started_at": _milliseconds(run.started_at),

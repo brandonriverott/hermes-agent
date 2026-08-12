@@ -36,6 +36,7 @@ export interface FleetRun {
   capabilities: Partial<Record<'pause' | 'steer' | 'stop' | 'openResult', { supported: boolean; reason?: string }>>
   control?: {
     sessionId?: string
+    ownerSessionId?: string
     processId?: string
     subagentId?: string
     board?: string
@@ -97,6 +98,7 @@ const STATUS_RANK: Record<FleetStatus, number> = {
 
 const PRIVATE_PATH = /(?:[A-Za-z]:\\|\/(?:Users|home|private|var|tmp)\/)[^\s"'`]+/g
 const SECRET = /\b(?:api[_-]?key|token|password|secret|authorization)\s*[:=]\s*\S+/gi
+const OPAQUE_KANBAN_IDENTITY = /^kanban:kanban-worker-[a-f0-9]{16}$/
 
 export function sanitizePresentation(value: unknown): string {
   return String(value ?? '')
@@ -111,6 +113,11 @@ export function safeArtifactName(value: unknown): string {
   const normalized = String(value ?? '').replaceAll('\\', '/')
 
   return sanitizePresentation(normalized.split('/').pop() || 'artifact')
+}
+
+/** Drops legacy Kanban records that persisted a raw assignee before redaction. */
+export function privacySafeFleetHistory(history: FleetEvidence[]): FleetEvidence[] {
+  return history.filter(item => item.run.source !== 'kanban' || OPAQUE_KANBAN_IDENTITY.test(item.identityKey))
 }
 
 export function fleetStorageKey(profileName: string, slot: FleetStorageSlot): string {
@@ -242,6 +249,12 @@ export function filterFleet(agents: FleetAgent[], filters: FleetFilters): FleetA
     .filter(agent => agent.runs.length > 0)
 }
 
+function evidenceTime(item: FleetEvidence): number {
+  return item.run.status === 'finished'
+    ? item.run.finishedAt ?? item.run.updatedAt
+    : item.run.updatedAt
+}
+
 /** Merge a fresh observation into durable plugin history. Runs are never aged out. */
 export function mergeFleetHistory(history: FleetEvidence[], fresh: FleetEvidence[]): FleetEvidence[] {
   const merged = new Map<string, FleetEvidence>()
@@ -250,7 +263,22 @@ export function mergeFleetHistory(history: FleetEvidence[], fresh: FleetEvidence
     const key = `${item.identityKey.trim().toLowerCase()}\0${item.run.source}\0${item.run.id}`
     const previous = merged.get(key)
 
-    merged.set(key, !previous || item.run.updatedAt >= previous.run.updatedAt ? item : previous)
+    if (!previous) {
+      merged.set(key, item)
+      continue
+    }
+
+    // A run id is immutable. Once an authoritative source records its
+    // completion, a later polling observation that still says "active" is
+    // stale and must never resurrect the run. Competing completions compare
+    // their actual finish times rather than their observation times.
+    if (previous.run.status === 'finished' && item.run.status !== 'finished') {continue}
+    if (item.run.status === 'finished' && previous.run.status !== 'finished') {
+      merged.set(key, item)
+      continue
+    }
+
+    merged.set(key, evidenceTime(item) >= evidenceTime(previous) ? item : previous)
   }
 
   return [...merged.values()]

@@ -24,7 +24,7 @@ describe('live agents public-source adapters', () => {
 
     const rest = vi.fn(async () => ({
       profiles: [{ name: 'argus', description: 'Researches durable questions.', gateway_running: true }],
-      runs: [{ id: 'r1', task_id: 't1', assignee: 'default', title: 'Ship it', board: 'main', status: 'done', ended_at: 20 }]
+      runs: [{ id: 'r1', task_id: 't1', identity_key: 'kanban-worker-0123456789abcdef', title: 'Ship it', board: 'main', status: 'done', ended_at: 20 }]
     }))
 
     const remote = vi.fn(async () => ({
@@ -54,6 +54,7 @@ describe('live agents public-source adapters', () => {
       assignment: 'Delegated work',
       latestActivity: 'read_file'
     })
+    expect(snapshot.evidence.find(item => item.run.source === 'delegation')?.run.capabilities.steer).toMatchObject({ supported: false })
     expect(snapshot.evidence.find(item => item.run.source === 'background-process')?.run).toMatchObject({
       assignment: 'Background process (npm)',
       latestActivity: 'Tracked background process is running.',
@@ -66,7 +67,6 @@ describe('live agents public-source adapters', () => {
     expect(snapshot.sources.filter(item => item.state === 'unavailable')).toEqual([])
     expect(aggregateFleet(snapshot.evidence).find(item => item.id === 'profile:default')?.runs.map(run => run.source).sort()).toEqual([
       'background-process',
-      'kanban',
       'remote'
     ])
     expect(request.mock.calls.map(([method]) => method)).not.toContain(expect.stringMatching(/model|provider|completion|chat/))
@@ -76,6 +76,7 @@ describe('live agents public-source adapters', () => {
       'spawn_tree.list',
       'projects.list'
     ])
+    expect(request).toHaveBeenCalledWith('spawn_tree.list', { cross_session: true, limit: 20 })
     expect(remote).toHaveBeenCalledTimes(1)
     expect(rest).toHaveBeenCalledWith('/snapshot')
   })
@@ -96,20 +97,21 @@ describe('live agents public-source adapters', () => {
 
       if (method === 'spawn_tree.list') {return { entries: [{ path: '/private/history-once.json', finished_at: 123 }] }}
 
-      if (method === 'spawn_tree.load') {return { finished_at: 123, subagents: [{ subagent_id: 'history-once', status: 'finished' }] }}
+      if (method === 'spawn_tree.load') {return { finished_at: 123, subagents: [{ subagent_id: 'history-once', status: 'finished', updated_at: 1 }] }}
       throw new Error(`unexpected ${method}`)
     })
 
-    await loadFleetEvidence(request, undefined, 'poll-cache-test')
+    const first = await loadFleetEvidence(request, undefined, 'poll-cache-test')
     await loadFleetEvidence(request, undefined, 'poll-cache-test')
 
+    expect(first.evidence[0]?.run.finishedAt).toBe(123_000)
     expect(request.mock.calls.filter(([method]) => method === 'spawn_tree.load')).toHaveLength(1)
   })
 
   it('does not enable Kanban controls without a real run id', async () => {
     const snapshot = await loadFleetEvidence(
       vi.fn(async method => method === 'projects.list' ? { projects: [] } : method === 'spawn_tree.list' ? { entries: [] } : method === 'delegation.status' ? { active: [] } : { processes: [] }),
-      vi.fn(async () => ({ profiles: [], runs: [{ id: 'task:t1', task_id: 't1', assignee: 'builder', board: 'main', status: 'running' }] })),
+      vi.fn(async () => ({ profiles: [], runs: [{ id: 'task:t1', task_id: 't1', identity_key: 'kanban-worker-0123456789abcdef', board: 'main', status: 'running' }] })),
       'default'
     )
 
@@ -119,7 +121,7 @@ describe('live agents public-source adapters', () => {
     })
   })
 
-  it('routes delegation steering and stopping through exact live public seams', async () => {
+  it('routes delegation steering only through its exact bound owner session', async () => {
     const request = vi.spyOn(host, 'request').mockImplementation(async method =>
       method === 'subagent.steer' ? { status: 'queued' } : { found: true }
     )
@@ -137,7 +139,7 @@ describe('live agents public-source adapters', () => {
       usage: { kind: 'unavailable' },
       artifacts: [],
       capabilities: { steer: { supported: true }, stop: { supported: true } },
-      control: { subagentId: 'subagent-1' }
+      control: { subagentId: 'subagent-1', ownerSessionId: 'owner-session' }
     }
 
     await controlRun('steer', run, 'Use the focused test', undefined)
@@ -149,6 +151,30 @@ describe('live agents public-source adapters', () => {
       text: 'Use the focused test'
     })
     expect(request).toHaveBeenNthCalledWith(2, 'subagent.interrupt', { subagent_id: 'subagent-1' })
+  })
+
+  it('fails closed before mutation when delegation steering has no exact owner binding', async () => {
+    const request = vi.spyOn(host, 'request').mockResolvedValue({ status: 'queued' })
+    vi.spyOn(host.state.activeSessionId, 'get').mockReturnValue('different-session')
+    const run: FleetRun = {
+      id: 'subagent-1', source: 'delegation', status: 'active', assignment: 'Delegated work', machine: 'Local machine', updatedAt: 1,
+      log: [], usage: { kind: 'unavailable' }, artifacts: [], capabilities: { steer: { supported: true } }, control: { subagentId: 'subagent-1', ownerSessionId: 'owner-session' }
+    }
+
+    await expect(controlRun('steer', run, 'Do not send')).rejects.toThrow('exact owning session')
+    await expect(controlRun('steer', { ...run, control: { subagentId: 'subagent-1' } }, 'Do not send')).rejects.toThrow('exact owning session')
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('does not retain raw Kanban assignees in fleet evidence', async () => {
+    const snapshot = await loadFleetEvidence(
+      vi.fn(async method => method === 'projects.list' ? { projects: [] } : method === 'spawn_tree.list' ? { entries: [] } : method === 'delegation.status' ? { active: [] } : { processes: [] }),
+      vi.fn(async () => ({ profiles: [], runs: [{ id: '42', task_id: 't1', identity_key: 'kanban-worker-0123456789abcdef', title: 'Ship it', board: 'main', status: 'running', assignee: 'ASSIGNEE_SENTINEL' }] })),
+      'default'
+    )
+
+    expect(JSON.stringify(snapshot.evidence)).not.toContain('ASSIGNEE_SENTINEL')
+    expect(snapshot.evidence[0]).toMatchObject({ identityKey: 'kanban:kanban-worker-0123456789abcdef', name: 'Kanban builder' })
   })
 
   it('routes Kanban steering through the scoped backend and rejects stale targets before mutation', async () => {

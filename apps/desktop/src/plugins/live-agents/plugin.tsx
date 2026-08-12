@@ -37,7 +37,7 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 
 import { controlRun, loadFleetEvidence } from './adapters'
-import { activeRosterCount, aggregateFleet, buildRosterGroups, filterFleet, type FleetAgent, type FleetEvidence, type FleetFilters, type FleetRun, type FleetSource, type FleetStatus, fleetStorageKey, mergeFleetHistory, parseRosterTarget } from './model'
+import { activeRosterCount, aggregateFleet, buildRosterGroups, filterFleet, type FleetAgent, type FleetEvidence, type FleetFilters, type FleetRun, type FleetSource, type FleetStatus, fleetStorageKey, mergeFleetHistory, parseRosterTarget, privacySafeFleetHistory } from './model'
 
 const QUERY_KEY = ['live-agents', 'fleet']
 const ROSTER_PANE_ID = 'live-agents:roster'
@@ -177,7 +177,7 @@ function LiveAgentsProfilePage({ profileName, rest, storage }: { profileName: st
   const [timeRange, setTimeRange] = useState('all')
   const [collapsed, setCollapsed] = useState<string[]>(() => storage.get<string[]>(fleetStorageKey(profileName, 'collapsed'), []).filter(id => id !== target.agent))
   const [dismissed, setDismissed] = useState<string[]>(() => storage.get(fleetStorageKey(profileName, 'dismissed'), []))
-  const [history, setHistory] = useState<FleetEvidence[]>(() => storage.get(fleetStorageKey(profileName, 'history'), []))
+  const [history, setHistory] = useState<FleetEvidence[]>(() => privacySafeFleetHistory(storage.get(fleetStorageKey(profileName, 'history'), [])))
   const [steerTarget, setSteerTarget] = useState<FleetRun | null>(null)
   const [steerText, setSteerText] = useState('')
   const query = useQuery({ queryKey, queryFn: () => loadFleetEvidence(host.request, rest, profileName), refetchInterval: 15_000, staleTime: 5_000 })

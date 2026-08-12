@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { activeRosterCount, aggregateFleet, buildRosterGroups, filterFleet, type FleetEvidence, fleetStorageKey, mergeFleetHistory, normalizeStatus, parseRosterTarget, safeArtifactName, sanitizePresentation } from './model'
+import { activeRosterCount, aggregateFleet, buildRosterGroups, filterFleet, type FleetEvidence, fleetStorageKey, mergeFleetHistory, normalizeStatus, parseRosterTarget, privacySafeFleetHistory, safeArtifactName, sanitizePresentation } from './model'
 
 const run = (id: string, source: string, status: 'active' | 'blocked' | 'finished', updatedAt: number) => ({
   id, source, status, assignment: `${source} assignment`, machine: 'local', updatedAt, log: [], usage: { kind: 'unavailable' as const },
@@ -91,19 +91,38 @@ describe('live agents fleet model', () => {
     expect(safeArtifactName('C:\\secret\\report.txt')).toBe('report.txt')
   })
 
+  it('drops legacy Kanban history that could contain an assignee name', () => {
+    const legacy = evidence('profile:ASSIGNEE_SENTINEL', '1', 'kanban', 'finished', 1)
+    const opaque = evidence('kanban:kanban-worker-0123456789abcdef', '2', 'kanban', 'finished', 1)
+
+    expect(privacySafeFleetHistory([legacy, opaque])).toEqual([opaque])
+  })
+
   it('represents remote online, unreachable, and stale states without treating them as live', () => {
     expect(normalizeStatus('online')).toBe('waiting')
     expect(normalizeStatus('unreachable')).toBe('unavailable')
     expect(normalizeStatus('stale')).toBe('unavailable')
   })
 
-  it('retains finished history and replaces a run only with newer authoritative evidence', () => {
-    const old = evidence('a', '1', 'delegation', 'active', 10)
-    const finished = evidence('a', '1', 'delegation', 'finished', 20)
-    const other = evidence('a', '2', 'kanban', 'finished', 5)
-    const merged = mergeFleetHistory([old, other], [finished])
+  it('retains a completion by its actual finish time when a later poll still reports it active', () => {
+    const finished = {
+      ...evidence('a', '1', 'delegation', 'finished', 900),
+      run: { ...run('1', 'delegation', 'finished', 900), finishedAt: 200 }
+    }
+    const staleActive = evidence('a', '1', 'delegation', 'active', 1_000)
+    const earlierCompletion = {
+      ...evidence('a', '2', 'kanban', 'finished', 950),
+      run: { ...run('2', 'kanban', 'finished', 950), finishedAt: 100 }
+    }
+    const laterCompletion = {
+      ...evidence('a', '2', 'kanban', 'finished', 300),
+      run: { ...run('2', 'kanban', 'finished', 300), finishedAt: 250 }
+    }
+    const merged = mergeFleetHistory([finished, earlierCompletion], [staleActive, laterCompletion])
+
     expect(merged).toHaveLength(2)
     expect(merged.find(item => item.run.id === '1')?.run.status).toBe('finished')
+    expect(merged.find(item => item.run.id === '2')?.run.finishedAt).toBe(250)
   })
 
   it('scopes durable presentation state to the active profile', () => {

@@ -97,6 +97,33 @@ def test_snapshot_projects_safe_event_activity_without_raw_worker_log(monkeypatc
     assert "/Users/example" not in repr(result)
 
 
+def test_snapshot_uses_an_opaque_worker_identity_without_exposing_assignee(monkeypatch):
+    module = _load_plugin()
+    task = SimpleNamespace(
+        id="t1",
+        title="Ship safely",
+        assignee="ASSIGNEE_SENTINEL",
+        status="running",
+        started_at=10,
+        completed_at=None,
+        created_at=9,
+    )
+    conn = SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr(module.kanban_db, "board_exists", lambda _slug: True)
+    monkeypatch.setattr(module.kanban_db, "connect", lambda **_kwargs: conn)
+    monkeypatch.setattr(module.kanban_db, "list_tasks", lambda *_args, **_kwargs: [task])
+    monkeypatch.setattr(module.kanban_db, "list_attachments", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(module.kanban_db, "list_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(module.kanban_db, "list_runs", lambda *_args, **_kwargs: [])
+
+    result = module._runs_for_board("main")
+
+    assert "assignee" not in result[0]
+    assert result[0]["identity_key"].startswith("kanban-worker-")
+    assert "ASSIGNEE_SENTINEL" not in repr(result)
+
+
 def test_steer_run_rejects_stale_target_and_adds_comment_for_exact_active_run(monkeypatch):
     module = _load_plugin()
     conn = SimpleNamespace(close=lambda: None)

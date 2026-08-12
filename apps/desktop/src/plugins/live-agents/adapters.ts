@@ -109,11 +109,13 @@ type Delegation = {
   subagent_id?: string
   id?: string
   parent_id?: string
+  owner_session_id?: string
   child_session_id?: string
   goal?: string
   status?: string
   started_at?: number
   updated_at?: number
+  finished_at?: number
   duration_seconds?: number
   model?: string
   current_tool?: string
@@ -125,12 +127,15 @@ type Delegation = {
   output_tail?: Array<{ preview?: string; tool?: string }>
 }
 
-function delegationEvidence(item: Delegation, now: number): FleetEvidence | null {
+function delegationEvidence(item: Delegation, now: number, snapshotFinishedAt?: number): FleetEvidence | null {
   const id = item.subagent_id || item.id
 
   if (!id) {return null}
   const status = normalizeStatus(item.status)
   const startedAt = item.started_at ? item.started_at * 1000 : item.duration_seconds ? now - item.duration_seconds * 1000 : undefined
+  const finishedAt = status === 'finished'
+    ? (snapshotFinishedAt ?? item.finished_at ?? item.updated_at ?? now / 1000) * 1000
+    : undefined
 
   const tail = (item.output_tail ?? []).map(entry => sanitizePresentation(entry.tool)).filter(Boolean)
 
@@ -141,6 +146,7 @@ function delegationEvidence(item: Delegation, now: number): FleetEvidence | null
   }))
 
   const sessionId = item.child_session_id
+  const ownerSessionId = item.owner_session_id?.trim() || undefined
 
   return {
     identityKey: `delegation:${id}`,
@@ -154,8 +160,8 @@ function delegationEvidence(item: Delegation, now: number): FleetEvidence | null
       assignment: 'Delegated work',
       machine: 'Local machine',
       startedAt,
-      updatedAt: item.updated_at ? item.updated_at * 1000 : now,
-      finishedAt: status === 'finished' ? (item.updated_at ? item.updated_at * 1000 : now) : undefined,
+      updatedAt: finishedAt ?? (item.updated_at ? item.updated_at * 1000 : now),
+      finishedAt,
       latestActivity: sanitizePresentation(item.current_tool || tail.at(-1) || (status === 'finished' ? 'Delegated work finished.' : 'Delegated work is running.')),
       log: tail,
       usage: {
@@ -166,13 +172,17 @@ function delegationEvidence(item: Delegation, now: number): FleetEvidence | null
       artifacts,
       capabilities: {
         pause: unsupported('The runtime only exposes a global delegation spawn pause, not per-run pause.'),
-        steer: status === 'active' ? { supported: true } : unsupported('Only a running delegation can be steered.'),
+        steer: status === 'active' && ownerSessionId
+          ? { supported: true }
+          : unsupported(status === 'active'
+            ? 'The exact owning session is not bound by this delegation observation.'
+            : 'Only a running delegation can be steered.'),
         stop: status === 'active' ? { supported: true } : unsupported('Only a running delegation can be stopped.'),
         openResult: sessionId
           ? { supported: true }
           : unsupported('This delegation did not report a child session result.')
       },
-      control: { sessionId, subagentId: id }
+      control: { sessionId, ownerSessionId, subagentId: id }
     }
   }
 }
@@ -181,7 +191,7 @@ type KanbanRun = {
   id?: string
   task_id?: string
   title?: string
-  assignee?: string
+  identity_key?: string
   board?: string
   status?: string
   started_at?: number
@@ -246,14 +256,20 @@ function profileEvidence(item: HermesProfile, now: number): FleetEvidence | null
   }
 }
 
+const KANBAN_WORKER_IDENTITY = /^kanban-worker-[a-f0-9]{16}$/
+const CROSS_SESSION_HISTORY_LIMIT = 20
+const CROSS_SESSION_SUBAGENT_LIMIT = 20
+
 function kanbanEvidence(item: KanbanRun, now: number, projectName?: string): FleetEvidence | null {
-  if (!item.id || !item.task_id || !item.assignee) {return null}
+  const workerIdentity = String(item.identity_key ?? '').toLowerCase()
+
+  if (!item.id || !item.task_id || !KANBAN_WORKER_IDENTITY.test(workerIdentity)) {return null}
   const status = normalizeStatus(item.status, item.ended_at)
   const hasLiveRunTarget = /^\d+$/.test(item.id)
 
   return {
-    identityKey: `profile:${item.assignee}`,
-    name: sanitizePresentation(item.assignee),
+    identityKey: `kanban:${workerIdentity}`,
+    name: 'Kanban builder',
     role: 'Kanban builder',
     brief: 'Builds assigned work from registered Hermes Kanban boards.',
     run: {
@@ -343,7 +359,7 @@ export async function loadFleetEvidence(
       'delegation-history',
       'Delegation history',
       'spawn_tree.list',
-      { cross_session: true, limit: Number.MAX_SAFE_INTEGER }
+      { cross_session: true, limit: CROSS_SESSION_HISTORY_LIMIT }
     ),
     optional<{ projects?: HermesProject[] }>(request, 'projects', 'Profiles and projects', 'projects.list'),
     remoteLoader
@@ -379,7 +395,7 @@ export async function loadFleetEvidence(
     if (item) {evidence.push(item)}
   }
 
-  const history = await Promise.all((historyIndex.data?.entries ?? []).map(async entry => {
+  const history = await Promise.all((historyIndex.data?.entries ?? []).slice(0, CROSS_SESSION_HISTORY_LIMIT).map(async entry => {
     if (!entry.path) {return []}
     const cacheKey = `${profileName}\0${entry.path}\0${entry.finished_at ?? ''}`
     const cached = delegationHistoryCache.get(cacheKey)
@@ -393,12 +409,10 @@ export async function loadFleetEvidence(
         subagents?: Delegation[]
       }
 
-      const loaded = (snapshot.subagents ?? []).map(item => delegationEvidence({
+      const loaded = (snapshot.subagents ?? []).slice(0, CROSS_SESSION_SUBAGENT_LIMIT).map(item => delegationEvidence({
         ...item,
-        parent_id: item.parent_id || snapshot.session_id,
-        status: item.status || 'finished',
-        updated_at: item.updated_at || snapshot.finished_at
-      }, now)).filter((item): item is FleetEvidence => item != null)
+        status: item.status || 'finished'
+      }, now, snapshot.finished_at)).filter((item): item is FleetEvidence => item != null)
 
       delegationHistoryCache.set(cacheKey, loaded)
 
@@ -477,9 +491,12 @@ export async function controlRun(
 
   if (action === 'steer' && run.source === 'delegation') {
     const subagentId = run.control?.subagentId
-    const ownerSessionId = host.state.activeSessionId.get()
+    const ownerSessionId = run.control?.ownerSessionId
+    const activeSessionId = host.state.activeSessionId.get()
 
-    if (!subagentId || !ownerSessionId || !message?.trim()) {throw new Error('A live delegation target and steering message are required.')}
+    if (!subagentId || !ownerSessionId || ownerSessionId !== activeSessionId || !message?.trim()) {
+      throw new Error('The exact owning session is not bound to this live delegation target.')
+    }
 
     const result = await host.request<{ status?: string }>('subagent.steer', {
       session_id: ownerSessionId,

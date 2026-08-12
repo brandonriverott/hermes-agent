@@ -60,7 +60,7 @@ describe('Live Agents desktop contributions', () => {
 
     const rest = vi.fn(async () => ({
       profiles: [],
-      runs: [{ id: 'r1', task_id: 't1', assignee: 'builder', title: 'Ship it', board: 'main', status: 'running' }]
+      runs: [{ id: 'r1', task_id: 't1', identity_key: 'kanban-worker-0123456789abcdef', title: 'Ship it', board: 'main', status: 'running' }]
     }))
 
     plugin.register({
@@ -99,7 +99,7 @@ describe('Live Agents desktop contributions', () => {
 
     const rest = vi.fn(async () => ({
       profiles: [],
-      runs: [{ id: 'r-finished', task_id: 't1', assignee: 'builder', title: 'Retained result', board: 'main', status: 'done', ended_at: 20 }]
+      runs: [{ id: 'r-finished', task_id: 't1', identity_key: 'kanban-worker-0123456789abcdef', title: 'Retained result', board: 'main', status: 'done', ended_at: 20 }]
     }))
 
     const registerMany = vi.fn()
@@ -113,7 +113,7 @@ describe('Live Agents desktop contributions', () => {
     expect((await screen.findAllByText('Retained result')).length).toBeGreaterThan(0)
     await waitFor(() => expect(values.get('profile:default:history')).toBeTruthy())
 
-    fireEvent.click(within(screen.getByRole('article', { name: 'builder, finished' })).getByRole('button', { expanded: true }))
+    fireEvent.click(within(screen.getByRole('article', { name: 'Kanban builder, finished' })).getByRole('button', { expanded: true }))
     expect(screen.queryByRole('region', { name: 'Run Retained result' })).toBeNull()
     first.unmount()
 
@@ -124,9 +124,9 @@ describe('Live Agents desktop contributions', () => {
 
     expect((await screen.findAllByText('Retained result')).length).toBeGreaterThan(0)
     expect(screen.queryByRole('region', { name: 'Run Retained result' })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Dismiss builder' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss Kanban builder' }))
     expect(screen.queryByText('Retained result')).toBeNull()
-    expect(values.get('profile:default:dismissed')).toEqual(['profile:builder'])
+    expect(values.get('profile:default:dismissed')).toEqual(['kanban:kanban-worker-0123456789abcdef'])
   })
 
   it('enables only controls backed by an exact public capability', async () => {
@@ -135,7 +135,7 @@ describe('Live Agents desktop contributions', () => {
 
     const rest = vi.fn(async () => ({
       profiles: [],
-      runs: [{ id: '42', task_id: 't1', assignee: 'builder', title: 'Ship it', board: 'main', status: 'running', started_at: 10 }]
+      runs: [{ id: '42', task_id: 't1', identity_key: 'kanban-worker-0123456789abcdef', title: 'Ship it', board: 'main', status: 'running', started_at: 10 }]
     }))
 
     plugin.register({
@@ -162,7 +162,7 @@ describe('Live Agents desktop contributions', () => {
     const rest = vi.fn(async (path: string) => path === '/snapshot'
       ? {
           profiles: [],
-          runs: [{ id: '42', task_id: 't1', assignee: 'builder', title: 'Ship it', board: 'main', status: 'running', started_at: 10 }]
+          runs: [{ id: '42', task_id: 't1', identity_key: 'kanban-worker-0123456789abcdef', title: 'Ship it', board: 'main', status: 'running', started_at: 10 }]
         }
       : { ok: true })
 
