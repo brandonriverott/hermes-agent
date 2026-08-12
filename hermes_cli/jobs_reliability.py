@@ -189,27 +189,119 @@ def _secure_result_cleanup_marker(path: Path) -> None:
             pass
 
 
-def _unlink_untrusted_result(path: Path) -> bool:
+def _overwrite_result_in_place(path: Path) -> bool:
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+    flags = os.O_WRONLY | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+    except Exception:
+        try:
+            before = path.lstat()
+            if path.is_symlink():
+                return False
+            with path.open("r+b", buffering=0) as stream:
+                observed = os.fstat(stream.fileno())
+                if (observed.st_dev, observed.st_ino) != (
+                    before.st_dev,
+                    before.st_ino,
+                ):
+                    return False
+                os.fchmod(stream.fileno(), 0o600)
+                stream.seek(0)
+                stream.truncate(0)
+                stream.write(_RESULT_CLEANUP_MARKER)
+                os.fsync(stream.fileno())
+            return True
+        except Exception:
+            return False
+    try:
+        os.fchmod(descriptor, 0o600)
+        os.write(descriptor, _RESULT_CLEANUP_MARKER)
+        os.fsync(descriptor)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _quarantine_result_handoff(path: Path) -> bool:
+    handoff = path.parent
+    handoffs_root = handoff.parent
+    lane_root = handoffs_root.parent
+    if handoffs_root.name != "handoffs" or handoff == handoffs_root:
+        return False
+    quarantine = lane_root / ".quarantine"
+    try:
+        quarantine.mkdir(mode=0o700, exist_ok=True)
+        if quarantine.is_symlink():
+            return False
+        quarantine.chmod(0o700)
+        for ordinal in range(100):
+            suffix = "" if ordinal == 0 else f"-{ordinal}"
+            tombstone = quarantine / (f"{handoff.name}.result-cleanup-failed{suffix}")
+            if tombstone.exists():
+                continue
+            os.replace(handoff, tombstone)
+            try:
+                tombstone.chmod(0o700)
+            except Exception:
+                pass
+            return not handoff.exists()
+    except Exception:
+        return False
+    return False
+
+
+def _mark_result_lane_unusable(path: Path) -> bool:
+    lane_root = path.parent.parent.parent
+    health = lane_root / "health"
+    lease = health / "lease.json"
+    temporary = health / ".lease.result-cleanup.tmp"
+    try:
+        if not health.is_dir() or health.is_symlink():
+            return False
+        temporary.write_text(
+            json.dumps(
+                {"state": "FAILED", "reason_code": "RESULT_CLEANUP_FAILED"},
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        os.replace(temporary, lease)
+        lease.chmod(0o600)
+        return True
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
+
+
+def _unlink_untrusted_result(path: Path) -> tuple[bool, bool]:
     try:
         path.unlink(missing_ok=True)
-        return True
+        return True, True
     except Exception:
         try:
             _secure_result_cleanup_marker(path)
         except Exception:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            try:
-                descriptor = os.open(path, flags, 0o600)
-                try:
-                    os.fchmod(descriptor, 0o600)
-                    os.write(descriptor, _RESULT_CLEANUP_MARKER)
-                finally:
-                    os.close(descriptor)
-            except OSError:
-                return False
-        return False
+            if _overwrite_result_in_place(path):
+                return False, True
+            quarantined = _quarantine_result_handoff(path)
+            return False, quarantined or _mark_result_lane_unusable(path)
+        return False, True
 
 
 def _lane_identity(lane_id: object) -> Optional[re.Match[str]]:
@@ -938,6 +1030,7 @@ class LocalProviderPhaseRunner:
         build_stdout = handoff / "build-stdout.json"
         build_stderr = handoff / "build-stderr.log"
         build_cleanup_ok = True
+        build_result_contained = True
         try:
             build = self._process_runner(
                 _provider_command(
@@ -958,7 +1051,13 @@ class LocalProviderPhaseRunner:
             )
         finally:
             if provider == "codex":
-                build_cleanup_ok = _unlink_untrusted_result(build_result_path)
+                build_cleanup_ok, build_result_contained = _unlink_untrusted_result(
+                    build_result_path
+                )
+                if not build_result_contained:
+                    raise jobs_execution.AdapterError(
+                        "untrusted build result cleanup failed"
+                    )
         captured = b"".join(
             _sanitize_phase_file(path)
             for path in (build_stdout, build_stderr)
@@ -1084,6 +1183,7 @@ class LocalProviderPhaseRunner:
         review_stdout = handoff / "review-stdout.json"
         review_stderr = handoff / "review-stderr.log"
         review_cleanup_ok = True
+        review_result_contained = True
         try:
             review_run = self._process_runner(
                 _provider_command(
@@ -1109,7 +1209,13 @@ class LocalProviderPhaseRunner:
             )
         finally:
             if provider == "codex":
-                review_cleanup_ok = _unlink_untrusted_result(review_result_path)
+                review_cleanup_ok, review_result_contained = _unlink_untrusted_result(
+                    review_result_path
+                )
+                if not review_result_contained:
+                    raise jobs_execution.AdapterError(
+                        "untrusted review result cleanup failed"
+                    )
         for path in (review_stdout, review_stderr):
             if path.is_file():
                 _sanitize_phase_file(path)

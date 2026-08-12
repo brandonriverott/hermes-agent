@@ -1116,7 +1116,91 @@ def test_result_unlink_failure_fails_closed_when_provider_otherwise_succeeds(
     assert result_path.stat().st_mode & 0o777 == 0o600
 
 
-def test_result_cleanup_cannot_secure_secret_fails_closed_without_echo(
+@pytest.mark.parametrize(
+    ("provider_returncode", "expected_reason"),
+    [(0, "RESULT_CLEANUP_FAILED"), (1, "PROCESS_CRASHED")],
+)
+def test_total_file_cleanup_failure_quarantines_attempt_for_success_or_failure(
+    tmp_path, monkeypatch, provider_returncode, expected_reason
+):
+    context = _context(tmp_path, "codex")
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/codex"
+    )
+    result_path = (
+        context.lane_root / "handoffs" / context.attempt_id / "build-result.json"
+    )
+    original_unlink = Path.unlink
+
+    def refuse_result_unlink(path, *args, **kwargs):
+        if path == result_path:
+            raise OSError("synthetic unlink refusal")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_result_unlink)
+    monkeypatch.setattr(
+        jobs_reliability,
+        "_secure_result_cleanup_marker",
+        lambda path: (_ for _ in ()).throw(OSError("synthetic replace refusal")),
+    )
+    monkeypatch.setattr(
+        jobs_reliability, "_overwrite_result_in_place", lambda path: False
+    )
+
+    def process_runner(argv, *, stdout_path, stderr_path, **kwargs):
+        target = Path(argv[argv.index("--output-last-message") + 1])
+        payload = (
+            {
+                "structured_output": _valid_build_payload(),
+                "provider_secret": "Authorization: Bearer raw-secret-value",
+            }
+            if provider_returncode == 0
+            else {"provider_secret": "Authorization: Bearer raw-secret-value"}
+        )
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        target.chmod(0o644)
+        stdout_path.touch()
+        stderr_path.touch()
+        return jobs_reliability.ProcessResult(provider_returncode)
+
+    result = jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
+        "codex", context
+    )
+
+    assert result.status == "failed"
+    assert result.failure_reason_code == expected_reason
+    assert "raw-secret-value" not in repr(result)
+    assert not result_path.exists()
+    tombstones = list((context.lane_root / ".quarantine").iterdir())
+    assert len(tombstones) == 1
+    assert tombstones[0].stat().st_mode & 0o777 == 0o700
+    assert not (context.lane_root / "handoffs" / context.attempt_id).exists()
+
+
+def test_result_cleanup_uses_direct_in_place_sanitization_before_quarantine(
+    tmp_path, monkeypatch
+):
+    result_path = tmp_path / "build-result.json"
+    result_path.write_text("Authorization: Bearer raw-secret-value", encoding="utf-8")
+    result_path.chmod(0o644)
+    monkeypatch.setattr(
+        Path, "unlink", lambda *args, **kwargs: (_ for _ in ()).throw(OSError())
+    )
+    monkeypatch.setattr(
+        jobs_reliability,
+        "_secure_result_cleanup_marker",
+        lambda path: (_ for _ in ()).throw(OSError()),
+    )
+
+    cleanup_ok, contained = jobs_reliability._unlink_untrusted_result(result_path)
+
+    assert not cleanup_ok
+    assert contained
+    assert result_path.stat().st_mode & 0o777 == 0o600
+    assert "raw-secret-value" not in result_path.read_text(encoding="utf-8")
+
+
+def test_unquarantinable_raw_result_marks_lane_failed_and_non_reusable(
     tmp_path, monkeypatch
 ):
     context = _context(tmp_path, "codex")
@@ -1139,15 +1223,11 @@ def test_result_cleanup_cannot_secure_secret_fails_closed_without_echo(
         "_secure_result_cleanup_marker",
         lambda path: (_ for _ in ()).throw(OSError("synthetic replace refusal")),
     )
-    original_os_open = jobs_reliability.os.open
     monkeypatch.setattr(
-        jobs_reliability.os,
-        "open",
-        lambda path, *args, **kwargs: (
-            (_ for _ in ()).throw(OSError("synthetic open refusal"))
-            if Path(path) == result_path
-            else original_os_open(path, *args, **kwargs)
-        ),
+        jobs_reliability, "_overwrite_result_in_place", lambda path: False
+    )
+    monkeypatch.setattr(
+        jobs_reliability, "_quarantine_result_handoff", lambda path: False
     )
 
     def process_runner(argv, *, stdout_path, stderr_path, **kwargs):
@@ -1155,7 +1235,7 @@ def test_result_cleanup_cannot_secure_secret_fails_closed_without_echo(
         target.write_text(
             json.dumps({
                 "structured_output": _valid_build_payload(),
-                "provider_secret": "api.key=raw-secret-value",
+                "provider_secret": "Authorization: Bearer raw-secret-value",
             }),
             encoding="utf-8",
         )
@@ -1166,9 +1246,12 @@ def test_result_cleanup_cannot_secure_secret_fails_closed_without_echo(
     result = jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
         "codex", context
     )
+    lease = json.loads(
+        (context.lane_root / "health" / "lease.json").read_text(encoding="utf-8")
+    )
 
-    assert result.status == "failed"
     assert result.failure_reason_code == "RESULT_CLEANUP_FAILED"
+    assert lease == {"state": "FAILED", "reason_code": "RESULT_CLEANUP_FAILED"}
     assert "raw-secret-value" not in repr(result)
 
 
