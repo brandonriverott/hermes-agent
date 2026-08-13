@@ -629,7 +629,7 @@ def _read_token_file(path_str: str) -> str:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise _CliError(f"claim token file is not a regular file: {path}")
-        if st.st_uid != os.getuid():
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():  # windows-footgun: ok
             raise _CliError(
                 f"claim token file is not owned by this user: {path}"
             )

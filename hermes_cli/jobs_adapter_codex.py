@@ -386,10 +386,13 @@ def _launch(
 
 
 def _kill_process(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (OSError, ProcessLookupError):
+    if os.name == "nt":
         proc.kill()
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok
+        except (OSError, ProcessLookupError):
+            proc.kill()
     try:
         proc.wait(timeout=10)
     except subprocess.SubprocessError:
