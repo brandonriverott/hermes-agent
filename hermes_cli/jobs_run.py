@@ -467,6 +467,72 @@ def run_once(
         )
 
 
+def canonical_dispatch_once(
+    *,
+    lane_root: Path,
+    worker_id: str,
+    job: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict:
+    """Run one Job through the graph/review/watcher-owned dispatcher.
+
+    The legacy ``run_once`` adapter is intentionally builder-only.  When the
+    gateway has Jobs dispatch enabled, callers must use this seam so the
+    builder result cannot be mistaken for a completed business workflow.
+    """
+
+    from gateway.jobs_dispatcher import dispatch_due_job_once
+
+    result = dispatch_due_job_once(
+        lane_root=Path(lane_root),
+        now=now,
+        worker_id=worker_id,
+        job_id=job,
+    )
+    if result is None:
+        return _refused("nothing_eligible", recovered=[])
+
+    job_id = result.get("job_id")
+    with jdb.connect_closing() as conn:
+        persisted = jdb.get_job(conn, job_id) if job_id else None
+        attempt = (
+            jdb.get_attempt(conn, result.get("attempt_id"))
+            if result.get("attempt_id")
+            else None
+        )
+    if not result.get("claimed"):
+        return _refused(
+            str(result.get("reason") or "dispatch_refused"),
+            recovered=[],
+            job=persisted,
+        )
+    if persisted is None or attempt is None:
+        return _refused(
+            "dispatch_evidence_missing", recovered=[], job=persisted,
+        )
+    return _public({
+        "ran": True,
+        "reason": result.get("reason"),
+        "recovered": [],
+        "job_id": persisted.id,
+        "job_number": persisted.number,
+        "job_label": persisted.label,
+        "attempt_id": attempt["id"],
+        "ordinal": attempt.get("ordinal"),
+        "status": attempt.get("status"),
+        "failure_class": result.get("failure_class") or attempt.get("failure_class"),
+        "repository": attempt.get("repository"),
+        "base_commit": attempt.get("base_commit"),
+        "commit": result.get("commit") or attempt.get("commit"),
+        "branch": attempt.get("branch"),
+        "worktree": attempt.get("worktree"),
+        "receipt_id": attempt.get("receipt_id"),
+        "job_status": persisted.status,
+        "job_step": persisted.step,
+        "routing_reason": persisted.routing_reason,
+    })
+
+
 def _refused(
     reason: str, *, recovered: list, job=None, error: Optional[str] = None
 ) -> dict:

@@ -946,22 +946,33 @@ def _cmd_release(args: argparse.Namespace) -> int:
 
 def _cmd_run_once(args: argparse.Namespace) -> int:
     try:
-        execution = _read_json_file(args.execution_file, "execution metadata")
-        # shlex, never a shell: the worker command is words, not a script.
-        worker_command = shlex.split(args.worker)
-        if not worker_command:
-            raise _CliError("--worker must name an executable")
-        result = jrun.run_once(
-            worker_command=worker_command,
-            workspace_root=args.workspace_root,
-            worker_id=args.worker_id,
-            execution=execution,
-            specialist=args.specialist,
-            job=args.job,
-            wall_clock_seconds=args.wall_clock_seconds,
-            request_id=args.request_id,
-            now=args.at,
-        )
+        if os.environ.get("HERMES_JOBS_DISPATCH") == "1":
+            lane_root = os.environ.get("HERMES_JOBS_LANE_ROOT", "").strip()
+            if not lane_root or not Path(lane_root).is_absolute():
+                raise _CliError(
+                    "Jobs dispatch is enabled but HERMES_JOBS_LANE_ROOT is invalid"
+                )
+            result = jrun.canonical_dispatch_once(
+                lane_root=Path(lane_root), worker_id=args.worker_id,
+                job=args.job, now=args.at,
+            )
+        else:
+            execution = _read_json_file(args.execution_file, "execution metadata")
+            # shlex, never a shell: the worker command is words, not a script.
+            worker_command = shlex.split(args.worker)
+            if not worker_command:
+                raise _CliError("--worker must name an executable")
+            result = jrun.run_once(
+                worker_command=worker_command,
+                workspace_root=args.workspace_root,
+                worker_id=args.worker_id,
+                execution=execution,
+                specialist=args.specialist,
+                job=args.job,
+                wall_clock_seconds=args.wall_clock_seconds,
+                request_id=args.request_id,
+                now=args.at,
+            )
     except (ValueError, OSError, _CliError) as exc:
         print(f"jobs: {exc}", file=sys.stderr)
         return 2

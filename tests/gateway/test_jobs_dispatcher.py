@@ -140,6 +140,33 @@ def test_canary_job_filter_never_claims_older_working_jobs(tmp_path, monkeypatch
     assert [item["job_id"] for item in seen] == [canary]
 
 
+def test_explicit_job_selector_never_falls_through_to_another_card(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    db_path = tmp_path / "jobs.db"
+    conn = jdb.connect(db_path)
+    goal = (
+        f"REPO_PATH={repo}\nBASE_COMMIT={'d' * 40}\nMODEL=gpt-5.6-sol\n"
+        "MAX_TURNS=120\n\nselected"
+    )
+    first = jdb.create_job(conn, name="first", requested_lane="codex", goal=goal)
+    second = jdb.create_job(conn, name="second", requested_lane="codex", goal=goal)
+    conn.close()
+    seen = []
+
+    jobs_dispatcher.dispatch_due_job_once(
+        jobs_path=db_path,
+        lane_root=tmp_path / "lanes",
+        now=100,
+        job_id=str(second),
+        dispatcher=lambda **kwargs: seen.append(kwargs) or {"job_id": kwargs["job_id"]},
+        health_collector=lambda **kwargs: _health(100),
+    )
+
+    assert first != second
+    assert [item["job_id"] for item in seen] == [second]
+
+
 def test_remote_health_is_policy_bound_and_requires_all_pc_seats(tmp_path):
     registry = jobs_lanes.load_lane_registry()
     lanes = []
