@@ -8,6 +8,7 @@ import base64
 import io
 import inspect
 import unicodedata
+import platform
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -145,6 +146,7 @@ def test_claude_phase_env_inherits_only_automation_oauth_credential(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-worker")
     monkeypatch.setenv("ANTHROPIC_TOKEN", "must-not-reach-worker")
     monkeypatch.setenv("UNRELATED_SECRET", "must-not-reach-worker")
+    monkeypatch.setattr(jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/claude")
 
     env = jobs_reliability._phase_env(
         "claude", tmp_path / "claude-mac-1", tmp_path / "handoff"
@@ -161,6 +163,7 @@ def test_codex_phase_env_does_not_inherit_claude_oauth_credential(
 ):
     """The Claude credential must not cross into a Codex worker lane."""
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-value")
+    monkeypatch.setattr(jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/codex")
 
     env = jobs_reliability._phase_env(
         "codex", tmp_path / "codex-mac-1", tmp_path / "handoff"
@@ -418,7 +421,8 @@ def _repo(tmp_path: Path) -> tuple[Path, str]:
 def _context(tmp_path: Path, provider: str) -> dispatch.DispatchContext:
     repo, base = _repo(tmp_path)
     identity = jobs_identity.resolve_requested_lane(provider)
-    lane_root = tmp_path / f"{provider}-mac-1"
+    host = "mac" if platform.system().lower() == "darwin" else "pc"
+    lane_root = tmp_path / f"{provider}-{host}-1"
     for child in ("auth", "worktrees", "handoffs", "receipts", "health"):
         (lane_root / child).mkdir(parents=True, exist_ok=True)
     return dispatch.DispatchContext(
@@ -434,7 +438,7 @@ def _context(tmp_path: Path, provider: str) -> dispatch.DispatchContext:
         worktree=lane_root / "worktrees" / "j_test-1",
         lane_root=lane_root,
         requested_lane=identity.requested_lane,
-        lane_id=f"{provider}-mac-1",
+        lane_id=f"{provider}-{host}-1",
         executor=identity.executor,
         specialist=identity.specialist,
         model=identity.model,
@@ -939,11 +943,47 @@ def test_local_phase_runner_uses_two_fresh_same_provider_sessions(
     assert not (handoff / "review-result.json").exists()
 
 
+def test_local_phase_runner_passes_heartbeat_to_each_provider_session(
+    tmp_path, monkeypatch
+):
+    context = _context(tmp_path, "claude")
+    seen = []
+    heartbeat = lambda: None
+    context = replace(context, on_heartbeat=heartbeat)
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/claude"
+    )
+
+    def process_runner(argv, *, cwd, stdout_path, stderr_path, on_heartbeat, **kwargs):
+        seen.append(on_heartbeat)
+        if len(seen) == 1:
+            (cwd / "built.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(cwd), "add", "built.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(cwd), "commit", "-qm", "candidate"], check=True
+            )
+            payload = _valid_build_payload()
+        else:
+            payload = _valid_review_payload()
+        stdout_path.write_text(
+            json.dumps({"structured_output": payload}), encoding="utf-8"
+        )
+        stderr_path.touch()
+        return jobs_reliability.ProcessResult(0)
+
+    jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
+        "claude", context
+    )
+
+    assert seen == [heartbeat, heartbeat]
+
+
 def test_local_phase_runner_refuses_remote_physical_lane_before_provider(
     tmp_path, monkeypatch
 ):
     context = _context(tmp_path, "codex")
-    context = replace(context, lane_id="codex-pc-1")
+    remote_host = "pc" if platform.system().lower() == "darwin" else "mac"
+    context = replace(context, lane_id=f"codex-{remote_host}-1")
     calls = []
     with pytest.raises(jobs_execution.AdapterError, match="not local"):
         jobs_reliability.LocalProviderPhaseRunner(
@@ -1696,12 +1736,14 @@ def test_remote_worker_independently_refuses_provider_context_lane_mismatch(
     other = "claude" if provider == "codex" else "codex"
     context = _context(tmp_path, other)
     lane_root = tmp_path / f"{other}-pc-1"
-    lane_root.mkdir()
+    lane_root.mkdir(exist_ok=True)
+    context_values = asdict(context)
+    context_values.pop("on_heartbeat")
     raw = {
         "schema_version": 1,
         "provider": provider,
         "context": {
-            **asdict(context),
+            **context_values,
             "repository": str(context.repository),
             "worktree": str(lane_root / "worktrees" / "j_test-1"),
             "lane_root": str(lane_root),
@@ -2183,6 +2225,7 @@ def test_local_runner_rejects_worktree_outside_lane_before_execution(
 def test_local_runner_rejects_symlinked_lane_category_before_execution(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
     context = _context(tmp_path, "codex")
     worktrees = context.lane_root / "worktrees"
     outside = tmp_path / "outside-worktrees"
@@ -2190,7 +2233,6 @@ def test_local_runner_rejects_symlinked_lane_category_before_execution(
     worktrees.rmdir()
     worktrees.symlink_to(outside, target_is_directory=True)
     calls = []
-    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(
         jobs_reliability, "_git", lambda *args, **kwargs: calls.append(args)
     )
@@ -2201,9 +2243,9 @@ def test_local_runner_rejects_symlinked_lane_category_before_execution(
 
 
 def test_local_runner_rejects_handoff_traversal_before_execution(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
     context = replace(_context(tmp_path, "codex"), attempt_id="../../escape")
     calls = []
-    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(
         jobs_reliability, "_git", lambda *args, **kwargs: calls.append(args)
     )
@@ -2314,15 +2356,22 @@ def _remote_worker_request(tmp_path: Path, *, lane_id: str = "codex-pc-1") -> di
     context_root = tmp_path / "context"
     context_root.mkdir()
     context = _context(context_root, "codex")
+    identity = jobs_identity.resolve_requested_lane("codex")
+    context_values = asdict(context)
+    context_values.pop("on_heartbeat")
     return {
         "schema_version": 1,
         "provider": "codex",
         "context": {
-            **asdict(context),
+            **context_values,
             "repository": str(context.repository),
             "worktree": str(lane_root / "worktrees" / "j_test-1"),
             "lane_root": str(lane_root),
             "lane_id": lane_id,
+            "requested_lane": identity.requested_lane,
+            "executor": identity.executor,
+            "specialist": identity.specialist,
+            "model": identity.model,
         },
     }
 
