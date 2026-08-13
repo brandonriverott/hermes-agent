@@ -146,6 +146,7 @@ def test_claude_phase_env_inherits_only_automation_oauth_credential(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-worker")
     monkeypatch.setenv("ANTHROPIC_TOKEN", "must-not-reach-worker")
     monkeypatch.setenv("UNRELATED_SECRET", "must-not-reach-worker")
+    monkeypatch.setattr(jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/claude")
 
     env = jobs_reliability._phase_env(
         "claude", tmp_path / "claude-mac-1", tmp_path / "handoff"
@@ -162,6 +163,7 @@ def test_codex_phase_env_does_not_inherit_claude_oauth_credential(
 ):
     """The Claude credential must not cross into a Codex worker lane."""
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-value")
+    monkeypatch.setattr(jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/codex")
 
     env = jobs_reliability._phase_env(
         "codex", tmp_path / "codex-mac-1", tmp_path / "handoff"
@@ -980,7 +982,8 @@ def test_local_phase_runner_refuses_remote_physical_lane_before_provider(
     tmp_path, monkeypatch
 ):
     context = _context(tmp_path, "codex")
-    context = replace(context, lane_id="codex-pc-1")
+    remote_host = "pc" if platform.system().lower() == "darwin" else "mac"
+    context = replace(context, lane_id=f"codex-{remote_host}-1")
     calls = []
     with pytest.raises(jobs_execution.AdapterError, match="not local"):
         jobs_reliability.LocalProviderPhaseRunner(
@@ -1733,12 +1736,14 @@ def test_remote_worker_independently_refuses_provider_context_lane_mismatch(
     other = "claude" if provider == "codex" else "codex"
     context = _context(tmp_path, other)
     lane_root = tmp_path / f"{other}-pc-1"
-    lane_root.mkdir()
+    lane_root.mkdir(exist_ok=True)
+    context_values = asdict(context)
+    context_values.pop("on_heartbeat")
     raw = {
         "schema_version": 1,
         "provider": provider,
         "context": {
-            **asdict(context),
+            **context_values,
             "repository": str(context.repository),
             "worktree": str(lane_root / "worktrees" / "j_test-1"),
             "lane_root": str(lane_root),
@@ -2220,6 +2225,7 @@ def test_local_runner_rejects_worktree_outside_lane_before_execution(
 def test_local_runner_rejects_symlinked_lane_category_before_execution(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
     context = _context(tmp_path, "codex")
     worktrees = context.lane_root / "worktrees"
     outside = tmp_path / "outside-worktrees"
@@ -2227,7 +2233,6 @@ def test_local_runner_rejects_symlinked_lane_category_before_execution(
     worktrees.rmdir()
     worktrees.symlink_to(outside, target_is_directory=True)
     calls = []
-    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(
         jobs_reliability, "_git", lambda *args, **kwargs: calls.append(args)
     )
@@ -2238,9 +2243,9 @@ def test_local_runner_rejects_symlinked_lane_category_before_execution(
 
 
 def test_local_runner_rejects_handoff_traversal_before_execution(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
     context = replace(_context(tmp_path, "codex"), attempt_id="../../escape")
     calls = []
-    monkeypatch.setattr(jobs_reliability.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(
         jobs_reliability, "_git", lambda *args, **kwargs: calls.append(args)
     )
