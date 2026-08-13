@@ -27,6 +27,33 @@ from hermes_cli.jobs_contract import JobEnvelope
 TOKEN = "claim-token-must-never-appear-anywhere"
 CLAUDE_SECRET = "sk-claude-secret-1234567890abcdef"
 
+
+def test_kill_uses_process_kill_on_windows(monkeypatch):
+    class Process:
+        pid = 7
+
+        def __init__(self):
+            self.killed = False
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout):
+            assert timeout == 10
+
+    proc = Process()
+    monkeypatch.setattr(codex.os, "name", "nt")
+    monkeypatch.setattr(
+        codex.os,
+        "killpg",
+        lambda *_: pytest.fail("Windows must not call os.killpg"),
+    )
+
+    codex._kill_process(proc)
+
+    assert proc.killed
+
+
 # Real subprocess.Popen preserved for pass-through of non-codex calls (git, etc.)
 _REAL_POPEN = subprocess.Popen
 

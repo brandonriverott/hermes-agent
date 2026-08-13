@@ -26,6 +26,32 @@ from hermes_cli.jobs_contract import JobEnvelope
 TOKEN = "claim-token-must-never-appear-anywhere"
 
 
+def test_kill_uses_process_kill_on_windows(monkeypatch):
+    class Process:
+        pid = 7
+
+        def __init__(self):
+            self.killed = False
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout):
+            assert timeout == 10
+
+    proc = Process()
+    monkeypatch.setattr(adapter.os, "name", "nt")
+    monkeypatch.setattr(
+        adapter.os,
+        "killpg",
+        lambda *_: pytest.fail("Windows must not call os.killpg"),
+    )
+
+    adapter._kill(proc)
+
+    assert proc.killed
+
+
 # ---------------------------------------------------------------------------
 # Real git repository + real injected worker
 # ---------------------------------------------------------------------------

@@ -92,6 +92,15 @@ def _claim(home, job, token_path=None, lease=600):
     return token_path
 
 
+def test_token_reader_skips_unavailable_posix_owner_check(tmp_path, monkeypatch):
+    token = tmp_path / "claim-token"
+    token.write_text("secret\n")
+    token.chmod(0o600)
+    monkeypatch.delattr(jobs_cli.os, "getuid")
+
+    assert jobs_cli._read_token_file(str(token)) == "secret"
+
+
 def _start(home, job, token_path):
     rc, out, _ = _run(
         ["attempt-start", str(job.number), "--claim-token-file", str(token_path),
