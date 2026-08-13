@@ -392,14 +392,21 @@ def evaluate(
         review_verdict = review_doc.get("verdict")
         found = review_doc.get("findings")
         findings = len(found) if isinstance(found, list) else 0
-        if review_verdict not in ("PASS", "NEEDS_CHANGES"):
+        if review_verdict not in ("PASS", "NEEDS_CHANGES", "UNABLE_TO_VERIFY"):
             sections["independent_review"] = f"BLOCKED — verdict {review_verdict!r} is not a verdict"
             result = park("REVIEW_ERROR", ["The independent reviewer did not return a usable verdict."])
             result.findings = findings
             return result
         sections["independent_review"] = f"{review_verdict} on attempt {attempt}, {findings} finding(s)"
         if review_verdict != "PASS":
-            result = park("NEEDS_CHANGES", [f"The independent review returned {findings} unresolved finding(s)."])
+            result = park(
+                review_verdict,
+                [
+                    "The independent reviewer could not verify the required evidence."
+                    if review_verdict == "UNABLE_TO_VERIFY"
+                    else f"The independent review returned {findings} unresolved finding(s)."
+                ],
+            )
             result.findings = findings
             return result
     else:

@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from hermes_cli import jobs_assurance
 from hermes_cli import jobs_identity as ji
 
 
@@ -40,7 +41,9 @@ _ORIGIN_FIELDS = (
     "profile",
 )
 _REQUIRED_ORIGIN_FIELDS = frozenset({"platform", "chat_id", "session_id"})
-_CREATE_FIELDS = frozenset({"name", "goal", "repo_path", "lane", "max_turns"})
+_CREATE_FIELDS = frozenset(
+    {"name", "goal", "repo_path", "lane", "max_turns", "assurance"}
+)
 _API_SESSION_SOURCES = frozenset({"desktop", "tui", "api_server"})
 
 
@@ -93,7 +96,9 @@ def _required_text(
     return value
 
 
-def _validate_create_args(args: object) -> tuple[str, str, Path, ji.JobIdentity, int]:
+def _validate_create_args(
+    args: object,
+) -> tuple[str, str, Path, ji.JobIdentity, int, dict[str, object]]:
     if not isinstance(args, Mapping):
         raise _InputRefusal("request")
     if any(key not in _CREATE_FIELDS for key in args):
@@ -138,7 +143,13 @@ def _validate_create_args(args: object) -> tuple[str, str, Path, ji.JobIdentity,
         raise _InputRefusal("repo_path") from exc
     if not is_directory or not has_git_marker:
         raise _InputRefusal("repo_path")
-    return name.strip(), goal, resolved, identity, max_turns
+    try:
+        assurance = jobs_assurance.AssuranceContract.from_mapping(
+            args.get("assurance")
+        )
+    except jobs_assurance.InvalidAssuranceContract as exc:
+        raise _InputRefusal("assurance") from exc
+    return name.strip(), goal, resolved, identity, max_turns, assurance.to_mapping()
 
 
 def resolve_repo_head(
@@ -306,7 +317,7 @@ def _execution_goal(
 def jobs_create_handler(args: object, **_request_context: Any) -> str:
     """Validate and atomically create a canonical, exactly-originated Job."""
     try:
-        name, body, repo, identity, max_turns = _validate_create_args(args)
+        name, body, repo, identity, max_turns, assurance = _validate_create_args(args)
     except _InputRefusal as exc:
         code = "invalid_repo" if exc.field == "repo_path" else "invalid_input"
         message = (
@@ -362,6 +373,7 @@ def jobs_create_handler(args: object, **_request_context: Any) -> str:
                 goal=goal,
                 requested_lane=identity.requested_lane,
                 origin=origin,
+                assurance_contract=assurance,
             )
             job = jdb.get_job(conn, job_id)
             if job is None:  # defensive: never return an unverified write
@@ -460,8 +472,28 @@ JOBS_CREATE_SCHEMA = {
                 "default": DEFAULT_MAX_TURNS,
                 "description": "Maximum builder turns (defaults to 120).",
             },
+            "assurance": {
+                "type": "object",
+                "additionalProperties": False,
+                "description": "Definition-of-done, critical journey, risk, and stop contract.",
+                "properties": {
+                    "critical_user_journey": {"type": "string", "minLength": 1, "maxLength": 4096},
+                    "success_metric": {"type": "string", "minLength": 1, "maxLength": 4096},
+                    "outcome_mode": {"type": "string", "enum": ["runtime", "visual", "integration", "not_applicable"]},
+                    "verification_steps": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 4096}},
+                    "max_attempts": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "wall_clock_budget_seconds": {"type": "integer", "minimum": 1, "maximum": 604800},
+                    "risk_domains": {"type": "array", "minItems": 1, "maxItems": 4, "items": {"type": "string", "enum": ["money", "permissions", "state", "none"]}},
+                    "consumers": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 4096}},
+                    "egress_paths": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 4096}},
+                    "rollback_behavior": {"type": "string", "minLength": 1, "maxLength": 4096},
+                    "knowledge_closure_required": {"type": "boolean"},
+                    "not_applicable_reason": {"type": ["string", "null"], "maxLength": 4096}
+                },
+                "required": ["critical_user_journey", "success_metric", "outcome_mode", "verification_steps", "max_attempts", "wall_clock_budget_seconds", "risk_domains", "consumers", "egress_paths", "rollback_behavior", "knowledge_closure_required"]
+            },
         },
-        "required": ["name", "goal", "repo_path", "lane"],
+        "required": ["name", "goal", "repo_path", "lane", "assurance"],
     },
 }
 

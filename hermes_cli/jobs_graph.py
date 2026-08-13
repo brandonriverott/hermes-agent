@@ -30,14 +30,18 @@ LEGAL = {
     None: frozenset({"QUEUED"}),
     "QUEUED": frozenset({"ASSIGNED", "FAILED", "BLOCKED", "CANCELLED"}),
     "ASSIGNED": frozenset({"BUILDING", "FAILED", "BLOCKED", "CANCELLED"}),
-    "BUILDING": frozenset(
-        {"EVIDENCE_COLLECTING", "FAILED", "BLOCKED", "CANCELLED"}
-    ),
-    "EVIDENCE_COLLECTING": frozenset(
-        {"REVIEWING", "FAILED", "BLOCKED", "CANCELLED"}
-    ),
+    "BUILDING": frozenset({"EVIDENCE_COLLECTING", "FAILED", "BLOCKED", "CANCELLED"}),
+    "EVIDENCE_COLLECTING": frozenset({"REVIEWING", "FAILED", "BLOCKED", "CANCELLED"}),
     "REVIEWING": frozenset({"VERIFIED", "FAILED", "BLOCKED", "CANCELLED"}),
-    "VERIFIED": frozenset({"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}),
+    "VERIFIED": frozenset(
+        {"OUTCOME_VERIFYING", "FAILED", "BLOCKED", "CANCELLED"}
+    ),
+    "OUTCOME_VERIFYING": frozenset(
+        {"OUTCOME_VERIFIED", "FAILED", "BLOCKED", "CANCELLED"}
+    ),
+    "OUTCOME_VERIFIED": frozenset(
+        {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}
+    ),
     "COMPLETED": frozenset(),
     "FAILED": frozenset(),
     "BLOCKED": frozenset(),
@@ -48,15 +52,17 @@ REQUIRED_EVIDENCE = {
     (None, "QUEUED"): frozenset({"attempt_created"}),
     ("QUEUED", "ASSIGNED"): frozenset({"preflight", "route", "lane_health"}),
     ("ASSIGNED", "BUILDING"): frozenset({"claim", "worktree", "attempt_started"}),
-    ("BUILDING", "EVIDENCE_COLLECTING"): frozenset(
-        {"executor_exit", "output_capture"}
-    ),
+    ("BUILDING", "EVIDENCE_COLLECTING"): frozenset({"executor_exit", "output_capture"}),
     ("EVIDENCE_COLLECTING", "REVIEWING"): frozenset({"tests", "readback"}),
     ("REVIEWING", "VERIFIED"): frozenset(
         {"themis_review", "receipt_verification"}
     ),
-    ("VERIFIED", "COMPLETED"): frozenset(
-        {"activation_gate", "completion_receipt"}
+    ("VERIFIED", "OUTCOME_VERIFYING"): frozenset({"outcome_contract"}),
+    ("OUTCOME_VERIFYING", "OUTCOME_VERIFIED"): frozenset(
+        {"critical_journey_result"}
+    ),
+    ("OUTCOME_VERIFIED", "COMPLETED"): frozenset(
+        {"activation_gate", "completion_receipt", "knowledge_closure"}
     ),
 }
 
@@ -94,6 +100,7 @@ class TransitionRequest:
     component_version: str
     idempotency_key: str
     created_at: int
+    handoff: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +121,7 @@ class TransitionRecord:
     component_version: str
     idempotency_key: str
     created_at: int
+    handoff: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -135,7 +143,11 @@ class ReceiptVerifier:
         )
 
 
-def _write(request: TransitionRequest) -> jobs_db.TransitionWrite:
+def _write(
+    request: TransitionRequest,
+    *,
+    handoff: Mapping[str, object] | None,
+) -> jobs_db.TransitionWrite:
     return jobs_db.TransitionWrite(
         job_id=request.job_id,
         attempt_id=request.attempt_id,
@@ -153,6 +165,7 @@ def _write(request: TransitionRequest) -> jobs_db.TransitionWrite:
         idempotency_key=request.idempotency_key,
         created_at=request.created_at,
         commit=request.commit,
+        handoff=handoff,
     )
 
 
@@ -174,6 +187,7 @@ def _record(row: Mapping[str, object]) -> TransitionRecord:
         component_version=str(row["component_version"]),
         idempotency_key=str(row["idempotency_key"]),
         created_at=int(row["created_at"]),
+        handoff=(None if row["handoff"] is None else dict(row["handoff"])),
     )
 
 
@@ -183,9 +197,7 @@ def _load_record(conn, transition_id: int) -> TransitionRecord:
     ).fetchone()
     if row is None:
         raise jobs_db.GraphConflict("accepted transition row disappeared")
-    parsed = dict(row)
-    parsed["evidence"] = jobs_receipts.loads_canonical(parsed.pop("evidence_json"))
-    return _record(parsed)
+    return _record(jobs_db._transition_to_dict(row))
 
 
 def _validate_evidence(request: TransitionRequest) -> None:
@@ -197,7 +209,9 @@ def _validate_evidence(request: TransitionRequest) -> None:
         and _DIGEST.fullmatch(digest)
         for name, digest in evidence.items()
     ):
-        raise MissingTransitionEvidence("transition evidence must be named sha256 digests")
+        raise MissingTransitionEvidence(
+            "transition evidence must be named sha256 digests"
+        )
     required = REQUIRED_EVIDENCE.get(
         (request.source_state, request.target_state), frozenset()
     )
@@ -211,7 +225,10 @@ def _validate_evidence(request: TransitionRequest) -> None:
             raise MissingTransitionEvidence("terminal transition requires evidence")
         if request.target_state == "FAILED" and not request.failure_class:
             raise MissingTransitionEvidence("FAILED requires a failure class")
-        if request.target_state in {"BLOCKED", "CANCELLED"} and not request.blocker_code:
+        if (
+            request.target_state in {"BLOCKED", "CANCELLED"}
+            and not request.blocker_code
+        ):
             raise MissingTransitionEvidence(
                 f"{request.target_state} requires a blocker or cancellation reason"
             )
@@ -221,7 +238,9 @@ def _verify_envelope(
     request: TransitionRequest,
     envelope: Mapping[str, object],
     verifier: ReceiptVerifier,
+    handoff: Mapping[str, object] | None,
 ) -> None:
+    jobs_db.require_transition_handoff_identity(envelope, handoff)
     verifier.verify(
         envelope,
         expected={
@@ -274,8 +293,14 @@ def transition_attempt(
         (request.attempt_id, request.idempotency_key),
     ).fetchone()
     if existing is not None:
-        transition_id = jobs_db.record_transition(conn, _write(request), envelope)
-        _verify_envelope(request, envelope, verifier)
+        _validate_evidence(request)
+        handoff = jobs_db.canonical_transition_handoff(
+            _write(request, handoff=request.handoff)
+        )
+        _verify_envelope(request, envelope, verifier, handoff)
+        transition_id = jobs_db.record_transition(
+            conn, _write(request, handoff=handoff), envelope
+        )
         return _load_record(conn, transition_id)
 
     if job.revision != request.expected_job_revision:
@@ -296,8 +321,13 @@ def transition_attempt(
     if attempt["status"] != "running":
         raise jobs_db.GraphConflict("new graph edge requires a running attempt")
     _validate_evidence(request)
-    _verify_envelope(request, envelope, verifier)
-    transition_id = jobs_db.record_transition(conn, _write(request), envelope)
+    handoff = jobs_db.canonical_transition_handoff(
+        _write(request, handoff=request.handoff)
+    )
+    _verify_envelope(request, envelope, verifier, handoff)
+    transition_id = jobs_db.record_transition(
+        conn, _write(request, handoff=handoff), envelope
+    )
     return _load_record(conn, transition_id)
 
 
@@ -307,6 +337,7 @@ def _projection_transition(row: Mapping[str, object]) -> dict[str, object]:
         "source_state": row["source_state"],
         "target_state": row["target_state"],
         "evidence": dict(row["evidence"]),
+        "handoff": (None if row["handoff"] is None else dict(row["handoff"])),
         "failure_class": row["failure_class"],
         "blocker_code": row["blocker_code"],
         "receipt_id": row["receipt_id"],
@@ -328,57 +359,47 @@ def compute_work_control(conn, *, now: int) -> dict[str, object]:
             attempt_transitions = [
                 row for row in transitions if row["attempt_id"] == attempt["id"]
             ]
-            placement = jobs_db.latest_lane_placement_for_attempt(
-                conn, attempt["id"]
-            )
-            projected_attempts.append(
-                {
-                    "attempt_id": attempt["id"],
-                    "ordinal": attempt["ordinal"],
-                    "status": attempt["status"],
-                    "state": (
-                        attempt_transitions[-1]["target_state"]
-                        if attempt_transitions
-                        else "QUEUED"
-                    ),
-                    "transitions": [
-                        _projection_transition(row) for row in attempt_transitions
-                    ],
-                    "placement": (
-                        None
-                        if placement is None
-                        else {
-                            "placement_id": placement["id"],
-                            "lane_id": placement["lane_id"],
-                            "executor": placement["executor"],
-                            "model": placement["model"],
-                            "state": placement["state"],
-                            "reason_code": placement["state_reason_code"],
-                            "policy_version": placement["policy_version"],
-                            "policy_digest": placement["policy_digest"],
-                            "fallback_applied": bool(
-                                placement["fallback_applied"]
-                            ),
-                            "cleanup_evidence_digest": placement[
-                                "cleanup_evidence_digest"
-                            ],
-                        }
-                    ),
-                }
-            )
+            placement = jobs_db.latest_lane_placement_for_attempt(conn, attempt["id"])
+            projected_attempts.append({
+                "attempt_id": attempt["id"],
+                "ordinal": attempt["ordinal"],
+                "status": attempt["status"],
+                "state": (
+                    attempt_transitions[-1]["target_state"]
+                    if attempt_transitions
+                    else "QUEUED"
+                ),
+                "transitions": [
+                    _projection_transition(row) for row in attempt_transitions
+                ],
+                "placement": (
+                    None
+                    if placement is None
+                    else {
+                        "placement_id": placement["id"],
+                        "lane_id": placement["lane_id"],
+                        "executor": placement["executor"],
+                        "model": placement["model"],
+                        "state": placement["state"],
+                        "reason_code": placement["state_reason_code"],
+                        "policy_version": placement["policy_version"],
+                        "policy_digest": placement["policy_digest"],
+                        "fallback_applied": bool(placement["fallback_applied"]),
+                        "cleanup_evidence_digest": placement["cleanup_evidence_digest"],
+                    }
+                ),
+            })
         state = projected_attempts[-1]["state"] if projected_attempts else "QUEUED"
-        projected_jobs.append(
-            {
-                "job_id": job.id,
-                "number": job.number,
-                "name": job.name,
-                "status": job.status,
-                "step": job.step,
-                "revision": job.revision,
-                "state": state,
-                "attempts": projected_attempts,
-            }
-        )
+        projected_jobs.append({
+            "job_id": job.id,
+            "number": job.number,
+            "name": job.name,
+            "status": job.status,
+            "step": job.step,
+            "revision": job.revision,
+            "state": state,
+            "attempts": projected_attempts,
+        })
     return {"schema_version": 1, "generated_at": int(now), "jobs": projected_jobs}
 
 

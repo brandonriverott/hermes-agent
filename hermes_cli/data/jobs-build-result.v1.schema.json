@@ -3,7 +3,7 @@
   "title": "Jobs builder and test result (v1)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["outcome", "failure_class", "reason", "tests"],
+  "required": ["outcome", "failure_class", "reason", "tests", "critical_user_journey", "handoff"],
   "properties": {
     "outcome": {"type": "string", "enum": ["succeeded", "failed"]},
     "failure_class": {
@@ -30,6 +30,45 @@
           "note": {"type": ["string", "null"], "maxLength": 1024}
         }
       }
+    },
+    "critical_user_journey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "result", "evidence"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "result": {"type": "string", "enum": ["pass", "fail", "not_applicable"]},
+        "evidence": {"type": "string", "minLength": 1, "maxLength": 1024}
+      }
+    },
+    "handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "next_action"],
+      "properties": {
+        "summary": {"type": "string", "minLength": 1, "maxLength": 700},
+        "next_action": {"type": "string", "minLength": 1, "maxLength": 500}
+      }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"const": "succeeded"}}},
+      "then": {
+        "properties": {
+          "failure_class": {"const": null},
+          "reason": {"const": null}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"outcome": {"const": "failed"}}},
+      "then": {
+        "properties": {
+          "failure_class": {"type": "string", "enum": ["implementation", "infrastructure", "timeout", "safety", "cancelled"]},
+          "reason": {"type": "string", "minLength": 1, "maxLength": 512}
+        }
+      }
+    }
+  ]
 }

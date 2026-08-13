@@ -8,6 +8,22 @@ from hermes_cli import jobs_harness as harness
 from hermes_cli import jobs_receipts as receipts
 
 
+def _assurance_contract():
+    return {
+        "critical_user_journey": "operator sees the completed job outcome",
+        "success_metric": "critical journey passes independently",
+        "outcome_mode": "integration",
+        "verification_steps": ["exercise critical journey"],
+        "max_attempts": 3,
+        "wall_clock_budget_seconds": 3600,
+        "risk_domains": ["none"],
+        "consumers": [],
+        "egress_paths": [],
+        "rollback_behavior": "not applicable",
+        "knowledge_closure_required": False,
+    }
+
+
 @pytest.fixture
 def conn(tmp_path):
     connection = jdb.connect(tmp_path / "jobs.db")
@@ -39,6 +55,7 @@ def passing_snapshot(conn, tmp_path):
         model="claude-opus-5",
         observed_at="2026-08-09T00:00:00Z",
         expected_job_revision=jdb.get_job(conn, job_id).revision,
+        assurance_contract=_assurance_contract(),
     )
 
 
@@ -57,7 +74,9 @@ def signer():
     )
 
 
-@pytest.mark.parametrize("failed_name", harness.CHECK_NAMES)
+@pytest.mark.parametrize(
+    "failed_name", [name for name in harness.CHECK_NAMES if name != "outcome_contract"]
+)
 def test_any_failed_check_blocks_without_claim(
     conn, passing_snapshot, probes, signer, failed_name
 ):
@@ -132,7 +151,8 @@ def test_every_probe_runs_once_in_fixed_order_when_one_raises(passing_snapshot):
 
     decision = harness.evaluate_preflight(passing_snapshot, probes)
 
-    assert calls == list(harness.CHECK_NAMES)
+    # The assurance check is a sealed built-in guard; callers cannot replace it.
+    assert calls == [name for name in harness.CHECK_NAMES if name != "outcome_contract"]
     failed = next(check for check in decision.checks if check.name == "permissions")
     assert (failed.status, failed.code, failed.safe_detail) == (
         "BLOCKED",

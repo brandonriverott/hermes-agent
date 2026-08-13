@@ -9,11 +9,13 @@ same Job.
 """
 
 import sqlite3
+from dataclasses import replace
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from hermes_cli import jobs_db as jdb
+from hermes_cli import jobs_handoffs as handoffs
 from hermes_cli import jobs_notifications as jn
 from hermes_cli import jobs_receipts as receipts
 
@@ -32,14 +34,24 @@ def signing_key():
     return Ed25519PrivateKey.generate()
 
 
-def _signed(signing_key, *, receipt_id, job_id, attempt_id, state):
+def _signed(
+    signing_key,
+    *,
+    receipt_id,
+    job_id,
+    attempt_id,
+    state,
+    evidence,
+    handoff,
+):
     return receipts.sign_receipt(
         {
             "job_id": job_id,
             "attempt_id": attempt_id,
             "commit": "c" * 40,
             "state": state,
-            "evidence": {},
+            "evidence": dict(evidence),
+            "handoff": handoff,
             "timestamp": "2026-08-09T00:00:00Z",
             "transitioned_by": "jobs_graph/1",
         },
@@ -125,14 +137,106 @@ def _transition(
         idempotency_key=key,
         created_at=created_at,
     )
+    outcomes = {
+        "QUEUED": "started",
+        "ASSIGNED": "handed_off",
+        "BUILDING": "started",
+        "EVIDENCE_COLLECTING": "handed_off",
+        "REVIEWING": "handed_off",
+        "VERIFIED": "passed",
+        "OUTCOME_VERIFYING": "handed_off",
+        "OUTCOME_VERIFIED": "passed",
+        "COMPLETED": "completed",
+        "FAILED": "rejected",
+        "BLOCKED": "blocked",
+    }
+    outcome = outcomes[target]
+    digest = next(iter(write.evidence.values()))
+    transition_handoff = handoffs.normalize_handoff(
+        {
+            "summary": f"Transitioned to {target}.",
+            "evidence_summary": [
+                {
+                    "label": "Transition evidence",
+                    "result": "Recorded.",
+                    "digest": digest,
+                }
+            ],
+            "next_action": "Continue the bounded Job workflow.",
+            "issues": (
+                [
+                    {
+                        "requirement": "The transition must succeed.",
+                        "finding": "The attempt failed.",
+                        "required_fix": "Correct the failure before retrying.",
+                    }
+                ]
+                if outcome == "rejected"
+                else []
+            ),
+            "decision_request": (
+                {
+                    "question": "How should this Job continue?",
+                    "options": [
+                        {
+                            "id": "retry",
+                            "label": "Retry",
+                            "consequence": "Retry after the blocker is cleared.",
+                        },
+                        {
+                            "id": "stop",
+                            "label": "Stop",
+                            "consequence": "Leave the Job blocked.",
+                        },
+                    ],
+                    "recommendation": "retry",
+                    "recommendation_reason": "The bounded retry is safe.",
+                    "blocked_scope": "Only this Job is blocked.",
+                    "safe_state": "No additional mutation occurred.",
+                    "next_owner_role": "builder",
+                }
+                if outcome == "blocked"
+                else None
+            ),
+        },
+        job_id=job_id,
+        attempt_id=attempt_id,
+        speaker_id="test",
+        speaker_role="system",
+        speaker_executor="hermes",
+        from_phase="ATTEMPT_CREATED" if source is None else source,
+        to_phase=target,
+        next_owner_role=None if outcome == "completed" else "next-worker",
+        outcome=outcome,
+        artifact_identity=None,
+        transition_evidence=dict(write.evidence),
+        created_at=created_at,
+    )
+    write = replace(write, handoff=transition_handoff)
     envelope = _signed(
         signing_key,
         receipt_id=write.receipt_id,
         job_id=job_id,
         attempt_id=attempt_id,
         state=target,
+        evidence=write.evidence,
+        handoff=write.handoff,
     )
     return write, envelope
+
+
+def _record_queued(conn, signing_key, job_id, attempt_id, *, created_at):
+    write, envelope = _transition(
+        conn,
+        signing_key,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        source=None,
+        target="QUEUED",
+        key=f"t:queued:{attempt_id}",
+        created_at=created_at,
+    )
+    jdb.record_transition(conn, write, envelope)
 
 
 def test_create_job_with_exact_origin_atomically_queues_one_notification(
@@ -181,8 +285,11 @@ def test_each_defined_phase_transition_creates_one_ordered_intent(conn, signing_
         ("BUILDING", "EVIDENCE_COLLECTING", "t:testing", 13, None, None),
         ("EVIDENCE_COLLECTING", "REVIEWING", "t:review", 14, None, None),
         ("REVIEWING", "VERIFIED", "t:verified", 15, None, None),
-        ("VERIFIED", "COMPLETED", "t:finished", 16, None, None),
+        ("VERIFIED", "OUTCOME_VERIFYING", "t:outcome", 16, None, None),
+        ("OUTCOME_VERIFYING", "OUTCOME_VERIFIED", "t:proved", 17, None, None),
+        ("OUTCOME_VERIFIED", "COMPLETED", "t:finished", 18, None, None),
     ]
+    visible_handoffs = []
     for source, target, key, at, failure_class, blocker_code in steps:
         write, envelope = _transition(
             conn,
@@ -195,18 +302,21 @@ def test_each_defined_phase_transition_creates_one_ordered_intent(conn, signing_
             created_at=at,
         )
         jdb.record_transition(conn, write, envelope)
+        if jn.milestone_for_state(target) is not None:
+            visible_handoffs.append(write.handoff)
 
     rows = jn.list_notifications(conn, job_id=job_id)
-    # ``queued`` from creation, then one ordered intent per user milestone;
-    # VERIFIED is durable but intentionally has no chat milestone.
+    # ``queued`` from creation, then one ordered intent per user milestone.
+    # BUILDING is a signed internal edge, not a second visible update.
     assert [r.milestone for r in rows] == [
         "queued",
         "assigned",
-        "building",
         "testing",
         "review",
+        "review-approved",
         "finished",
     ]
+    assert [row.payload["handoff"] for row in rows[1:]] == visible_handoffs
     assert [r.id for r in rows] == sorted(r.id for r in rows)
     assert all(r.delivered_at is None for r in rows)
 
@@ -214,13 +324,14 @@ def test_each_defined_phase_transition_creates_one_ordered_intent(conn, signing_
 def test_blocked_and_terminal_failure_milestones(conn, signing_key):
     job_id = _queued_job(conn)
     attempt_id = _attempt(conn, job_id)
+    _record_queued(conn, signing_key, job_id, attempt_id, created_at=9)
 
     write, envelope = _transition(
         conn,
         signing_key,
         job_id=job_id,
         attempt_id=attempt_id,
-        source=None,
+        source="QUEUED",
         target="BLOCKED",
         key="t:blocked",
         created_at=10,
@@ -232,8 +343,11 @@ def test_blocked_and_terminal_failure_milestones(conn, signing_key):
         "needs-you",
     ]
 
-    failed_job = _queued_job(conn, origin=_origin(chat_id="chat-2", session_id="session-2"))
+    failed_job = _queued_job(
+        conn, origin=_origin(chat_id="chat-2", session_id="session-2")
+    )
     terminal_attempt = _attempt(conn, failed_job)
+    _record_queued(conn, signing_key, failed_job, terminal_attempt, created_at=19)
     conn.execute(
         "UPDATE job_attempts SET terminal_failure = 1 WHERE id = ?",
         (terminal_attempt,),
@@ -244,7 +358,7 @@ def test_blocked_and_terminal_failure_milestones(conn, signing_key):
         signing_key,
         job_id=failed_job,
         attempt_id=terminal_attempt,
-        source=None,
+        source="QUEUED",
         target="FAILED",
         key="t:terminal-failure",
         created_at=20,
@@ -260,13 +374,14 @@ def test_blocked_and_terminal_failure_milestones(conn, signing_key):
 def test_nonterminal_failure_creates_correcting_milestone(conn, signing_key):
     job_id = _queued_job(conn)
     attempt_id = _attempt(conn, job_id)
+    _record_queued(conn, signing_key, job_id, attempt_id, created_at=9)
 
     write, envelope = _transition(
         conn,
         signing_key,
         job_id=job_id,
         attempt_id=attempt_id,
-        source=None,
+        source="QUEUED",
         target="FAILED",
         key="t:correcting",
         created_at=10,
@@ -282,12 +397,13 @@ def test_nonterminal_failure_creates_correcting_milestone(conn, signing_key):
 def test_duplicate_transition_key_does_not_duplicate_messages(conn, signing_key):
     job_id = _queued_job(conn)
     attempt_id = _attempt(conn, job_id)
+    _record_queued(conn, signing_key, job_id, attempt_id, created_at=9)
     write, envelope = _transition(
         conn,
         signing_key,
         job_id=job_id,
         attempt_id=attempt_id,
-        source=None,
+        source="QUEUED",
         target="ASSIGNED",
         key="t:same",
         created_at=10,
@@ -300,6 +416,12 @@ def test_duplicate_transition_key_does_not_duplicate_messages(conn, signing_key)
     rows = jn.list_notifications(conn, job_id=job_id)
     assert [r.milestone for r in rows] == ["queued", "assigned"]
     assert len(rows) == 2
+    assert rows[-1].payload["handoff"] == write.handoff
+
+
+def test_building_is_internal_and_verified_is_review_approved():
+    assert jn.milestone_for_state("BUILDING") is None
+    assert jn.milestone_for_state("VERIFIED") == "review-approved"
 
 
 def test_outbox_insert_failure_rolls_back_job_creation(conn):
@@ -317,13 +439,18 @@ def test_outbox_insert_failure_rolls_back_job_creation(conn):
 def test_outbox_insert_failure_rolls_back_transition_write(conn, signing_key):
     job_id = _queued_job(conn)
     attempt_id = _attempt(conn, job_id)
+    _record_queued(conn, signing_key, job_id, attempt_id, created_at=9)
     revision_before = jdb.get_job(conn, job_id).revision
+    transition_count = conn.execute(
+        "SELECT COUNT(*) FROM job_attempt_transitions"
+    ).fetchone()[0]
+    receipt_count = conn.execute("SELECT COUNT(*) FROM job_receipts").fetchone()[0]
     write, envelope = _transition(
         conn,
         signing_key,
         job_id=job_id,
         attempt_id=attempt_id,
-        source=None,
+        source="QUEUED",
         target="ASSIGNED",
         key="t:rollback",
         created_at=10,
@@ -335,21 +462,123 @@ def test_outbox_insert_failure_rolls_back_transition_write(conn, signing_key):
     with pytest.raises(sqlite3.OperationalError):
         jdb.record_transition(conn, write, envelope)
 
-    assert conn.execute(
-        "SELECT COUNT(*) FROM job_attempt_transitions"
-    ).fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM job_receipts").fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM job_attempt_transitions").fetchone()[0]
+        == transition_count
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM job_receipts").fetchone()[0] == receipt_count
+    )
     assert jdb.get_job(conn, job_id).revision == revision_before
 
 
-def test_pending_rows_claim_retry_acknowledge_in_order_per_job(conn, tmp_path, signing_key):
+def test_conflicting_outbox_intent_rolls_back_transition_and_handoff(conn, signing_key):
+    job_id = _queued_job(conn)
+    attempt_id = _attempt(conn, job_id)
+    _record_queued(conn, signing_key, job_id, attempt_id, created_at=9)
+    revision_before = jdb.get_job(conn, job_id).revision
+    transition_count = conn.execute(
+        "SELECT COUNT(*) FROM job_attempt_transitions"
+    ).fetchone()[0]
+    write, envelope = _transition(
+        conn,
+        signing_key,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        source="QUEUED",
+        target="ASSIGNED",
+        key="t:conflicting-outbox",
+        created_at=10,
+    )
+    jn.enqueue_locked(
+        conn,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        job_revision=write.expected_job_revision + 1,
+        milestone=jn.MILESTONE_ASSIGNED,
+        transition_id=None,
+        payload={"handoff": {"summary": "different"}},
+        now=10,
+    )
+    conn.commit()
+
+    with pytest.raises(jdb.GraphConflict, match="notification intent"):
+        jdb.record_transition(conn, write, envelope)
+
+    assert (
+        conn.execute("SELECT COUNT(*) FROM job_attempt_transitions").fetchone()[0]
+        == transition_count
+    )
+    assert jdb.get_job(conn, job_id).revision == revision_before
+    assert jdb.latest_handoff(conn, attempt_id)["to_phase"] == "QUEUED"
+
+
+def test_outbox_handoff_bool_cannot_match_transition_integer(conn, signing_key):
+    job_id = _queued_job(conn)
+    attempt_id = _attempt(conn, job_id)
+    _record_queued(conn, signing_key, job_id, attempt_id, created_at=9)
+    revision_before = jdb.get_job(conn, job_id).revision
+    transition_count = conn.execute(
+        "SELECT COUNT(*) FROM job_attempt_transitions"
+    ).fetchone()[0]
+    next_transition_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM job_attempt_transitions"
+    ).fetchone()[0]
+    write, envelope = _transition(
+        conn,
+        signing_key,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        source="QUEUED",
+        target="ASSIGNED",
+        key="t:bool-conflicting-outbox",
+        created_at=10,
+    )
+    job = jdb.get_job(conn, job_id)
+    changed = dict(write.handoff)
+    changed["schema_version"] = True
+    jn.enqueue_locked(
+        conn,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        job_revision=write.expected_job_revision + 1,
+        milestone=jn.MILESTONE_ASSIGNED,
+        transition_id=next_transition_id,
+        payload={
+            "number": job.number,
+            "name": job.name,
+            "target_state": write.target_state,
+            "failure_class": write.failure_class,
+            "blocker_code": write.blocker_code,
+            "handoff": changed,
+        },
+        now=10,
+    )
+    conn.commit()
+
+    with pytest.raises(jdb.GraphConflict, match="notification intent"):
+        jdb.record_transition(conn, write, envelope)
+
+    assert (
+        conn.execute("SELECT COUNT(*) FROM job_attempt_transitions").fetchone()[0]
+        == transition_count
+    )
+    assert jdb.get_job(conn, job_id).revision == revision_before
+    assert jdb.latest_handoff(conn, attempt_id)["to_phase"] == "QUEUED"
+
+
+def test_pending_rows_claim_retry_acknowledge_in_order_per_job(
+    conn, tmp_path, signing_key
+):
     import time
 
     job_id = _queued_job(conn)
     attempt_id = _attempt(conn, job_id)
+    _record_queued(conn, signing_key, job_id, attempt_id, created_at=9)
     steps = [
-        (None, "ASSIGNED", "t:assigned", 10),
+        ("QUEUED", "ASSIGNED", "t:assigned", 10),
         ("ASSIGNED", "BUILDING", "t:building", 11),
+        ("BUILDING", "EVIDENCE_COLLECTING", "t:testing", 12),
     ]
     for source, target, key, at in steps:
         write, envelope = _transition(
@@ -367,11 +596,11 @@ def test_pending_rows_claim_retry_acknowledge_in_order_per_job(conn, tmp_path, s
     base = int(time.time())
     other = jdb.connect(tmp_path / "jobs.db")
     try:
-        queued, assigned, building = jn.list_notifications(conn, job_id=job_id)
-        assert [r.milestone for r in (queued, assigned, building)] == [
+        queued, assigned, testing = jn.list_notifications(conn, job_id=job_id)
+        assert [r.milestone for r in (queued, assigned, testing)] == [
             "queued",
             "assigned",
-            "building",
+            "testing",
         ]
 
         # Worker A claims the earliest pending row.
@@ -413,8 +642,8 @@ def test_pending_rows_claim_retry_acknowledge_in_order_per_job(conn, tmp_path, s
         # Acknowledging the second row unblocks the third.
         jn.acknowledge(conn, assigned.notification_id, owner="A", now=base + 102)
         third = jn.claim_due(other, owner="B", now=base + 103, lease_seconds=30)
-        assert third.notification_id == building.notification_id
-        jn.acknowledge(other, building.notification_id, owner="B", now=base + 104)
+        assert third.notification_id == testing.notification_id
+        jn.acknowledge(other, testing.notification_id, owner="B", now=base + 104)
 
         assert jn.claim_due(conn, owner="A", now=base + 105, lease_seconds=30) is None
         assert jn.claim_due(other, owner="B", now=base + 105, lease_seconds=30) is None
@@ -442,3 +671,38 @@ def test_unavailable_older_job_does_not_starve_a_new_job_notification(conn):
 
     assert claimed.notification_id == newer_row.notification_id
     assert claimed.notification_id != older_row.notification_id
+
+
+def test_no_progress_heartbeat_is_idempotent_and_retries_in_order(conn):
+    import time
+
+    job_id = _queued_job(conn)
+    row = jn.list_notifications(conn, job_id=job_id)[0]
+    base = int(time.time())
+
+    claimed = jn.claim_due(conn, owner="watcher", now=base, lease_seconds=30)
+    assert claimed.notification_id == row.notification_id
+    jn.acknowledge(conn, row.notification_id, owner="watcher", now=base + 1)
+
+    stagnant_at = base + jn.HEARTBEAT_AFTER_SECONDS + 1
+    assert jn.enqueue_due_heartbeats(conn, now=stagnant_at) == [
+        f"n:{job_id}:1:heartbeat"
+    ]
+    # A watcher restart in the same stagnant phase cannot create a duplicate.
+    assert jn.enqueue_due_heartbeats(conn, now=stagnant_at + 1) == []
+
+    heartbeat = jn.claim_due(conn, owner="watcher", now=stagnant_at)
+    assert heartbeat.milestone == jn.MILESTONE_HEARTBEAT
+    retry_at = stagnant_at + 60
+    jn.release_claim(
+        conn,
+        heartbeat.notification_id,
+        owner="watcher",
+        now=stagnant_at,
+        retry_at=retry_at,
+        error="origin temporarily unavailable",
+    )
+    assert jn.claim_due(conn, owner="watcher", now=retry_at - 1) is None
+    retried = jn.claim_due(conn, owner="watcher", now=retry_at)
+    assert retried.notification_id == heartbeat.notification_id
+    assert retried.delivery_attempts == 2

@@ -21,7 +21,9 @@ Rows are immutable intents plus delivery state:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from typing import Mapping, Optional
 
@@ -30,30 +32,36 @@ MILESTONE_ASSIGNED = "assigned"
 MILESTONE_BUILDING = "building"
 MILESTONE_TESTING = "testing"
 MILESTONE_REVIEW = "review"
+MILESTONE_REVIEW_APPROVED = "review-approved"
 MILESTONE_CORRECTING = "correcting"
 MILESTONE_NEEDS_YOU = "needs-you"
 MILESTONE_FAILURE = "failure"
 MILESTONE_FINISHED = "finished"
 MILESTONE_HEARTBEAT = "heartbeat"
 
-ALL_MILESTONES = frozenset(
-    {
-        MILESTONE_QUEUED,
-        MILESTONE_ASSIGNED,
-        MILESTONE_BUILDING,
-        MILESTONE_TESTING,
-        MILESTONE_REVIEW,
-        MILESTONE_CORRECTING,
-        MILESTONE_NEEDS_YOU,
-        MILESTONE_FAILURE,
-        MILESTONE_FINISHED,
-        MILESTONE_HEARTBEAT,
-    }
-)
+ALL_MILESTONES = frozenset({
+    MILESTONE_QUEUED,
+    MILESTONE_ASSIGNED,
+    MILESTONE_BUILDING,
+    MILESTONE_TESTING,
+    MILESTONE_REVIEW,
+    MILESTONE_REVIEW_APPROVED,
+    MILESTONE_CORRECTING,
+    MILESTONE_NEEDS_YOU,
+    MILESTONE_FAILURE,
+    MILESTONE_FINISHED,
+    MILESTONE_HEARTBEAT,
+})
 
 # One heartbeat is emitted per stagnant phase episode, and only after this
 # many seconds have passed since the phase's milestone was delivered.
 HEARTBEAT_AFTER_SECONDS = 600
+
+_UNSET = object()
+_SECRET_LABEL = re.compile(
+    r"authorization\s*:|bearer\s+|token\s*=|api[\s_-]*key|private\s+key|(?<!\w)sk\s*-\s*",
+    re.IGNORECASE,
+)
 
 MAX_PAYLOAD_CHARS = 4096
 MAX_ERROR_CHARS = 512
@@ -91,27 +99,25 @@ def milestone_for_state(
     """The user milestone for a graph target state, or ``None``.
 
     ``QUEUED`` milestones are emitted at Job creation, not per attempt;
-    ``VERIFIED`` and ``CANCELLED`` are durable graph states with no chat
-    milestone.  A ``FAILED`` attempt is ``failure`` only when it was declared
+    ``BUILDING`` is a signed internal edge and ``CANCELLED`` has no chat
+    milestone. A ``FAILED`` attempt is ``failure`` only when it was declared
     terminal; otherwise it is ``correcting`` (a retry/re-review is coming).
     """
     if target_state == "ASSIGNED":
         return MILESTONE_ASSIGNED
-    if target_state == "BUILDING":
-        return MILESTONE_BUILDING
     if target_state == "EVIDENCE_COLLECTING":
         return MILESTONE_TESTING
     if target_state == "REVIEWING":
         return MILESTONE_REVIEW
+    if target_state == "VERIFIED":
+        return MILESTONE_REVIEW_APPROVED
     if target_state == "BLOCKED":
         return MILESTONE_NEEDS_YOU
     if target_state == "COMPLETED":
         return MILESTONE_FINISHED
     if target_state == "FAILED":
         return (
-            MILESTONE_FAILURE
-            if attempt_terminal_failure == 1
-            else MILESTONE_CORRECTING
+            MILESTONE_FAILURE if attempt_terminal_failure == 1 else MILESTONE_CORRECTING
         )
     return None
 
@@ -401,23 +407,87 @@ def render_milestone_message(
     record: NotificationRecord,
     *,
     re_review: bool = False,
+    transition_evidence: Mapping[str, str] | None = None,
+    expected_job_id: str | None = None,
+    expected_attempt_id: object = _UNSET,
+    expected_target_state: str | None = None,
+    expected_speaker_id: str | None = None,
 ) -> str:
-    """One concise, stable user-facing message for a milestone record.
+    """Render one bounded Jobs update.
 
-    Pure over the bounded outbox payload: it reads only ``number``, ``name``
-    and (for heartbeats) ``phase``.  Raw goal text, stdout, stack traces,
-    token counts, and full review text are never part of the payload or the
-    rendered message.
+    New rows carrying a handoff render the validated substantive handoff. Old
+    rows retain one bounded compatibility line. A handoff without trusted
+    transition evidence, or one that no longer validates, fails closed.
 
     The stable ``review`` milestone renders as a re-review only when the
     caller passes ``re_review=True`` (the delivery worker derives that from
     the job's delivered history); the milestone type itself stays ``review``.
     """
-    number = record.payload.get("number") or ""
-    name = record.payload.get("name") or record.job_id
+    number = _safe_label(record.payload.get("number"))
+
+    if "handoff" in record.payload:
+        from hermes_cli import jobs_handoffs
+
+        try:
+            if (
+                expected_job_id is None
+                or expected_attempt_id is _UNSET
+                or expected_target_state is None
+                or expected_speaker_id is None
+            ):
+                raise jobs_handoffs.HandoffValidationError(
+                    "handoff lacks trusted transition binding"
+                )
+            handoff = jobs_handoffs.validate_persisted_handoff(
+                record.payload["handoff"],
+                target_state=(
+                    record.payload.get("target_state")
+                    if isinstance(record.payload.get("target_state"), str)
+                    else None
+                ),
+                transition_evidence=transition_evidence,
+            )
+            expected_milestone = milestone_for_state(expected_target_state)
+            milestone_matches = (
+                record.milestone in {MILESTONE_CORRECTING, MILESTONE_FAILURE}
+                if expected_target_state == "FAILED"
+                else expected_milestone is not None
+                and record.milestone == expected_milestone
+            )
+            if (
+                handoff["job_id"] != expected_job_id
+                or handoff["attempt_id"] != expected_attempt_id
+                or handoff["to_phase"] != expected_target_state
+                or handoff["speaker_id"] != expected_speaker_id
+                or not milestone_matches
+            ):
+                raise jobs_handoffs.HandoffValidationError(
+                    "handoff identity does not match trusted transition"
+                )
+            return jobs_handoffs.render_handoff(
+                handoff,
+                transition_evidence=transition_evidence,
+            )
+        except (jobs_handoffs.HandoffValidationError, TypeError, ValueError):
+            # Never repeat untrusted handoff facts in a diagnostic. Job number
+            # and current milestone are the only safe context available here.
+            safe_state = _safe_label(expected_target_state or "current state")[:80]
+            return f"Hermes could not explain this handoff — Job #{number} is {safe_state}."
+
+    # Historical rows predate substantive handoffs. Keep exactly one visible,
+    # bounded compatibility line rather than pretending an agent spoke.
+    legacy = _legacy_milestone_message(record, re_review=re_review)
+    return f"Legacy Jobs update — {legacy}"
+
+
+def _legacy_milestone_message(record: NotificationRecord, *, re_review: bool) -> str:
+    """Render the pre-handoff milestone wording without claiming authorship."""
+
+    number = _safe_label(record.payload.get("number"))
+    name = _safe_label(record.payload.get("name") or record.job_id)
 
     if record.milestone == MILESTONE_HEARTBEAT:
-        phase = record.payload.get("phase") or "working"
+        phase = _safe_label(record.payload.get("phase") or "working")
         return f"Still working — {name} (#{number}) (still {phase})"
     if record.milestone == MILESTONE_REVIEW and re_review:
         return f"Re-review — {name} (#{number}) back under review"
@@ -426,21 +496,34 @@ def render_milestone_message(
         MILESTONE_QUEUED: f"Queued — {name} (#{number}) accepted",
         MILESTONE_ASSIGNED: f"Assigned — {name} (#{number}) started",
         MILESTONE_BUILDING: f"Building — {name} (#{number}) in progress",
-        MILESTONE_TESTING: (
-            f"Testing — {name} (#{number}) running tests and evidence"
-        ),
+        MILESTONE_TESTING: (f"Testing — {name} (#{number}) running tests and evidence"),
         MILESTONE_REVIEW: f"Review — {name} (#{number}) under review",
         MILESTONE_CORRECTING: f"Correcting — {name} (#{number}) fixing findings",
-        MILESTONE_NEEDS_YOU: (
-            f"Needs you — {name} (#{number}) requires your decision"
-        ),
+        MILESTONE_NEEDS_YOU: (f"Needs you — {name} (#{number}) requires your decision"),
         MILESTONE_FAILURE: f"Failed — {name} (#{number}) ended unsuccessfully",
         MILESTONE_FINISHED: f"Finished — {name} (#{number}) complete",
     }
     return templates.get(
         record.milestone,
-        f"Update — {name} (#{number}) ({record.milestone})",
+        "unavailable",
     )
+
+
+def _safe_label(value: object) -> str:
+    """Bound labels and remove structural/control characters from legacy data."""
+    text = str(value or "")
+    if _SECRET_LABEL.search(unicodedata.normalize("NFKC", text)):
+        return "[redacted]"
+    text = "".join(
+        " "
+        if ord(char) < 32
+        or ord(char) == 127
+        or ord(char) in {0x2028, 0x2029}
+        or unicodedata.category(char) in {"Cf", "Cs"}
+        else char
+        for char in text
+    )
+    return text[:160]
 
 
 def enqueue_due_heartbeats(
@@ -500,9 +583,7 @@ def enqueue_due_heartbeats(
                 "name": anchor.payload.get("name"),
                 "phase": anchor.milestone,
             }
-            payload_json = json.dumps(
-                payload, ensure_ascii=False, sort_keys=True
-            )
+            payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             if len(payload_json) > MAX_PAYLOAD_CHARS:
                 raise ValueError("heartbeat payload exceeds size bound")
             cursor = conn.execute(
@@ -544,6 +625,7 @@ __all__ = [
     "MILESTONE_NEEDS_YOU",
     "MILESTONE_QUEUED",
     "MILESTONE_REVIEW",
+    "MILESTONE_REVIEW_APPROVED",
     "MILESTONE_TESTING",
     "NotificationClaimError",
     "NotificationRecord",

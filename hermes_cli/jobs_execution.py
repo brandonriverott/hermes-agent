@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 from hermes_cli import jobs_exec as jx
 from hermes_cli import jobs_receipts
@@ -37,9 +37,14 @@ class ReliabilityExecution:
     artifacts: tuple[ArtifactClaim, ...]
     executor_exit_digest: str
     output_capture_digest: str
+    builder_handoff: Optional[Mapping[str, object]] = None
+    tester_handoff: Optional[Mapping[str, object]] = None
+    reviewer_handoff: Optional[Mapping[str, object]] = None
     failure_reason_code: Optional[str] = None
     http_status: Optional[int] = None
     safety_gate: bool = False
+    response_change_digest: Optional[str] = None
+    result_delta_digest: Optional[str] = None
 
 
 def claim_artifact(path: Path, *, name: str) -> ArtifactClaim:
@@ -58,9 +63,7 @@ def claim_artifact(path: Path, *, name: str) -> ArtifactClaim:
     )
 
 
-def bounded_text(
-    path: Path, *, maximum: int = MAX_PRESERVED_BYTES
-) -> Optional[str]:
+def bounded_text(path: Path, *, maximum: int = MAX_PRESERVED_BYTES) -> Optional[str]:
     """Read a bounded UTF-8 tail, dropping any first partial line."""
 
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:

@@ -221,10 +221,16 @@ def dispatch_due_job_once(
     lane_root: Path,
     now: Optional[int] = None,
     worker_id: str = "gateway-jobs-dispatcher",
+    job_id: Optional[str] = None,
     dispatcher: Optional[Callable[..., dict]] = None,
     health_collector: Callable[..., Sequence[object]] = collect_fleet_lane_health,
 ) -> Optional[dict]:
-    """Dispatch the oldest valid unclaimed Job once, or return ``None``."""
+    """Dispatch one valid unclaimed Job, or return ``None``.
+
+    ``job_id`` is an explicit retry/replay selector used by the CLI bridge. It
+    is deliberately applied before any claim so a requested Job can never fall
+    through to a different card when it is not eligible.
+    """
 
     from hermes_cli import jobs_db as jdb
     from hermes_cli import jobs_dispatch
@@ -240,6 +246,12 @@ def dispatch_due_job_once(
         health = tuple(health_collector(lane_root=root, now=instant))
         for job in jdb.list_jobs(conn, status="working"):
             if canary_job_id and job.id != canary_job_id:
+                continue
+            if (
+                job_id is not None
+                and job.id != job_id
+                and str(job.number) != str(job_id)
+            ):
                 continue
             if (
                 job.step not in jdb.EXECUTABLE_STEPS
@@ -268,6 +280,8 @@ def dispatch_due_job_once(
                 executor_registry=None,
                 gate=None,
                 activation_gate=None,
+                outcome_gate=None,
+                closure_gate=None,
                 observed_at=datetime.fromtimestamp(
                     instant, tz=timezone.utc
                 ).isoformat().replace("+00:00", "Z"),

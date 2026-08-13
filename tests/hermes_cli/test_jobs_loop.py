@@ -15,9 +15,7 @@ from hermes_cli import jobs_loop as loop
         (loop.FailureSignal(http_status=429), "PROVIDER"),
         (loop.FailureSignal(reason_code="BILLING_REFUSED"), "PROVIDER"),
         (
-            loop.FailureSignal(
-                reason_code="APPROVAL_REQUIRED", safety_gate=True
-            ),
+            loop.FailureSignal(reason_code="APPROVAL_REQUIRED", safety_gate=True),
             "SAFETY_GATE",
         ),
         (loop.FailureSignal(reason_code="DISK_FULL"), "INFRA_FAILURE"),
@@ -48,9 +46,7 @@ def test_authentication_has_precedence_over_safety_and_task_signals():
 
 def test_identical_evidence_is_not_retried():
     history = [
-        loop.RetryRecord(
-            ordinal=1, evidence_digest="sha256:same", decision="RETRY"
-        )
+        loop.RetryRecord(ordinal=1, evidence_digest="sha256:same", decision="RETRY")
     ]
     decision = loop.decide_retry(
         history, evidence_digest="sha256:same", failure_class="PROVIDER"
@@ -63,9 +59,7 @@ def test_identical_evidence_is_not_retried():
 
 def test_fourth_execution_is_blocked():
     history = [
-        loop.RetryRecord(
-            ordinal=i, evidence_digest=f"sha256:{i}", decision="RETRY"
-        )
+        loop.RetryRecord(ordinal=i, evidence_digest=f"sha256:{i}", decision="RETRY")
         for i in (1, 2, 3)
     ]
     decision = loop.decide_retry(
@@ -75,9 +69,7 @@ def test_fourth_execution_is_blocked():
 
 
 def test_retry_backoff_is_bounded_and_task_correction_is_immediate():
-    first = loop.decide_retry(
-        [], evidence_digest="sha256:1", failure_class="PROVIDER"
-    )
+    first = loop.decide_retry([], evidence_digest="sha256:1", failure_class="PROVIDER")
     second = loop.decide_retry(
         [loop.RetryRecord(1, "sha256:1", "RETRY")],
         evidence_digest="sha256:2",
@@ -91,6 +83,29 @@ def test_retry_backoff_is_bounded_and_task_correction_is_immediate():
     assert (task.action, task.backoff_seconds) == ("RETRY", 0)
 
 
+@pytest.mark.parametrize(
+    "reason_code",
+    [
+        "WORKER_INFRASTRUCTURE_FAILED",
+        "PROCESS_TIMEOUT",
+        "REVIEWER_PROCESS_FAILED",
+        "CLEANUP_FAILED",
+        "RESULT_CLEANUP_FAILED",
+    ],
+)
+def test_jobs_worker_infrastructure_reasons_retry(reason_code):
+    decision = loop.classify_failure(loop.FailureSignal(reason_code=reason_code))
+    retry = loop.decide_retry(
+        [], evidence_digest="sha256:new", failure_class=decision.failure_class
+    )
+
+    assert (decision.failure_class, decision.recovery_decision) == (
+        "INFRA_FAILURE",
+        "RETRY",
+    )
+    assert (retry.action, retry.backoff_seconds) == ("RETRY", 30)
+
+
 @pytest.mark.parametrize("failure_class", ["AUTH_INFRA", "SAFETY_GATE"])
 def test_authentication_and_safety_never_retry(failure_class):
     decision = loop.decide_retry(
@@ -102,9 +117,7 @@ def test_authentication_and_safety_never_retry(failure_class):
 def test_readback_mismatch_blocks_verification(tmp_path):
     artifact = tmp_path / "artifact.bin"
     artifact.write_bytes(b"changed")
-    result = loop.verify_readback(
-        artifact, expected_digest="sha256:" + "0" * 64
-    )
+    result = loop.verify_readback(artifact, expected_digest="sha256:" + "0" * 64)
     assert (result.status, result.reason_code) == (
         "BLOCKED",
         "READBACK_DIGEST_MISMATCH",

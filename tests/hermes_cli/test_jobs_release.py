@@ -138,12 +138,25 @@ def test_build_creates_versioned_immutable_bundle(tmp_path, monkeypatch):
 
 def test_release_file_set_contains_every_rollout_runtime_seam():
     required = {
+        "gateway/jobs_dispatcher.py",
         "gateway/jobs_notifications.py",
         "gateway/run.py",
         "hermes_cli/data/jobs-codex-result.v1.schema.json",
+        "hermes_cli/data/jobs-build-result.v1.schema.json",
+        "hermes_cli/data/jobs-review-result.v1.schema.json",
         "hermes_cli/jobs.py",
+        "hermes_cli/jobs_db.py",
+        "hermes_cli/jobs_dispatch.py",
+        "hermes_cli/jobs_execution.py",
+        "hermes_cli/jobs_graph.py",
+        "hermes_cli/jobs_handoffs.py",
+        "hermes_cli/jobs_loop.py",
+        "hermes_cli/jobs_notifications.py",
+        "hermes_cli/jobs_reliability.py",
         "hermes_cli/jobs_release.py",
         "hermes_cli/plugins.py",
+        "scripts/jobs_remote_worker.py",
+        "scripts/jobs-handoff-canary.py",
         "plugins/jobs/__init__.py",
         "plugins/jobs/plugin.yaml",
     }
