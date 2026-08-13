@@ -248,6 +248,7 @@ class DispatchContext:
     max_turns: int = 120
     prior_handoff: Optional[Mapping[str, object]] = None
     assurance_contract: Mapping[str, object] | None = None
+    on_heartbeat: Optional[Callable[[], None]] = None
 
 
 @dataclass(frozen=True)
@@ -945,6 +946,12 @@ def dispatch_once(
         max_turns=spec.max_turns,
         prior_handoff=_latest_prior_handoff(conn, job.id),
         assurance_contract=job.assurance_contract,
+        on_heartbeat=lambda: jdb.claim_heartbeat(
+            conn,
+            job.id,
+            claim_token=claim_token,
+            lease_seconds=lease_seconds,
+        ),
     )
     sequence = 0
 

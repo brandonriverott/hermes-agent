@@ -939,6 +939,41 @@ def test_local_phase_runner_uses_two_fresh_same_provider_sessions(
     assert not (handoff / "review-result.json").exists()
 
 
+def test_local_phase_runner_passes_heartbeat_to_each_provider_session(
+    tmp_path, monkeypatch
+):
+    context = _context(tmp_path, "claude")
+    seen = []
+    heartbeat = lambda: None
+    context = replace(context, on_heartbeat=heartbeat)
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/claude"
+    )
+
+    def process_runner(argv, *, cwd, stdout_path, stderr_path, on_heartbeat, **kwargs):
+        seen.append(on_heartbeat)
+        if len(seen) == 1:
+            (cwd / "built.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(cwd), "add", "built.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(cwd), "commit", "-qm", "candidate"], check=True
+            )
+            payload = _valid_build_payload()
+        else:
+            payload = _valid_review_payload()
+        stdout_path.write_text(
+            json.dumps({"structured_output": payload}), encoding="utf-8"
+        )
+        stderr_path.touch()
+        return jobs_reliability.ProcessResult(0)
+
+    jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
+        "claude", context
+    )
+
+    assert seen == [heartbeat, heartbeat]
+
+
 def test_local_phase_runner_refuses_remote_physical_lane_before_provider(
     tmp_path, monkeypatch
 ):
