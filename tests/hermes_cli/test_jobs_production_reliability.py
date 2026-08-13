@@ -127,6 +127,38 @@ def _valid_transport_payload(provider: str = "codex", *, status: str = "succeede
     }
 
 
+def test_claude_phase_env_inherits_only_automation_oauth_credential(
+    tmp_path, monkeypatch
+):
+    """A Claude lane needs subscription OAuth without receiving API secrets."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-value")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-reach-worker")
+    monkeypatch.setenv("ANTHROPIC_TOKEN", "must-not-reach-worker")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-reach-worker")
+
+    env = jobs_reliability._phase_env(
+        "claude", tmp_path / "claude-mac-1", tmp_path / "handoff"
+    )
+
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-test-value"
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_TOKEN" not in env
+    assert "UNRELATED_SECRET" not in env
+
+
+def test_codex_phase_env_does_not_inherit_claude_oauth_credential(
+    tmp_path, monkeypatch
+):
+    """The Claude credential must not cross into a Codex worker lane."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-value")
+
+    env = jobs_reliability._phase_env(
+        "codex", tmp_path / "codex-mac-1", tmp_path / "handoff"
+    )
+
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+
+
 @pytest.mark.parametrize(
     "filename",
     ["jobs-build-result.v1.schema.json", "jobs-review-result.v1.schema.json"],

@@ -844,6 +844,9 @@ def _phase_env(provider: str, lane_root: Path, handoff: Path) -> dict[str, str]:
         env["CODEX_HOME"] = str(lane_root / "auth")
     else:
         env["CLAUDE_CONFIG_DIR"] = str(lane_root / "auth")
+        oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+        if oauth_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
     return env
 
 
