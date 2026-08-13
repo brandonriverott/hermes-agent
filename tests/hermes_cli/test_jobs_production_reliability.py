@@ -8,6 +8,7 @@ import base64
 import io
 import inspect
 import unicodedata
+import platform
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -418,7 +419,8 @@ def _repo(tmp_path: Path) -> tuple[Path, str]:
 def _context(tmp_path: Path, provider: str) -> dispatch.DispatchContext:
     repo, base = _repo(tmp_path)
     identity = jobs_identity.resolve_requested_lane(provider)
-    lane_root = tmp_path / f"{provider}-mac-1"
+    host = "mac" if platform.system().lower() == "darwin" else "pc"
+    lane_root = tmp_path / f"{provider}-{host}-1"
     for child in ("auth", "worktrees", "handoffs", "receipts", "health"):
         (lane_root / child).mkdir(parents=True, exist_ok=True)
     return dispatch.DispatchContext(
@@ -434,7 +436,7 @@ def _context(tmp_path: Path, provider: str) -> dispatch.DispatchContext:
         worktree=lane_root / "worktrees" / "j_test-1",
         lane_root=lane_root,
         requested_lane=identity.requested_lane,
-        lane_id=f"{provider}-mac-1",
+        lane_id=f"{provider}-{host}-1",
         executor=identity.executor,
         specialist=identity.specialist,
         model=identity.model,
@@ -2349,15 +2351,22 @@ def _remote_worker_request(tmp_path: Path, *, lane_id: str = "codex-pc-1") -> di
     context_root = tmp_path / "context"
     context_root.mkdir()
     context = _context(context_root, "codex")
+    identity = jobs_identity.resolve_requested_lane("codex")
+    context_values = asdict(context)
+    context_values.pop("on_heartbeat")
     return {
         "schema_version": 1,
         "provider": "codex",
         "context": {
-            **asdict(context),
+            **context_values,
             "repository": str(context.repository),
             "worktree": str(lane_root / "worktrees" / "j_test-1"),
             "lane_root": str(lane_root),
             "lane_id": lane_id,
+            "requested_lane": identity.requested_lane,
+            "executor": identity.executor,
+            "specialist": identity.specialist,
+            "model": identity.model,
         },
     }
 

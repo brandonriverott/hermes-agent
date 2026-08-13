@@ -543,6 +543,8 @@ def test_real_bridge_keeps_failed_checks_blocked_despite_reviewer_pass(bridge_ri
 
 
 def test_bridge_patch_is_mapped_to_the_installed_bridge(tmp_path):
+    if not LIVE_BRIDGE.is_file():
+        pytest.skip("installed PC bridge is available only on the PC runner")
     assert LIVE_BRIDGE.is_file(), f"installed bridge missing: {LIVE_BRIDGE}"
     assert BRIDGE_PATCH.is_file(), "canonical bridge patch is missing"
     bridge = tmp_path / "jobs-pc-bridge.sh"
