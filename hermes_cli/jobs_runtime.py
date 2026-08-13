@@ -251,8 +251,14 @@ def production_preflight_probes(
         return result(okay, "TOOL_ROUTING_INVALID", lane_id=str(lane_id), executor=str(executor), model=str(model))
 
     def auth_check(_value):
+        from hermes_cli import jobs_reliability
+
         return result(
-            lane_health.status == "PASS" and lane_health.state == "IDLE",
+            lane_health.status == "PASS"
+            and lane_health.state == "IDLE"
+            and jobs_reliability.production_auth_preflight(
+                lane_health.lane_id.split("-", 1)[0], root
+            ),
             "AUTH_REQUIRED",
             authenticated=True,
         )

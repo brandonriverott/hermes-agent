@@ -850,6 +850,42 @@ def _phase_env(provider: str, lane_root: Path, handoff: Path) -> dict[str, str]:
     return env
 
 
+def production_auth_preflight(provider: str, lane_root: Path) -> bool:
+    """Prove the selected provider is authenticated in its exact lane."""
+
+    root = Path(lane_root)
+    with tempfile.TemporaryDirectory(prefix="jobs-auth-preflight-") as temp_root:
+        env = _phase_env(provider, root, Path(temp_root))
+        executable = shutil.which(provider, path=env["PATH"])
+        if executable is None:
+            return False
+        argv = (
+            [executable, "auth", "status"]
+            if provider == "claude"
+            else [executable, "login", "status"]
+        )
+        try:
+            completed = subprocess.run(
+                argv,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+    if completed.returncode != 0:
+        return False
+    if provider != "claude":
+        return True
+    try:
+        status = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return status.get("loggedIn") is True
+
+
 def _codex_git_metadata_dirs(worktree: Path) -> tuple[Path, ...]:
     """Return only this isolated worktree's Git metadata write locations.
 

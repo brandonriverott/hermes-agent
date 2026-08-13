@@ -159,6 +159,64 @@ def test_codex_phase_env_does_not_inherit_claude_oauth_credential(
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
 
 
+def test_production_auth_preflight_runs_in_exact_claude_lane(
+    tmp_path, monkeypatch
+):
+    """An idle lane is not authenticated until its real CLI proves it."""
+    lane_root = tmp_path / "claude-mac-1"
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps(
+                {
+                    "loggedIn": True,
+                    "authMethod": "oauth_token",
+                    "apiProvider": "firstParty",
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(jobs_reliability.subprocess, "run", run)
+    monkeypatch.setattr(jobs_reliability.shutil, "which", lambda *_a, **_k: "/bin/claude")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-value")
+
+    assert jobs_reliability.production_auth_preflight("claude", lane_root) is True
+    argv, kwargs = calls[0]
+    assert argv == ["/bin/claude", "auth", "status"]
+    assert kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(lane_root / "auth")
+    assert kwargs["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-test-value"
+    assert "ANTHROPIC_API_KEY" not in kwargs["env"]
+
+
+def test_production_auth_preflight_rejects_logged_out_claude_lane(
+    tmp_path, monkeypatch
+):
+    """A successful process exit cannot hide Claude's logged-out result."""
+    monkeypatch.setattr(jobs_reliability.shutil, "which", lambda *_a, **_k: "/bin/claude")
+    monkeypatch.setattr(
+        jobs_reliability.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+            stderr="",
+        ),
+    )
+
+    assert (
+        jobs_reliability.production_auth_preflight(
+            "claude", tmp_path / "claude-mac-1"
+        )
+        is False
+    )
+
+
 @pytest.mark.parametrize(
     "filename",
     ["jobs-build-result.v1.schema.json", "jobs-review-result.v1.schema.json"],
@@ -1561,6 +1619,36 @@ def test_runtime_production_preflight_refuses_non_idle_health(tmp_path):
     )
     result = probes.auth_check("codex-mac-1")
     assert (result.status, result.code) == ("BLOCKED", "AUTH_REQUIRED")
+
+
+def test_runtime_production_preflight_requires_exact_lane_auth(tmp_path, monkeypatch):
+    context = _context(tmp_path, "claude")
+    health = jobs_lanes.LaneHealth(
+        lane_id="claude-mac-1",
+        state="IDLE",
+        status="PASS",
+        failure_class=None,
+        reason_code="OK",
+        observed_at=100,
+        expires_at=220,
+        executor_version="2.1.197",
+        available_capacity=1,
+        safe_detail={},
+    )
+    observed = []
+    monkeypatch.setattr(
+        jobs_reliability,
+        "production_auth_preflight",
+        lambda provider, lane_root: observed.append((provider, lane_root)) or False,
+    )
+
+    probes = jobs_runtime.production_preflight_probes(
+        lane_root=context.lane_root, lane_health=health
+    )
+
+    result = probes.auth_check("claude-mac-1")
+    assert (result.status, result.code) == ("BLOCKED", "AUTH_REQUIRED")
+    assert observed == [("claude", context.lane_root)]
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
