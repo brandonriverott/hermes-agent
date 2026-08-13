@@ -819,22 +819,34 @@ def _default_process_runner(
     stdout_path: Path,
     stderr_path: Path,
     timeout: int,
+    on_heartbeat: Optional[Callable[[], None]] = None,
 ) -> ProcessResult:
     try:
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-            completed = subprocess.run(
+            proc = subprocess.Popen(
                 list(argv),
                 cwd=str(cwd),
                 env=dict(env),
-                input=prompt,
+                stdin=subprocess.PIPE,
                 stdout=stdout,
                 stderr=stderr,
-                timeout=timeout,
-                check=False,
             )
-        return ProcessResult(completed.returncode)
-    except subprocess.TimeoutExpired:
-        return ProcessResult(124, timed_out=True)
+            assert proc.stdin is not None
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    return ProcessResult(
+                        proc.wait(timeout=min(60, max(1, deadline - time.monotonic())))
+                    )
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        proc.kill()
+                        proc.wait()
+                        return ProcessResult(124, timed_out=True)
+                    if on_heartbeat is not None:
+                        on_heartbeat()
     except OSError as exc:
         raise jobs_execution.AdapterError("provider process could not start") from exc
 
@@ -1108,6 +1120,9 @@ class LocalProviderPhaseRunner:
         build_cleanup_ok = True
         build_result_contained = True
         try:
+            build_runner_kwargs = {}
+            if context_heartbeat := getattr(context, "on_heartbeat", None):
+                build_runner_kwargs["on_heartbeat"] = context_heartbeat
             build = self._process_runner(
                 _provider_command(
                     provider,
@@ -1121,6 +1136,7 @@ class LocalProviderPhaseRunner:
                 stdout_path=build_stdout,
                 stderr_path=build_stderr,
                 timeout=max(60, int(getattr(context, "max_turns", 120)) * 30),
+                **build_runner_kwargs,
             )
             reported = _read_json(
                 build_result_path if provider == "codex" else build_stdout
@@ -1261,6 +1277,9 @@ class LocalProviderPhaseRunner:
         review_cleanup_ok = True
         review_result_contained = True
         try:
+            review_runner_kwargs = {}
+            if context_heartbeat := getattr(context, "on_heartbeat", None):
+                review_runner_kwargs["on_heartbeat"] = context_heartbeat
             review_run = self._process_runner(
                 _provider_command(
                     provider,
@@ -1279,6 +1298,7 @@ class LocalProviderPhaseRunner:
                 stdout_path=review_stdout,
                 stderr_path=review_stderr,
                 timeout=max(60, int(getattr(context, "max_turns", 120)) * 15),
+                **review_runner_kwargs,
             )
             reported_review = _read_json(
                 review_result_path if provider == "codex" else review_stdout

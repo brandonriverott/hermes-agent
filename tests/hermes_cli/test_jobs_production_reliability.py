@@ -169,9 +169,7 @@ def test_codex_phase_env_does_not_inherit_claude_oauth_credential(
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
 
 
-def test_production_auth_preflight_runs_in_exact_claude_lane(
-    tmp_path, monkeypatch
-):
+def test_production_auth_preflight_runs_in_exact_claude_lane(tmp_path, monkeypatch):
     """An idle lane is not authenticated until its real CLI proves it."""
     lane_root = tmp_path / "claude-mac-1"
     calls = []
@@ -181,18 +179,18 @@ def test_production_auth_preflight_runs_in_exact_claude_lane(
         return subprocess.CompletedProcess(
             argv,
             0,
-            stdout=json.dumps(
-                {
-                    "loggedIn": True,
-                    "authMethod": "oauth_token",
-                    "apiProvider": "firstParty",
-                }
-            ),
+            stdout=json.dumps({
+                "loggedIn": True,
+                "authMethod": "oauth_token",
+                "apiProvider": "firstParty",
+            }),
             stderr="",
         )
 
     monkeypatch.setattr(jobs_reliability.subprocess, "run", run)
-    monkeypatch.setattr(jobs_reliability.shutil, "which", lambda *_a, **_k: "/bin/claude")
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *_a, **_k: "/bin/claude"
+    )
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-test-value")
 
     assert jobs_reliability.production_auth_preflight("claude", lane_root) is True
@@ -207,7 +205,9 @@ def test_production_auth_preflight_rejects_logged_out_claude_lane(
     tmp_path, monkeypatch
 ):
     """A successful process exit cannot hide Claude's logged-out result."""
-    monkeypatch.setattr(jobs_reliability.shutil, "which", lambda *_a, **_k: "/bin/claude")
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *_a, **_k: "/bin/claude"
+    )
     monkeypatch.setattr(
         jobs_reliability.subprocess,
         "run",
@@ -220,9 +220,7 @@ def test_production_auth_preflight_rejects_logged_out_claude_lane(
     )
 
     assert (
-        jobs_reliability.production_auth_preflight(
-            "claude", tmp_path / "claude-mac-1"
-        )
+        jobs_reliability.production_auth_preflight("claude", tmp_path / "claude-mac-1")
         is False
     )
 
@@ -697,14 +695,14 @@ def test_reliability_adapter_preserves_provider_and_materializes_evidence(
             status="succeeded",
             commit=commit,
             tests=tuple(_valid_build_payload()["tests"]),
-                review={
+            review={
                 "verdict": "PASS",
                 "finding_type": "none",
                 "findings": [],
-                    "checks_run": ["diff"],
-                    "outcome_evidence": _valid_review_payload()["outcome_evidence"],
-                    "knowledge_closure": None,
-                    "raw_output": "review transcript must not be persisted",
+                "checks_run": ["diff"],
+                "outcome_evidence": _valid_review_payload()["outcome_evidence"],
+                "knowledge_closure": None,
+                "raw_output": "review transcript must not be persisted",
             },
             executor_exit_digest="sha256:" + "1" * 64,
             output_capture_digest="sha256:" + "2" * 64,
@@ -937,6 +935,41 @@ def test_local_phase_runner_uses_two_fresh_same_provider_sessions(
     assert "sk-in-test-secret" not in (handoff / "build-stderr.log").read_text()
     assert not (handoff / "build-result.json").exists()
     assert not (handoff / "review-result.json").exists()
+
+
+def test_local_phase_runner_passes_heartbeat_to_each_provider_session(
+    tmp_path, monkeypatch
+):
+    context = _context(tmp_path, "claude")
+    seen = []
+    heartbeat = lambda: None
+    context = replace(context, on_heartbeat=heartbeat)
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/claude"
+    )
+
+    def process_runner(argv, *, cwd, stdout_path, stderr_path, on_heartbeat, **kwargs):
+        seen.append(on_heartbeat)
+        if len(seen) == 1:
+            (cwd / "built.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(cwd), "add", "built.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(cwd), "commit", "-qm", "candidate"], check=True
+            )
+            payload = _valid_build_payload()
+        else:
+            payload = _valid_review_payload()
+        stdout_path.write_text(
+            json.dumps({"structured_output": payload}), encoding="utf-8"
+        )
+        stderr_path.touch()
+        return jobs_reliability.ProcessResult(0)
+
+    jobs_reliability.LocalProviderPhaseRunner(process_runner=process_runner)(
+        "claude", context
+    )
+
+    assert seen == [heartbeat, heartbeat]
 
 
 def test_local_phase_runner_refuses_remote_physical_lane_before_provider(
