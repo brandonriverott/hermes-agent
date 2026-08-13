@@ -51,11 +51,27 @@ def _run(argv, capsys=None):
 def _job(home, name="Ship it", goal="do the thing", lane="claude"):
     gf = home / "goal.txt"
     gf.write_text(goal)
+    assurance = home / "assurance.json"
+    assurance.write_text(json.dumps({
+        "critical_user_journey": "operator observes the requested result",
+        "success_metric": "critical journey passes",
+        "outcome_mode": "integration",
+        "verification_steps": ["exercise critical journey"],
+        "max_attempts": 3,
+        "wall_clock_budget_seconds": 3600,
+        "risk_domains": ["none"],
+        "consumers": [],
+        "egress_paths": [],
+        "rollback_behavior": "not applicable",
+        "knowledge_closure_required": False,
+    }))
     argv = [
         "create",
         name,
         "--goal-file",
         str(gf),
+        "--assurance-file",
+        str(assurance),
         "--lane",
         lane,
         "--json",

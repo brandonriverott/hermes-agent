@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -42,6 +44,23 @@ def _run(argv, capsys=None):
     stdout AND stderr in one shot and hands both back — a later
     ``capsys.readouterr()`` in the test would otherwise see nothing.
     """
+    argv = list(argv)
+    if argv and argv[0] in {"create", "intake"} and "--assurance-file" not in argv:
+        assurance_path = Path(os.environ["HERMES_HOME"]) / "assurance.json"
+        assurance_path.write_text(json.dumps({
+            "critical_user_journey": "operator observes the requested result",
+            "success_metric": "critical journey passes",
+            "outcome_mode": "integration",
+            "verification_steps": ["exercise critical journey"],
+            "max_attempts": 3,
+            "wall_clock_budget_seconds": 3600,
+            "risk_domains": ["none"],
+            "consumers": [],
+            "egress_paths": [],
+            "rollback_behavior": "not applicable",
+            "knowledge_closure_required": False,
+        }), encoding="utf-8")
+        argv.extend(["--assurance-file", str(assurance_path)])
     parser = argparse.ArgumentParser(prog="hermes")
     sub = parser.add_subparsers(dest="command")
     jobs_cli.build_parser(sub)
@@ -57,6 +76,25 @@ def _goal_file(home, data: bytes = GOAL_BYTES):
     p = home / "goal.txt"
     p.write_bytes(data)
     return p
+
+
+def test_scorecard_is_read_only_and_reports_created_jobs(home, capsys):
+    _run([
+        "create", "Measured", "--goal-file", str(_goal_file(home, b"measure")),
+        "--lane", "claude",
+    ], capsys)
+    with jdb.connect_closing() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM job_events").fetchone()[0]
+
+    rc, out, _ = _run(
+        ["scorecard", "--since", "0", "--until", "9999999999", "--json"],
+        capsys,
+    )
+
+    assert rc == 0
+    assert json.loads(out)["jobs_started"] == 1
+    with jdb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM job_events").fetchone()[0] == before
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +197,24 @@ def test_list_and_status_filter(home, capsys):
     rc, out, _ = _run(["list", "--status", "needs_you"], capsys)
     assert rc == 0
     assert "Job #2" in out and "Job #1" not in out
+
+
+def test_unclaimed_job_is_presented_as_waiting_not_working(home, capsys):
+    _run([
+        "create", "Waiting", "--goal-file", str(_goal_file(home, b"wait")),
+        "--lane", "claude",
+    ], capsys)
+
+    rc, out, _ = _run(["list"], capsys)
+    assert rc == 0
+    assert "waiting" in out and "for_worker" in out
+    assert "working" not in out and "routing" not in out
+
+    rc, out, _ = _run(["show", "1", "--json"], capsys)
+    assert rc == 0
+    payload = json.loads(out)
+    assert payload["display_status"] == "waiting"
+    assert payload["display_step"] == "for_worker"
 
 
 def test_show_resolves_id_number_and_label(home, capsys):

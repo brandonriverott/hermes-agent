@@ -33,7 +33,15 @@ LEGAL = {
     "BUILDING": frozenset({"EVIDENCE_COLLECTING", "FAILED", "BLOCKED", "CANCELLED"}),
     "EVIDENCE_COLLECTING": frozenset({"REVIEWING", "FAILED", "BLOCKED", "CANCELLED"}),
     "REVIEWING": frozenset({"VERIFIED", "FAILED", "BLOCKED", "CANCELLED"}),
-    "VERIFIED": frozenset({"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}),
+    "VERIFIED": frozenset(
+        {"OUTCOME_VERIFYING", "FAILED", "BLOCKED", "CANCELLED"}
+    ),
+    "OUTCOME_VERIFYING": frozenset(
+        {"OUTCOME_VERIFIED", "FAILED", "BLOCKED", "CANCELLED"}
+    ),
+    "OUTCOME_VERIFIED": frozenset(
+        {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}
+    ),
     "COMPLETED": frozenset(),
     "FAILED": frozenset(),
     "BLOCKED": frozenset(),
@@ -46,8 +54,16 @@ REQUIRED_EVIDENCE = {
     ("ASSIGNED", "BUILDING"): frozenset({"claim", "worktree", "attempt_started"}),
     ("BUILDING", "EVIDENCE_COLLECTING"): frozenset({"executor_exit", "output_capture"}),
     ("EVIDENCE_COLLECTING", "REVIEWING"): frozenset({"tests", "readback"}),
-    ("REVIEWING", "VERIFIED"): frozenset({"themis_review", "receipt_verification"}),
-    ("VERIFIED", "COMPLETED"): frozenset({"activation_gate", "completion_receipt"}),
+    ("REVIEWING", "VERIFIED"): frozenset(
+        {"themis_review", "receipt_verification"}
+    ),
+    ("VERIFIED", "OUTCOME_VERIFYING"): frozenset({"outcome_contract"}),
+    ("OUTCOME_VERIFYING", "OUTCOME_VERIFIED"): frozenset(
+        {"critical_journey_result"}
+    ),
+    ("OUTCOME_VERIFIED", "COMPLETED"): frozenset(
+        {"activation_gate", "completion_receipt", "knowledge_closure"}
+    ),
 }
 
 TERMINAL_STATES = frozenset({"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"})

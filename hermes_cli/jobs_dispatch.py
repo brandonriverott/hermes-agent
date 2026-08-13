@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import jobs_db as jdb
+from hermes_cli import jobs_assurance
 from hermes_cli import jobs_execution
 from hermes_cli import jobs_executors
 from hermes_cli import jobs_graph as graph
@@ -246,6 +247,7 @@ class DispatchContext:
     effort: str = "max"
     max_turns: int = 120
     prior_handoff: Optional[Mapping[str, object]] = None
+    assurance_contract: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -489,6 +491,22 @@ def _transition_handoff(
         )
         summary, next_action, issues = _provider_handoff_value(
             provider_handoff, summary=summary, next_action=next_action
+        )
+    elif target == "OUTCOME_VERIFYING":
+        role, speaker_executor, owner = "Hermes", "hermes", "Outcome Verifier"
+        outcome, summary, next_action, issues = (
+            "handed_off",
+            "Hermes bound the approved candidate to its outcome contract.",
+            "Verify the critical user journey in the declared environment.",
+            [],
+        )
+    elif target == "OUTCOME_VERIFIED":
+        role, speaker_executor, owner = "Outcome Verifier", "hermes", "Hermes"
+        outcome, summary, next_action, issues = (
+            "passed",
+            "The critical user journey met the declared success metric.",
+            "Apply the activation and durable-knowledge closure gates.",
+            [],
         )
     elif target == "BLOCKED":
         role, speaker_executor, owner = "Hermes", "hermes", "Brandon"
@@ -752,6 +770,10 @@ def dispatch_once(
     lease_seconds: int = 1800,
     failure_journal_path: Optional[Path] = None,
     lane_decision: Optional[jobs_lanes.LaneDecision] = None,
+    outcome_gate: Optional[Callable[..., jobs_assurance.OutcomeDecision]] = None,
+    closure_gate: Optional[
+        Callable[..., jobs_assurance.KnowledgeClosureReceipt]
+    ] = None,
 ) -> DispatchResult:
     """Run one evidence-authorized dispatch without provider assumptions.
 
@@ -798,6 +820,7 @@ def dispatch_once(
         model=spec.model,
         observed_at=observed_at,
         expected_job_revision=job.revision,
+        assurance_contract=job.assurance_contract,
     )
     preflight = harness.preflight_and_record(conn, snapshot, probes, signer)
     if preflight.status != "PASS":
@@ -921,6 +944,7 @@ def dispatch_once(
         effort=spec.effort,
         max_turns=spec.max_turns,
         prior_handoff=_latest_prior_handoff(conn, job.id),
+        assurance_contract=job.assurance_contract,
     )
     sequence = 0
 
@@ -997,6 +1021,8 @@ def dispatch_once(
         force_blocked: bool = False,
         provider_handoff: object = None,
         journal_error_override: Optional[str] = None,
+        response_change_digest: Optional[str] = None,
+        result_delta_digest: Optional[str] = None,
     ) -> DispatchResult:
         decision = jobs_loop.classify_failure(signal)
         reported_reason = decision.reason_code
@@ -1028,6 +1054,17 @@ def dispatch_once(
             history_rows = jdb.list_retry_evidence(
                 conn, job.id, chain_id=chain_id
             )
+            contract = jobs_assurance.AssuranceContract.from_mapping(
+                context.assurance_contract
+            )
+            prior_failure_digest = (
+                str(history_rows[-1]["evidence_digest"]) if history_rows else evidence_digest
+            )
+            continuation = jobs_assurance.decide_continuation(
+                contract,
+                attempts_started=int(attempt["ordinal"]),
+                elapsed_seconds=max(0, int(now) - int(attempts[0]["started_at"] or now)),
+            )
             retry = jobs_loop.decide_retry(
                 [
                     jobs_loop.RetryRecord(
@@ -1039,18 +1076,19 @@ def dispatch_once(
                 ],
                 evidence_digest=evidence_digest,
                 failure_class=decision.failure_class,
-                prior_failure_digest=(
-                    str(history_rows[-1]["evidence_digest"])
-                    if history_rows
-                    else evidence_digest
-                ),
-                changed_evidence_digest=evidence_digest,
+                prior_failure_digest=prior_failure_digest,
+                changed_evidence_digest=result_delta_digest or evidence_digest,
                 what_changed=(
-                    "first observed failure"
-                    if not history_rows
-                    else "new attempt evidence digest"
+                    "response change and measurable result supplied"
+                    if response_change_digest and result_delta_digest
+                    else None
                 ),
+                response_change_digest=response_change_digest,
+                result_delta_digest=result_delta_digest,
+                policy=jobs_loop.RetryPolicy(max_attempts=contract.max_attempts),
             )
+            if continuation.action == "STOP":
+                retry = jobs_loop.RetryDecision("BLOCKED", continuation.reason_code, 0)
             stored = jdb.record_retry_decision(
                 conn,
                 jdb.RetryEvidenceWrite(
@@ -1060,6 +1098,9 @@ def dispatch_once(
                     parent_attempt_id=attempt["parent_attempt_id"],
                     ordinal=int(attempt["ordinal"]),
                     evidence_digest=evidence_digest,
+                    prior_failure_digest=prior_failure_digest,
+                    response_change_digest=response_change_digest,
+                    result_delta_digest=result_delta_digest,
                     decision=retry.action,
                     reason_code=retry.reason_code,
                     created_at=int(now) + sequence + 1,
@@ -1090,6 +1131,18 @@ def dispatch_once(
             else:
                 target = "FAILED"
                 blocker_code = None
+        if signal.reason_code in {
+            "OUTCOME_NOT_PASSING",
+            "OUTCOME_NOT_PROVED",
+            "JOURNEY_MISMATCH",
+            "VERIFICATION_STEPS_MISSING",
+            "OUTCOME_EVIDENCE_INVALID",
+            "OUTCOME_VERIFIER_FAILED",
+        }:
+            target = "BLOCKED"
+            retry_action = "HUMAN_ACTION"
+            recovery = retry_action
+            blocker_code = "EVIDENCE_REQUIRED"
 
         if placement_id is not None:
             placement = jdb.get_lane_placement(conn, placement_id)
@@ -1280,6 +1333,8 @@ def dispatch_once(
             ),
             commit=candidate,
             provider_handoff=execution.reviewer_handoff or execution.builder_handoff,
+            response_change_digest=execution.response_change_digest,
+            result_delta_digest=execution.result_delta_digest,
         )
     if execution.builder_handoff is None:
         return fail(
@@ -1601,6 +1656,70 @@ def dispatch_once(
         provider_handoff=execution.reviewer_handoff,
     )
 
+    if outcome_gate is None or closure_gate is None:
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="OUTCOME_GATE_REQUIRED", safety_gate=True
+            ),
+            evidence_digest=_digest({"stage": "outcome", "gate": "missing"}),
+            commit=candidate,
+            force_blocked=True,
+        )
+    try:
+        contract = jobs_assurance.AssuranceContract.from_mapping(
+            context.assurance_contract
+        )
+    except jobs_assurance.InvalidAssuranceContract:
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="ASSURANCE_CONTRACT_REQUIRED", safety_gate=True
+            ),
+            evidence_digest=_digest({"stage": "outcome", "contract": "invalid"}),
+            commit=candidate,
+            force_blocked=True,
+        )
+    advance(
+        "OUTCOME_VERIFYING",
+        {"outcome_contract": contract.digest},
+        commit=candidate,
+    )
+    try:
+        outcome = outcome_gate(context, execution)
+    except Exception as exc:  # noqa: BLE001 - verifier must fail closed
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="OUTCOME_VERIFIER_FAILED", safety_gate=True
+            ),
+            evidence_digest=_digest(
+                {"stage": "outcome", "exception": type(exc).__name__}
+            ),
+            commit=candidate,
+            force_blocked=True,
+        )
+    if not isinstance(outcome, jobs_assurance.OutcomeDecision) or outcome.status != "PASS":
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code=(
+                    outcome.reason_code
+                    if isinstance(outcome, jobs_assurance.OutcomeDecision)
+                    else "OUTCOME_EVIDENCE_INVALID"
+                ),
+                safety_gate=True,
+            ),
+            evidence_digest=(
+                outcome.evidence_digest
+                if isinstance(outcome, jobs_assurance.OutcomeDecision)
+                else _digest({"stage": "outcome", "result": "invalid"})
+            ),
+            commit=candidate,
+            force_blocked=True,
+        )
+    advance(
+        "OUTCOME_VERIFIED",
+        {"critical_journey_result": outcome.evidence_digest},
+        commit=candidate,
+    )
+
     if placement_id is not None:
         sequence += 1
         jdb.transition_lane_placement(
@@ -1635,12 +1754,36 @@ def dispatch_once(
                 commit=candidate,
             )
 
+    try:
+        closure = closure_gate(context, execution)
+    except Exception as exc:  # noqa: BLE001 - closure must fail closed
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="KNOWLEDGE_CLOSURE_FAILED", safety_gate=True
+            ),
+            evidence_digest=_digest(
+                {"stage": "knowledge_closure", "exception": type(exc).__name__}
+            ),
+            commit=candidate,
+            force_blocked=True,
+        )
+    if not isinstance(closure, jobs_assurance.KnowledgeClosureReceipt) or not closure.closed:
+        return fail(
+            jobs_loop.FailureSignal(
+                reason_code="KNOWLEDGE_CLOSURE_INVALID", safety_gate=True
+            ),
+            evidence_digest=_digest({"stage": "knowledge_closure", "result": "invalid"}),
+            commit=candidate,
+            force_blocked=True,
+        )
+
     advance(
         "COMPLETED",
         {
             "activation_gate": activation.activation_gate_digest,
             "completion_receipt": activation.completion_receipt_digest,
             "completion_handoff": _digest(activation.completion_handoff),
+            "knowledge_closure": closure.digest,
         },
         commit=candidate,
         provider_handoff=activation.completion_handoff,

@@ -280,6 +280,8 @@ def dispatch_due_job_once(
                 executor_registry=None,
                 gate=None,
                 activation_gate=None,
+                outcome_gate=None,
+                closure_gate=None,
                 observed_at=datetime.fromtimestamp(
                     instant, tz=timezone.utc
                 ).isoformat().replace("+00:00", "Z"),

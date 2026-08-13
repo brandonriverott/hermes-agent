@@ -40,8 +40,8 @@ ALLOWED_TRANSITIONS = (
     ("BUILDING", "EVIDENCE_COLLECTING", "handed_off"),
     ("EVIDENCE_COLLECTING", "REVIEWING", "handed_off"),
     ("REVIEWING", "VERIFIED", "passed"),
-    ("VERIFIED", "COMPLETED", "completed"),
-    ("VERIFIED", "COMPLETED", "activated"),
+    ("OUTCOME_VERIFIED", "COMPLETED", "completed"),
+    ("OUTCOME_VERIFIED", "COMPLETED", "activated"),
     *((phase, "FAILED", "rejected") for phase in ACTIVE_PHASES),
     *((phase, "BLOCKED", "blocked") for phase in ACTIVE_PHASES),
 )
@@ -87,8 +87,8 @@ def _normalize(raw=None, **overrides):
         "passed": ("REVIEWING", "VERIFIED"),
         "rejected": ("REVIEWING", "FAILED"),
         "blocked": ("BUILDING", "BLOCKED"),
-        "activated": ("VERIFIED", "COMPLETED"),
-        "completed": ("VERIFIED", "COMPLETED"),
+        "activated": ("OUTCOME_VERIFIED", "COMPLETED"),
+        "completed": ("OUTCOME_VERIFIED", "COMPLETED"),
     }
     compatible_edge = (
         compatible_edges.get(values["outcome"])
@@ -280,7 +280,7 @@ def test_phase_rejects_an_incompatible_outcome(to_phase, outcome):
 def test_persisted_target_state_cannot_authorize_a_contradictory_outcome():
     receipt = _normalize(
         outcome="completed",
-        from_phase="VERIFIED",
+        from_phase="OUTCOME_VERIFIED",
         to_phase="COMPLETED",
         next_owner_role=None,
     )
@@ -297,7 +297,7 @@ def test_persisted_target_state_cannot_authorize_a_contradictory_outcome():
 def test_renderer_refuses_a_contradictory_completed_receipt():
     receipt = _normalize(
         outcome="completed",
-        from_phase="VERIFIED",
+        from_phase="OUTCOME_VERIFIED",
         to_phase="COMPLETED",
         next_owner_role=None,
     )
@@ -614,7 +614,7 @@ def test_cyclic_values_raise_handoff_validation_error_at_both_boundaries():
 def test_completed_handoff_may_have_no_next_owner():
     receipt = _normalize(
         outcome="completed",
-        from_phase="VERIFIED",
+        from_phase="OUTCOME_VERIFIED",
         to_phase="COMPLETED",
         next_owner_role=None,
     )
@@ -1472,7 +1472,7 @@ def test_decision_render_includes_options_recommendation_scope_and_safe_state():
             _normalize(
                 outcome="completed",
                 speaker_role="release-manager",
-                from_phase="VERIFIED",
+                from_phase="OUTCOME_VERIFIED",
                 to_phase="COMPLETED",
                 next_owner_role=None,
             ),

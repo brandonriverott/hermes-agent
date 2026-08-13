@@ -43,6 +43,8 @@ class ReliabilityExecution:
     failure_reason_code: Optional[str] = None
     http_status: Optional[int] = None
     safety_gate: bool = False
+    response_change_digest: Optional[str] = None
+    result_delta_digest: Optional[str] = None
 
 
 def claim_artifact(path: Path, *, name: str) -> ArtifactClaim:

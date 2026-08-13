@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Optional
 
+from hermes_cli import jobs_assurance
 from hermes_cli import jobs_execution
 from hermes_cli import jobs_exec
 from hermes_cli import jobs_identity
@@ -107,6 +108,8 @@ _REVIEW_FIELDS = frozenset({
     "findings",
     "checks_run",
     "handoff",
+    "outcome_evidence",
+    "knowledge_closure",
 })
 
 
@@ -610,6 +613,23 @@ def _normalize_review(value: object) -> Optional[dict[str, object]]:
     findings = value.get("findings")
     checks = value.get("checks_run")
     handoff = _normalize_handoff(value.get("handoff"))
+    try:
+        outcome_evidence = jobs_assurance.OutcomeEvidence.from_mapping(
+            value.get("outcome_evidence")
+        ).to_mapping()
+        closure_value = value.get("knowledge_closure")
+        knowledge_closure = (
+            None
+            if closure_value is None
+            else jobs_assurance.KnowledgeClosureReceipt.from_mapping(
+                closure_value
+            ).to_mapping()
+        )
+    except (
+        jobs_assurance.InvalidOutcomeEvidence,
+        jobs_assurance.InvalidClosureReceipt,
+    ):
+        return None
     if (
         not isinstance(verdict, str)
         or verdict not in {"PASS", "NEEDS_CHANGES", "UNABLE_TO_VERIFY"}
@@ -649,6 +669,8 @@ def _normalize_review(value: object) -> Optional[dict[str, object]]:
         "findings": clean_findings,
         "checks_run": clean_checks,
         "handoff": handoff,
+        "outcome_evidence": outcome_evidence,
+        "knowledge_closure": knowledge_closure,
     }
 
 
@@ -1830,6 +1852,8 @@ class ProductionReliabilityAdapter:
                 "finding_type": result.review.get("finding_type"),
                 "findings": result.review.get("findings"),
                 "checks_run": result.review.get("checks_run"),
+                "outcome_evidence": result.review.get("outcome_evidence"),
+                "knowledge_closure": result.review.get("knowledge_closure"),
                 "handoff": {
                     "summary": reviewer_handoff["summary"],
                     "next_action": reviewer_handoff["next_action"],
@@ -2011,6 +2035,72 @@ def production_completion_gate(context: object, gate: object):
     )
 
 
+def _review_receipt(context: object) -> dict:
+    lane_root = getattr(context, "lane_root", None)
+    if lane_root is None:
+        raise jobs_execution.AdapterError("outcome gate lacks lane identity")
+    evidence_dir = Path(lane_root) / "receipts" / str(getattr(context, "attempt_id"))
+    review_attempt = max(0, int(getattr(context, "ordinal")) - 1)
+    path = evidence_dir / f"review-{review_attempt}.json"
+    if path.is_symlink():
+        raise jobs_execution.AdapterError("review receipt must not be a symlink")
+    review = _read_json(path)
+    if review is None:
+        raise jobs_execution.AdapterError("review receipt is unavailable")
+    return review
+
+
+def production_outcome_gate(context: object, _execution: object):
+    """Verify the named user journey from the independent reviewer receipt."""
+
+    contract = jobs_assurance.AssuranceContract.from_mapping(
+        getattr(context, "assurance_contract", None)
+    )
+    review = _review_receipt(context)
+    validated_review = jobs_assurance.validate_review_result(review)
+    evidence = jobs_assurance.OutcomeEvidence.from_mapping(
+        review.get("outcome_evidence")
+    )
+    decision = jobs_assurance.verify_outcome(contract, evidence)
+    if not validated_review.authorizes_completion and decision.status == "PASS":
+        return jobs_assurance.OutcomeDecision(
+            "BLOCKED", "REVIEW_NOT_PASSING", evidence.digest
+        )
+    return decision
+
+
+def production_knowledge_closure_gate(context: object, _execution: object):
+    """Require a Vault Steward closure receipt when durable knowledge changed."""
+
+    contract = jobs_assurance.AssuranceContract.from_mapping(
+        getattr(context, "assurance_contract", None)
+    )
+    review = _review_receipt(context)
+    closure_value = review.get("knowledge_closure")
+    if contract.knowledge_closure_required:
+        if closure_value is None:
+            raise jobs_execution.AdapterError(
+                "required Vault Steward closure receipt is missing"
+            )
+        return jobs_assurance.KnowledgeClosureReceipt.from_mapping(closure_value)
+    if closure_value is not None:
+        return jobs_assurance.KnowledgeClosureReceipt.from_mapping(closure_value)
+    digest = jobs_receipts.digest_bytes(
+        jobs_receipts.canonical_json_bytes({
+            "job_id": str(getattr(context, "job_id")),
+            "attempt_id": str(getattr(context, "attempt_id")),
+            "contract_digest": contract.digest,
+            "disposition": "NOT_APPLICABLE",
+        })
+    )
+    return jobs_assurance.KnowledgeClosureReceipt.from_mapping({
+        "disposition": "NOT_APPLICABLE",
+        "canonical_note_path": None,
+        "retrieval_confirmed": False,
+        "steward_receipt_digest": digest,
+    })
+
+
 __all__ = [
     "LocalProviderPhaseRunner",
     "FleetProviderPhaseRunner",
@@ -2022,4 +2112,6 @@ __all__ = [
     "production_remote_preflight",
     "production_completion_gate",
     "production_gate",
+    "production_knowledge_closure_gate",
+    "production_outcome_gate",
 ]

@@ -17,8 +17,10 @@ from hermes_cli import jobs_runtime as rt
 
 from tests.hermes_cli.test_jobs_reliability_e2e import (
     _authoritative_gate,
+    _not_applicable_closure,
     _passing_activation,
     _passing_executor,
+    _passing_outcome,
     reliability_rig,
 )
 
@@ -97,6 +99,8 @@ def _dispatch(
         executor_registry=registry,
         gate=gate if gate is not None else _authoritative_gate(rig),
         activation_gate=_passing_activation,
+        outcome_gate=_passing_outcome,
+        closure_gate=_not_applicable_closure,
         observed_at="2026-08-09T00:00:00Z",
         now=rig.clock,
         lane_health=lane_health,
@@ -111,7 +115,11 @@ def _dispatch(
 def test_selected_codex_pc_path(reliability_rig):
     rig = reliability_rig
     job_id = jdb.create_job(
-        rig.conn, name="task5 codex", goal="build", requested_lane="codex"
+        rig.conn,
+        name="task5 codex",
+        goal="build",
+        requested_lane="codex",
+        assurance_contract=jdb.get_job(rig.conn, rig.job_id).assurance_contract,
     )
     result = _dispatch(
         rig,
@@ -134,7 +142,11 @@ def test_selected_codex_pc_path(reliability_rig):
 def test_codex_pc_blocked_falls_back_to_mac(reliability_rig):
     rig = reliability_rig
     job_id = jdb.create_job(
-        rig.conn, name="task5 fallback", goal="build", requested_lane="codex"
+        rig.conn,
+        name="task5 fallback",
+        goal="build",
+        requested_lane="codex",
+        assurance_contract=jdb.get_job(rig.conn, rig.job_id).assurance_contract,
     )
     lane_health = [
         _blocked_health(rig.clock, lane)
@@ -161,7 +173,11 @@ def test_no_codex_seat_queued_with_zero_claude_calls(reliability_rig):
         raise AssertionError("claude adapter must not be called")
 
     job_id = jdb.create_job(
-        rig.conn, name="task5 queued", goal="build", requested_lane="codex"
+        rig.conn,
+        name="task5 queued",
+        goal="build",
+        requested_lane="codex",
+        assurance_contract=jdb.get_job(rig.conn, rig.job_id).assurance_contract,
     )
     lane_health = [
         _blocked_health(rig.clock, lane)
@@ -212,7 +228,11 @@ def test_header_model_disagreement_fails_before_dispatch(reliability_rig):
         "build something"
     )
     job_id = jdb.create_job(
-        rig.conn, name="task5 header", goal=goal, requested_lane="codex"
+        rig.conn,
+        name="task5 header",
+        goal=goal,
+        requested_lane="codex",
+        assurance_contract=jdb.get_job(rig.conn, rig.job_id).assurance_contract,
     )
     with pytest.raises(dispatch.LegacyMetadataError):
         _dispatch(
@@ -227,7 +247,11 @@ def test_header_model_disagreement_fails_before_dispatch(reliability_rig):
 def test_missing_adapter_fails_before_dispatch(reliability_rig):
     rig = reliability_rig
     job_id = jdb.create_job(
-        rig.conn, name="task5 adapter", goal="build", requested_lane="codex"
+        rig.conn,
+        name="task5 adapter",
+        goal="build",
+        requested_lane="codex",
+        assurance_contract=jdb.get_job(rig.conn, rig.job_id).assurance_contract,
     )
     with pytest.raises(jobs_executors.UnsupportedExecutor):
         _dispatch(
@@ -244,7 +268,11 @@ def test_missing_adapter_fails_before_dispatch(reliability_rig):
 def test_unknown_identity_fails_before_dispatch(reliability_rig):
     rig = reliability_rig
     job_id = jdb.create_job(
-        rig.conn, name="task5 identity", goal="build", requested_lane="codex"
+        rig.conn,
+        name="task5 identity",
+        goal="build",
+        requested_lane="codex",
+        assurance_contract=jdb.get_job(rig.conn, rig.job_id).assurance_contract,
     )
     rig.conn.execute(
         "UPDATE jobs SET specialist = ? WHERE id = ?",

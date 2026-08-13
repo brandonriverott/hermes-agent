@@ -38,6 +38,8 @@ _CONTEXT_KEYS = {
     "model",
     "effort",
     "max_turns",
+    "prior_handoff",
+    "assurance_contract",
 }
 
 
@@ -178,8 +180,16 @@ def execute() -> int:
         if raw["schema_version"] != 1 or raw["provider"] not in {"claude", "codex"}:
             raise ValueError("request identity")
         values = raw["context"]
-        if not isinstance(values, dict) or set(values) != _CONTEXT_KEYS:
+        context_keys = set(values) if isinstance(values, dict) else set()
+        optional_context = {"assurance_contract", "prior_handoff"}
+        if (
+            not isinstance(values, dict)
+            or not (_CONTEXT_KEYS - optional_context).issubset(context_keys)
+            or not context_keys.issubset(_CONTEXT_KEYS)
+        ):
             raise ValueError("context shape")
+        values.setdefault("assurance_contract", None)
+        values.setdefault("prior_handoff", None)
         context = SimpleNamespace(**values)
         jobs_reliability._require_provider_context(raw["provider"], context, host="pc")
         lane_root = _validated_context_paths(context)

@@ -26,7 +26,14 @@ LEGAL = {
         "CANCELLED",
     },
     "REVIEWING": {"VERIFIED", "FAILED", "BLOCKED", "CANCELLED"},
-    "VERIFIED": {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"},
+    "VERIFIED": {"OUTCOME_VERIFYING", "FAILED", "BLOCKED", "CANCELLED"},
+    "OUTCOME_VERIFYING": {
+        "OUTCOME_VERIFIED",
+        "FAILED",
+        "BLOCKED",
+        "CANCELLED",
+    },
+    "OUTCOME_VERIFIED": {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"},
     "COMPLETED": set(),
     "FAILED": set(),
     "BLOCKED": set(),
@@ -40,7 +47,13 @@ REQUIRED = {
     ("BUILDING", "EVIDENCE_COLLECTING"): {"executor_exit", "output_capture"},
     ("EVIDENCE_COLLECTING", "REVIEWING"): {"tests", "readback"},
     ("REVIEWING", "VERIFIED"): {"themis_review", "receipt_verification"},
-    ("VERIFIED", "COMPLETED"): {"activation_gate", "completion_receipt"},
+    ("VERIFIED", "OUTCOME_VERIFYING"): {"outcome_contract"},
+    ("OUTCOME_VERIFYING", "OUTCOME_VERIFIED"): {"critical_journey_result"},
+    ("OUTCOME_VERIFIED", "COMPLETED"): {
+        "activation_gate",
+        "completion_receipt",
+        "knowledge_closure",
+    },
 }
 
 FORWARD = [
@@ -50,6 +63,8 @@ FORWARD = [
     "EVIDENCE_COLLECTING",
     "REVIEWING",
     "VERIFIED",
+    "OUTCOME_VERIFYING",
+    "OUTCOME_VERIFIED",
     "COMPLETED",
 ]
 STATES = tuple(state for state in LEGAL if state is not None)
@@ -142,6 +157,8 @@ class GraphRig:
             "EVIDENCE_COLLECTING": "handed_off",
             "REVIEWING": "handed_off",
             "VERIFIED": "passed",
+            "OUTCOME_VERIFYING": "handed_off",
+            "OUTCOME_VERIFIED": "passed",
             "COMPLETED": "completed",
             "FAILED": "rejected",
             "BLOCKED": "blocked",

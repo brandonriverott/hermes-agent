@@ -247,8 +247,16 @@ def production_preflight_probes(
             and lane_health.state == "IDLE"
             and lane_id.startswith(str(executor) + "-")
             and bool(model)
+            and bool(lane_health.executor_version)
         )
-        return result(okay, "TOOL_ROUTING_INVALID", lane_id=str(lane_id), executor=str(executor), model=str(model))
+        return result(
+            okay,
+            "TOOL_ROUTING_INVALID",
+            lane_id=str(lane_id),
+            executor=str(executor),
+            model=str(model),
+            version=str(lane_health.executor_version),
+        )
 
     def auth_check(_value):
         from hermes_cli import jobs_reliability
@@ -301,6 +309,8 @@ def dispatch_job_once(
     executor_registry: Optional[jobs_executors.ExecutorRegistry],
     gate: Optional[Callable[..., Any]],
     activation_gate: Optional[Callable[..., Any]],
+    outcome_gate: Optional[Callable[..., Any]],
+    closure_gate: Optional[Callable[..., Any]],
     observed_at: str,
     now: int,
     lane_health: Sequence[jobs_lanes.LaneHealth],
@@ -380,12 +390,22 @@ def dispatch_job_once(
         )
     if executor_registry is None:
         executor_registry = jobs_executors.production_registry()
-    if gate is None or activation_gate is None:
+    if (
+        gate is None
+        or activation_gate is None
+        or outcome_gate is None
+        or closure_gate is None
+    ):
         from hermes_cli import jobs_reliability
 
         gate = gate or jobs_reliability.production_gate
         activation_gate = (
             activation_gate or jobs_reliability.production_completion_gate
+        )
+        outcome_gate = outcome_gate or jobs_reliability.production_outcome_gate
+        closure_gate = (
+            closure_gate
+            or jobs_reliability.production_knowledge_closure_gate
         )
 
     # 7. Build the immutable spec and dispatch via the provider-true seam.
@@ -411,6 +431,8 @@ def dispatch_job_once(
         executor_registry=executor_registry,
         gate=gate,
         activation_gate=activation_gate,
+        outcome_gate=outcome_gate,
+        closure_gate=closure_gate,
         observed_at=observed_at,
         now=now,
         lease_seconds=lease_seconds,

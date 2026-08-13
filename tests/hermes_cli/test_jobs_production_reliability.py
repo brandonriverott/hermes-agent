@@ -70,6 +70,16 @@ def _valid_review_payload(**overrides) -> dict:
             "summary": "I independently verified the candidate.",
             "next_action": "Hermes can continue to the remaining gate.",
         },
+        "outcome_evidence": {
+            "critical_user_journey": "Open the candidate and verify behavior.",
+            "verdict": "PASS",
+            "environment": "isolated test worktree",
+            "checks_run": ["Run the critical user journey."],
+            "observed_behavior": "The expected behavior was observed.",
+            "artifact_digests": ["sha256:" + "7" * 64],
+            "observed_at": 1786233600,
+        },
+        "knowledge_closure": None,
     }
     payload.update(overrides)
     return payload
@@ -687,12 +697,14 @@ def test_reliability_adapter_preserves_provider_and_materializes_evidence(
             status="succeeded",
             commit=commit,
             tests=tuple(_valid_build_payload()["tests"]),
-            review={
+                review={
                 "verdict": "PASS",
                 "finding_type": "none",
                 "findings": [],
-                "checks_run": ["diff"],
-                "raw_output": "review transcript must not be persisted",
+                    "checks_run": ["diff"],
+                    "outcome_evidence": _valid_review_payload()["outcome_evidence"],
+                    "knowledge_closure": None,
+                    "raw_output": "review transcript must not be persisted",
             },
             executor_exit_digest="sha256:" + "1" * 64,
             output_capture_digest="sha256:" + "2" * 64,

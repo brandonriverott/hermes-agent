@@ -144,6 +144,8 @@ def _transition(
         "EVIDENCE_COLLECTING": "handed_off",
         "REVIEWING": "handed_off",
         "VERIFIED": "passed",
+        "OUTCOME_VERIFYING": "handed_off",
+        "OUTCOME_VERIFIED": "passed",
         "COMPLETED": "completed",
         "FAILED": "rejected",
         "BLOCKED": "blocked",
@@ -283,7 +285,9 @@ def test_each_defined_phase_transition_creates_one_ordered_intent(conn, signing_
         ("BUILDING", "EVIDENCE_COLLECTING", "t:testing", 13, None, None),
         ("EVIDENCE_COLLECTING", "REVIEWING", "t:review", 14, None, None),
         ("REVIEWING", "VERIFIED", "t:verified", 15, None, None),
-        ("VERIFIED", "COMPLETED", "t:finished", 16, None, None),
+        ("VERIFIED", "OUTCOME_VERIFYING", "t:outcome", 16, None, None),
+        ("OUTCOME_VERIFYING", "OUTCOME_VERIFIED", "t:proved", 17, None, None),
+        ("OUTCOME_VERIFIED", "COMPLETED", "t:finished", 18, None, None),
     ]
     visible_handoffs = []
     for source, target, key, at, failure_class, blocker_code in steps:

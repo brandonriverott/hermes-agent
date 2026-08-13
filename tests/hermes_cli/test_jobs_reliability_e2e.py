@@ -12,6 +12,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from hermes_cli import jobs_adapter_claude as adapter
+from hermes_cli import jobs_assurance as assurance
 from hermes_cli import jobs_db as jdb
 from hermes_cli import jobs_dispatch as dispatch
 from hermes_cli import jobs_executors
@@ -20,6 +21,7 @@ from hermes_cli import jobs_harness as harness
 from hermes_cli import jobs_lanes
 from hermes_cli import jobs_receipts as receipts
 from hermes_cli import jobs_run
+from hermes_cli import jobs_scorecard
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -86,6 +88,19 @@ class ReliabilityRig:
             name="reliability e2e",
             goal="prove the sequence",
             requested_lane="claude",
+            assurance_contract={
+                "critical_user_journey": "Open the built artifact and confirm its content",
+                "success_metric": "Artifact contains the independently expected value",
+                "outcome_mode": "integration",
+                "verification_steps": ["Read artifact.txt from the candidate worktree"],
+                "max_attempts": 3,
+                "wall_clock_budget_seconds": 3600,
+                "risk_domains": ["none"],
+                "consumers": [],
+                "egress_paths": [],
+                "rollback_behavior": "not applicable",
+                "knowledge_closure_required": False,
+            },
         )
 
         def passed(_probe_input):
@@ -124,6 +139,8 @@ class ReliabilityRig:
         probes=None,
         gate_callback=None,
         activation_callback=None,
+        outcome_callback=None,
+        closure_callback=None,
     ):
         self.clock += 100
         lane_kwargs = {}
@@ -150,6 +167,16 @@ class ReliabilityRig:
                 if activation_callback is None
                 else activation_callback
             ),
+            outcome_gate=(
+                (lambda _context, _execution: None)
+                if outcome_callback is None
+                else outcome_callback
+            ),
+            closure_gate=(
+                (lambda _context, _execution: None)
+                if closure_callback is None
+                else closure_callback
+            ),
             observed_at="2026-08-09T00:00:00Z",
             now=self.clock,
             lease_seconds=60,
@@ -169,6 +196,7 @@ def reliability_rig(tmp_path, monkeypatch):
 
 def _passing_executor(rig):
     def execute(context):
+        provider = context.executor.capitalize()
         subprocess.run(
             [
                 "git",
@@ -256,22 +284,22 @@ def _passing_executor(rig):
             executor_exit_digest=_digest(b"exit:0"),
             output_capture_digest=output_claim.digest,
             builder_handoff={
-                "speaker_role": "Claude Builder",
-                "speaker_executor": "claude",
+                "speaker_role": f"{provider} Builder",
+                "speaker_executor": context.executor,
                 "summary": "I built the candidate.",
                 "next_action": "Verify the recorded artifacts.",
-                "next_owner_role": "Claude Tester",
+                "next_owner_role": f"{provider} Tester",
             },
             tester_handoff={
-                "speaker_role": "Claude Tester",
-                "speaker_executor": "claude",
+                "speaker_role": f"{provider} Tester",
+                "speaker_executor": context.executor,
                 "summary": "I ran the recorded checks.",
                 "next_action": "Review the observed candidate.",
                 "next_owner_role": "Independent Reviewer",
             },
             reviewer_handoff={
                 "speaker_role": "Independent Reviewer",
-                "speaker_executor": "claude",
+                "speaker_executor": context.executor,
                 "summary": "I independently reviewed the candidate.",
                 "next_action": "Authorize completion.",
                 "next_owner_role": "Hermes",
@@ -325,11 +353,40 @@ def _passing_activation(_context, _gate):
     )
 
 
+def _passing_outcome(context, _execution):
+    contract = assurance.AssuranceContract.from_mapping(context.assurance_contract)
+    evidence = assurance.OutcomeEvidence.from_mapping(
+        {
+            "critical_user_journey": contract.critical_user_journey,
+            "verdict": "PASS",
+            "environment": "isolated integration worktree",
+            "checks_run": list(contract.verification_steps),
+            "observed_behavior": "artifact.txt contained verified output",
+            "artifact_digests": [_digest(b"verified output\n")],
+            "observed_at": 1786233600,
+        }
+    )
+    return assurance.verify_outcome(contract, evidence)
+
+
+def _not_applicable_closure(_context, _execution):
+    return assurance.KnowledgeClosureReceipt.from_mapping(
+        {
+            "disposition": "NOT_APPLICABLE",
+            "canonical_note_path": None,
+            "retrieval_confirmed": False,
+            "steward_receipt_digest": _digest(b"no durable knowledge change"),
+        }
+    )
+
+
 def test_provider_free_happy_path_reaches_exact_completed_graph(reliability_rig):
     result = reliability_rig.run(
         _passing_executor(reliability_rig),
         gate_callback=_authoritative_gate(reliability_rig),
         activation_callback=_passing_activation,
+        outcome_callback=_passing_outcome,
+        closure_callback=_not_applicable_closure,
     )
 
     transitions = jdb.list_transitions(
@@ -342,6 +399,8 @@ def test_provider_free_happy_path_reaches_exact_completed_graph(reliability_rig)
         "EVIDENCE_COLLECTING",
         "REVIEWING",
         "VERIFIED",
+        "OUTCOME_VERIFYING",
+        "OUTCOME_VERIFIED",
         "COMPLETED",
     ]
     projection = graph.compute_work_control(reliability_rig.conn, now=999)
@@ -355,6 +414,15 @@ def test_provider_free_happy_path_reaches_exact_completed_graph(reliability_rig)
         result.commit,
     )
     assert jdb.get_job(reliability_rig.conn, reliability_rig.job_id).claimed_by is None
+    report = jobs_scorecard.scorecard_from_connection(
+        reliability_rig.conn, period_start=0, period_end=999
+    )
+    assert (
+        report.jobs_started,
+        report.jobs_settled,
+        report.outcomes_verified,
+        report.false_complete,
+    ) == (1, 1, 1, 0)
 
 
 def test_nonpassing_reviewer_handoff_never_reaches_verified(reliability_rig):
@@ -517,6 +585,8 @@ def test_lane_aware_happy_path_cleans_registered_worktree_before_idle(
         _passing_executor(reliability_rig),
         gate_callback=_authoritative_gate(reliability_rig),
         activation_callback=_passing_activation,
+        outcome_callback=_passing_outcome,
+        closure_callback=_not_applicable_closure,
     )
     placement = jdb.latest_lane_placement_for_attempt(
         reliability_rig.conn, result.attempt_id
@@ -530,6 +600,39 @@ def test_lane_aware_happy_path_cleans_registered_worktree_before_idle(
     assert not Path(placement["registered_worktree"]).exists()
     assert auth_sentinel.read_text(encoding="utf-8") == "do not remove"
     assert jdb.active_lane_load(reliability_rig.conn) == {}
+
+
+def test_unable_to_verify_outcome_blocks_completion(reliability_rig):
+    def unable(context, _execution):
+        contract = assurance.AssuranceContract.from_mapping(context.assurance_contract)
+        evidence = assurance.OutcomeEvidence.from_mapping(
+            {
+                "critical_user_journey": contract.critical_user_journey,
+                "verdict": "UNABLE_TO_VERIFY",
+                "environment": "staging",
+                "checks_run": list(contract.verification_steps),
+                "observed_behavior": "Staging was unreachable",
+                "artifact_digests": [_digest(b"staging unavailable")],
+                "observed_at": 1786233600,
+            }
+        )
+        return assurance.verify_outcome(contract, evidence)
+
+    result = reliability_rig.run(
+        _passing_executor(reliability_rig),
+        gate_callback=_authoritative_gate(reliability_rig),
+        outcome_callback=unable,
+        closure_callback=_not_applicable_closure,
+        activation_callback=_passing_activation,
+    )
+
+    states = [
+        row["target_state"]
+        for row in jdb.list_transitions(reliability_rig.conn, reliability_rig.job_id)
+    ]
+    assert result.state == "BLOCKED"
+    assert states[-2:] == ["OUTCOME_VERIFYING", "BLOCKED"]
+    assert "COMPLETED" not in states
 
 
 def test_ssh_preflight_block_has_no_claim_or_attempt(reliability_rig):
@@ -671,7 +774,7 @@ def test_forged_done_never_reaches_verified(reliability_rig):
     assert "VERIFIED" not in states
 
 
-def _provider_failure(evidence: bytes):
+def _provider_failure(evidence: bytes, *, proves_progress: bool = True):
     digest = _digest(evidence)
 
     def execute(context):
@@ -683,6 +786,12 @@ def _provider_failure(evidence: bytes):
             executor_exit_digest=digest,
             output_capture_digest=digest,
             failure_reason_code="PROVIDER_OUTAGE",
+            response_change_digest=(
+                _digest(b"changed response:" + evidence) if proves_progress else None
+            ),
+            result_delta_digest=(
+                _digest(b"new measured result:" + evidence) if proves_progress else None
+            ),
         )
 
     return execute
@@ -697,16 +806,31 @@ def test_identical_provider_evidence_is_not_retried(reliability_rig):
     assert second.reason == "RETRY_REJECTED_NO_NEW_EVIDENCE"
 
 
-def test_fourth_execution_is_blocked_by_retry_limit(reliability_rig):
+def test_provider_retry_without_progress_proof_settles_blocked(reliability_rig):
+    result = reliability_rig.run(
+        _provider_failure(b"unexplained retry", proves_progress=False)
+    )
+
+    assert (result.state, result.retry_action, result.reason) == (
+        "BLOCKED",
+        "BLOCKED",
+        "RETRY_MISSING_RESPONSE_CHANGE",
+    )
+    report = jobs_scorecard.scorecard_from_connection(
+        reliability_rig.conn, period_start=0, period_end=999
+    )
+    assert report.retry_without_progress == 1
+
+
+def test_contract_attempt_ceiling_blocks_the_third_failed_execution(reliability_rig):
     results = [
         reliability_rig.run(_provider_failure(f"evidence-{index}".encode()))
-        for index in range(1, 5)
+        for index in range(1, 4)
     ]
 
-    assert [(item.state, item.retry_action) for item in results[:3]] == [
-        ("FAILED", "RETRY"),
+    assert [(item.state, item.retry_action) for item in results[:2]] == [
         ("FAILED", "RETRY"),
         ("FAILED", "RETRY"),
     ]
-    assert results[3].state == "BLOCKED"
-    assert results[3].reason == "RETRY_LIMIT"
+    assert results[2].state == "BLOCKED"
+    assert results[2].reason == "BUDGET_EXHAUSTED"

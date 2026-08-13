@@ -90,6 +90,8 @@ _ACTIVE_PHASES = frozenset({
     "EVIDENCE_COLLECTING",
     "REVIEWING",
     "VERIFIED",
+    "OUTCOME_VERIFYING",
+    "OUTCOME_VERIFIED",
 })
 _ALLOWED_TRANSITIONS = frozenset({
     ("INTAKE", "QUEUED", "started"),
@@ -99,6 +101,12 @@ _ALLOWED_TRANSITIONS = frozenset({
     ("BUILDING", "EVIDENCE_COLLECTING", "handed_off"),
     ("EVIDENCE_COLLECTING", "REVIEWING", "handed_off"),
     ("REVIEWING", "VERIFIED", "passed"),
+    ("VERIFIED", "OUTCOME_VERIFYING", "handed_off"),
+    ("OUTCOME_VERIFYING", "OUTCOME_VERIFIED", "passed"),
+    ("OUTCOME_VERIFIED", "COMPLETED", "completed"),
+    ("OUTCOME_VERIFIED", "COMPLETED", "activated"),
+    # Read-only compatibility for receipts created before outcome states were
+    # inserted into the durable graph. New graph writes cannot use this edge.
     ("VERIFIED", "COMPLETED", "completed"),
     ("VERIFIED", "COMPLETED", "activated"),
     *((phase, "FAILED", "rejected") for phase in _ACTIVE_PHASES),

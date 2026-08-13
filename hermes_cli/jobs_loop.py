@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Mapping, Sequence
 
+from hermes_cli import jobs_assurance
 from hermes_cli import jobs_receipts
 from hermes_constants import get_hermes_home
 
@@ -167,6 +168,8 @@ def decide_retry(
     prior_failure_digest: str | None = None,
     changed_evidence_digest: str | None = None,
     what_changed: str | None = None,
+    response_change_digest: str | None = None,
+    result_delta_digest: str | None = None,
     policy: RetryPolicy = RetryPolicy(),
 ) -> RetryDecision:
     """Return a deterministic decision without mutating attempt state."""
@@ -177,6 +180,18 @@ def decide_retry(
         return RetryDecision("HUMAN_ACTION", f"{failure_class}_REQUIRES_HUMAN", 0)
     if failure_class not in {"PROVIDER", "INFRA_FAILURE", "TASK_FAILURE"}:
         return RetryDecision("BLOCKED", "UNSUPPORTED_FAILURE_CLASS", 0)
+    if what_changed is None and (
+        response_change_digest is not None
+        or result_delta_digest is not None
+        or changed_evidence_digest is not None
+    ):
+        progress = jobs_assurance.assess_retry_progress(
+            prior_failure=prior_failure_digest,
+            response_change=response_change_digest,
+            result_delta=result_delta_digest,
+        )
+        if progress.action != "RETRY":
+            return RetryDecision("BLOCKED", progress.reason_code, 0)
     # Keep the original API usable for old callers, while requiring the
     # stronger three-part correction proof whenever a dispatcher supplies it.
     if any(
@@ -203,6 +218,16 @@ def decide_retry(
         return RetryDecision("BLOCKED", "RETRY_REJECTED_NO_NEW_EVIDENCE", 0)
     if len(history) >= policy.max_attempts:
         return RetryDecision("BLOCKED", "RETRY_LIMIT", 0)
+    if what_changed is not None and (
+        response_change_digest is not None or result_delta_digest is not None
+    ):
+        progress = jobs_assurance.assess_retry_progress(
+            prior_failure=prior_failure_digest,
+            response_change=response_change_digest,
+            result_delta=result_delta_digest,
+        )
+        if progress.action != "RETRY":
+            return RetryDecision("BLOCKED", progress.reason_code, 0)
     attempt_count = len(history) + 1
     if failure_class == "TASK_FAILURE":
         backoff = 0

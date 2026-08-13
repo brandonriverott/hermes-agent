@@ -406,6 +406,9 @@ def test_retry_evidence_is_persisted_before_duplicate_evidence_is_rejected(conn)
         parent_attempt_id=None,
         ordinal=1,
         evidence_digest="sha256:" + "d" * 64,
+        prior_failure_digest="sha256:" + "a" * 64,
+        response_change_digest="sha256:" + "b" * 64,
+        result_delta_digest="sha256:" + "c" * 64,
         decision="RETRY",
         reason_code="NEW_EVIDENCE",
         created_at=4,
@@ -415,6 +418,7 @@ def test_retry_evidence_is_persisted_before_duplicate_evidence_is_rejected(conn)
     duplicate = jdb.record_retry_decision(conn, write)
 
     assert accepted["decision"] == "RETRY"
+    assert accepted["response_change_digest"] == "sha256:" + "b" * 64
     assert (duplicate["decision"], duplicate["reason_code"]) == (
         "BLOCKED",
         "RETRY_REJECTED_NO_NEW_EVIDENCE",
@@ -431,6 +435,9 @@ def test_retry_ordinal_cannot_be_reused_with_different_evidence(conn):
         parent_attempt_id=None,
         ordinal=1,
         evidence_digest="sha256:" + "d" * 64,
+        prior_failure_digest="sha256:" + "a" * 64,
+        response_change_digest="sha256:" + "b" * 64,
+        result_delta_digest="sha256:" + "c" * 64,
         decision="RETRY",
         reason_code="NEW_EVIDENCE",
         created_at=4,
