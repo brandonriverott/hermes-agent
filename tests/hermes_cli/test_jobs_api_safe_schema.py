@@ -51,7 +51,8 @@ def test_codex_command_uses_api_safe_schema_file(tmp_path):
     assert not list(_banned(written))
 
 
-def test_claude_command_keeps_strict_schema_text(tmp_path):
+def test_claude_command_gets_api_safe_schema_text(tmp_path):
+    """claude 2.1.197 silently disables structured output on a "$schema" key."""
     context = SimpleNamespace(model="claude-opus-5", worktree=tmp_path, effort="max")
     command = jr._provider_command(
         "claude",
@@ -60,7 +61,9 @@ def test_claude_command_keeps_strict_schema_text(tmp_path):
         result_path=tmp_path / "build-result.json",
     )
     schema_text = command[command.index("--json-schema") + 1]
-    assert list(_banned(json.loads(schema_text)))
+    parsed = json.loads(schema_text)
+    assert not list(_banned(parsed))
+    assert "$schema" not in parsed
 
 
 def test_default_process_runner_actually_runs_a_process(tmp_path):

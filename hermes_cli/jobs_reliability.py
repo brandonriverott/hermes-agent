@@ -987,7 +987,7 @@ def _api_safe_schema(value: object) -> object:
         return {
             ("anyOf" if key == "oneOf" else key): _api_safe_schema(item)
             for key, item in value.items()
-            if key != "allOf"
+            if key not in ("allOf", "$schema")
         }
     if isinstance(value, list):
         return [_api_safe_schema(item) for item in value]
@@ -1079,7 +1079,13 @@ def _provider_command(
         "--output-format",
         "json",
         "--json-schema",
-        schema.read_text(encoding="utf-8"),
+        # The same API-safe view codex gets: claude 2.1.197 silently disables
+        # structured output when the schema carries a "$schema" meta-key (and
+        # the model APIs refuse allOf/oneOf), leaving the envelope without
+        # structured_output and failing every build as HANDOFF_INCOMPLETE.
+        json.dumps(
+            _api_safe_schema(json.loads(schema.read_text(encoding="utf-8")))
+        ),
     ]
 
 
