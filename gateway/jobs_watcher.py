@@ -426,19 +426,52 @@ def _append_desktop_message(
         raise ValueError("desktop Jobs handoff has no origin session id")
     db_path = Path(state_db) if state_db is not None else get_hermes_home() / "state.db"
     state = SessionDB(db_path=db_path)
+    display_metadata = {
+        "source": "jobs",
+        "job_id": str(job_id or ""),
+        "delivery_key": str(delivery_key or ""),
+        "notification_kind": "terminal",
+    }
     try:
-        _row_id, target = state.append_message_to_compression_tip(
-            session_id,
+        tip_append = getattr(state, "append_message_to_compression_tip", None)
+        if tip_append is not None:
+            _row_id, target = tip_append(
+                session_id,
+                "assistant",
+                message,
+                timestamp=time.time(),
+                display_kind="job_notification",
+                display_metadata=display_metadata,
+            )
+            return target
+        # 2026-08-14: this module evolved against the mutable checkout, whose
+        # SessionDB grew ``append_message_to_compression_tip``. The release
+        # branch's SessionDB has not; committing the watcher into a release
+        # (which is what keeps it alive across cuts) therefore met an engine
+        # missing that method, and every delivery raised AttributeError. Do the
+        # same job with the primitives both trees do have: follow the
+        # compression lineage, refuse anything not live, append once.
+        #
+        # The narrow race the richer method retries — compression rotating the
+        # row between resolution and append — is not retried here. It does not
+        # need to be: the caller releases the delivery claim on any exception
+        # and the next tick, ten seconds later, resolves the new tip.
+        target = state.get_compression_tip(session_id) or session_id
+        row = state.get_session(target)
+        if row is None:
+            raise ValueError(f"origin session does not exist: {session_id}")
+        if row.get("ended_at") is not None:
+            raise ValueError(
+                f"origin session is not live: {target} "
+                f"({row.get('end_reason') or 'ended'})"
+            )
+        state.append_message(
+            target,
             "assistant",
             message,
             timestamp=time.time(),
             display_kind="job_notification",
-            display_metadata={
-                "source": "jobs",
-                "job_id": str(job_id or ""),
-                "delivery_key": str(delivery_key or ""),
-                "notification_kind": "terminal",
-            },
+            display_metadata=display_metadata,
         )
         return target
     finally:
