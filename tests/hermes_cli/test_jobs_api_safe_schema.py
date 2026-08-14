@@ -83,3 +83,17 @@ def test_default_process_runner_actually_runs_a_process(tmp_path):
     assert result.returncode == 0
     assert not result.timed_out
     assert (tmp_path / "out.txt").read_bytes() == b"runner smoke\n"
+
+
+def test_coercion_reimposes_conditionals_on_benign_decoration():
+    succeeded = {"outcome": "succeeded", "failure_class": "implementation", "reason": "all good"}
+    fixed = jr._coerce_api_schema_result("codex", "build", succeeded)
+    assert fixed["failure_class"] is None and fixed["reason"] is None
+    # A PASS review carrying findings is self-contradiction, never coerced.
+    passed = {"verdict": "PASS", "finding_type": "defect", "findings": [{"x": 1}]}
+    assert jr._coerce_api_schema_result("codex", "review", passed) == passed
+    # Real disagreements pass through untouched and fail strict normalization.
+    failed = {"outcome": "failed", "failure_class": None, "reason": None}
+    assert jr._coerce_api_schema_result("codex", "build", failed) == failed
+    # Claude results are never touched.
+    assert jr._coerce_api_schema_result("claude", "build", succeeded) == succeeded

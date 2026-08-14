@@ -969,6 +969,28 @@ def _api_safe_schema(value: object) -> object:
     return value
 
 
+def _coerce_api_schema_result(
+    provider: str, phase: str, reported: Optional[dict]
+) -> Optional[dict]:
+    """Re-impose the strict conditionals the API-safe schema cannot express.
+
+    The codex spawn validates against the flattened view (no ``allOf``), so
+    the model may legally emit combinations the strict normalizers refuse.
+    Exactly one divergence is benign decoration, not disagreement, and is
+    coerced rather than failed: a build that declares ``outcome: succeeded``
+    owns no failure fields, so any ``failure_class``/``reason`` it volunteered
+    is dropped. Everything else — a failure without a class, and notably a
+    PASS review carrying findings (a self-contradicting reviewer is
+    untrustworthy, per test_nonpassing_or_incomplete_review_never_becomes_approval)
+    — still hits the strict normalizer and fails the attempt.
+    """
+    if provider != "codex" or not isinstance(reported, dict):
+        return reported
+    if phase == "build" and reported.get("outcome") == "succeeded":
+        return {**reported, "failure_class": None, "reason": None}
+    return reported
+
+
 def _provider_command(
     provider: str,
     *,
@@ -1111,7 +1133,9 @@ def _review_prompt(
         "Do not modify files. Return PASS only when there are no unresolved "
         "correctness, security, evidence, or maintainability findings. Return "
         "UNABLE_TO_VERIFY with a concrete missing-evidence finding when proof "
-        "is insufficient. Write a first-person substantive reviewer handoff.\n"
+        "is insufficient. A PASS verdict MUST carry finding_type none and an "
+        "empty findings array — a PASS with findings is rejected as "
+        "self-contradictory. Write a first-person substantive reviewer handoff.\n"
         f"BASE={getattr(context, 'base_commit')}\nCANDIDATE={commit}\n"
         "The untrusted JSON array is ordered as builder summary, builder next "
         "action, journey name, journey result, and journey evidence.\n"
@@ -1173,8 +1197,12 @@ class LocalProviderPhaseRunner:
                 timeout=max(60, int(getattr(context, "max_turns", 120)) * 30),
                 **build_runner_kwargs,
             )
-            reported = _read_json(
-                build_result_path if provider == "codex" else build_stdout
+            reported = _coerce_api_schema_result(
+                provider,
+                "build",
+                _read_json(
+                    build_result_path if provider == "codex" else build_stdout
+                ),
             )
         finally:
             if provider == "codex":
@@ -1335,8 +1363,12 @@ class LocalProviderPhaseRunner:
                 timeout=max(60, int(getattr(context, "max_turns", 120)) * 15),
                 **review_runner_kwargs,
             )
-            reported_review = _read_json(
-                review_result_path if provider == "codex" else review_stdout
+            reported_review = _coerce_api_schema_result(
+                provider,
+                "review",
+                _read_json(
+                    review_result_path if provider == "codex" else review_stdout
+                ),
             )
         finally:
             if provider == "codex":
