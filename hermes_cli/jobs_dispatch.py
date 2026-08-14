@@ -1325,10 +1325,16 @@ def dispatch_once(
                 force_blocked=True,
             )
     if execution.status != "succeeded":
+        failure_reason_code = execution.failure_reason_code
+        if (
+            failure_reason_code == "NO_CANDIDATE_COMMIT"
+            and execution.builder_handoff is not None
+        ):
+            failure_reason_code = "IMPLEMENTATION_FAILED"
         return fail(
             jobs_loop.FailureSignal(
                 http_status=execution.http_status,
-                reason_code=execution.failure_reason_code,
+                reason_code=failure_reason_code,
                 safety_gate=execution.safety_gate,
                 stage="executor",
             ),

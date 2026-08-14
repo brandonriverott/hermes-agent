@@ -1054,7 +1054,7 @@ def _provider_command(
         ):
             command.extend(["--add-dir", str(metadata_dir)])
         return [*command, "-"]
-    return [
+    command = [
         "claude",
         "-p",
         "--model",
@@ -1064,12 +1064,31 @@ def _provider_command(
         "--permission-mode",
         "acceptEdits" if phase == "build" else "plan",
         "--safe-mode",
+    ]
+    if phase == "build":
+        command.extend([
+            "--allowedTools",
+            "Bash(git add:*) Bash(git commit:*) Bash(git status:*) "
+            "Bash(git diff:*) Bash(git log:*) Bash(pnpm:*) Bash(npm:*) "
+            "Bash(npx:*) Bash(node:*) Bash(tsc:*) Bash(vitest:*) "
+            "Bash(python3:*) Bash(pytest:*)",
+        ])
+    return [
+        *command,
         "--no-session-persistence",
         "--output-format",
         "json",
         "--json-schema",
         schema.read_text(encoding="utf-8"),
     ]
+
+
+def _claude_auth_failure(reported: object) -> bool:
+    return (
+        isinstance(reported, dict)
+        and reported.get("is_error") is True
+        and "not logged in" in str(reported.get("result", "")).lower()
+    )
 
 
 def _build_prompt(context: object) -> bytes:
@@ -1247,6 +1266,16 @@ class LocalProviderPhaseRunner:
             f"{provider}:build:{build.returncode}:{build.timed_out}".encode()
         )
         output_digest = _sha256(captured)
+        if provider == "claude" and _claude_auth_failure(reported):
+            return PhaseResult(
+                status="failed",
+                commit=None,
+                tests=(),
+                review={},
+                executor_exit_digest=exit_digest,
+                output_capture_digest=output_digest,
+                failure_reason_code="AUTH_REQUIRED",
+            )
         if build.returncode != 0 or build.timed_out or not isinstance(reported, dict):
             return PhaseResult(
                 status="failed",
@@ -1329,10 +1358,12 @@ class LocalProviderPhaseRunner:
             return PhaseResult(
                 status="failed",
                 commit=commit,
-                tests=(),
+                tests=tests,
                 review={},
                 executor_exit_digest=exit_digest,
                 output_capture_digest=output_digest,
+                build_handoff=build_handoff,
+                critical_user_journey=journey,
                 failure_reason_code="NO_CANDIDATE_COMMIT",
             )
         if tests is None:

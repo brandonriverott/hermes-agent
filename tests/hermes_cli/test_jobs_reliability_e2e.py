@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import platform
 import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -20,6 +22,7 @@ from hermes_cli import jobs_graph as graph
 from hermes_cli import jobs_harness as harness
 from hermes_cli import jobs_lanes
 from hermes_cli import jobs_receipts as receipts
+from hermes_cli import jobs_reliability
 from hermes_cli import jobs_run
 from hermes_cli import jobs_scorecard
 
@@ -33,6 +36,31 @@ import jobs_evidence_gate as evidence_gate  # noqa: E402
 
 def _digest(value: bytes) -> str:
     return receipts.digest_bytes(value)
+
+
+def test_claude_build_command_allows_verification_and_commit_but_review_does_not(
+    tmp_path,
+):
+    context = SimpleNamespace(
+        model="claude-opus-5", effort="max", worktree=tmp_path
+    )
+
+    build = jobs_reliability._provider_command(
+        "claude", phase="build", context=context, result_path=tmp_path / "build"
+    )
+    review = jobs_reliability._provider_command(
+        "claude", phase="review", context=context, result_path=tmp_path / "review"
+    )
+
+    assert "--safe-mode" in build
+    assert build[build.index("--allowedTools") + 1] == (
+        "Bash(git add:*) Bash(git commit:*) Bash(git status:*) "
+        "Bash(git diff:*) Bash(git log:*) Bash(pnpm:*) Bash(npm:*) "
+        "Bash(npx:*) Bash(node:*) Bash(tsc:*) Bash(vitest:*) "
+        "Bash(python3:*) Bash(pytest:*)"
+    )
+    assert "--allowedTools" not in review
+    assert review[review.index("--permission-mode") + 1] == "plan"
 
 
 class ReliabilityRig:
@@ -798,6 +826,108 @@ def _provider_failure(evidence: bytes, *, proves_progress: bool = True):
         )
 
     return execute
+
+
+def test_local_claude_runner_maps_not_logged_in_result_to_authentication(
+    reliability_rig, monkeypatch
+):
+    host = "mac" if platform.system().lower() == "darwin" else "pc"
+    lane_root = reliability_rig.root / f"claude-{host}-1"
+    for child in ("auth", "worktrees", "handoffs"):
+        (lane_root / child).mkdir(parents=True)
+    context = SimpleNamespace(
+        repository=reliability_rig.repo,
+        base_commit=reliability_rig.base,
+        branch="jobs/auth-result",
+        worktree=lane_root / "worktrees" / "auth-result",
+        lane_root=lane_root,
+        lane_id=lane_root.name,
+        attempt_id="a_auth_result",
+        requested_lane="claude",
+        executor="claude",
+        specialist="claude-builder",
+        model="claude-opus-5",
+        effort="max",
+        max_turns=1,
+        goal="classify the provider result",
+    )
+    monkeypatch.setattr(
+        jobs_reliability.shutil, "which", lambda *args, **kwargs: "/bin/claude"
+    )
+
+    def process_runner(argv, *, stdout_path, stderr_path, **kwargs):
+        stdout_path.write_text(
+            json.dumps(
+                {"is_error": True, "result": "Not logged in · run /login"}
+            ),
+            encoding="utf-8",
+        )
+        stderr_path.touch()
+        return jobs_reliability.ProcessResult(1)
+
+    phase = jobs_reliability.LocalProviderPhaseRunner(
+        process_runner=process_runner
+    )("claude", context)
+
+    assert phase.failure_reason_code == "AUTH_REQUIRED"
+
+
+def test_not_logged_in_executor_failure_requires_authentication(reliability_rig):
+    def executor(context):
+        return adapter.ReliabilityExecution(
+            status="failed",
+            commit=None,
+            worktree=context.worktree,
+            artifacts=(),
+            executor_exit_digest=_digest(b"not logged in exit"),
+            output_capture_digest=_digest(b"not logged in output"),
+            failure_reason_code="AUTH_REQUIRED",
+        )
+
+    result = reliability_rig.run(executor)
+
+    assert (result.state, result.failure_class, result.reason) == (
+        "BLOCKED",
+        "AUTH_INFRA",
+        "AUTH_REQUIRED",
+    )
+    assert result.retry_action == "HUMAN_ACTION"
+
+
+def test_honest_report_without_commit_is_implementation_and_keeps_summary(
+    reliability_rig,
+):
+    summary = "I completed the implementation but could not create the commit."
+
+    def executor(context):
+        return adapter.ReliabilityExecution(
+            status="failed",
+            commit=None,
+            worktree=context.worktree,
+            artifacts=(),
+            executor_exit_digest=_digest(b"honest report exit"),
+            output_capture_digest=_digest(b"honest report output"),
+            builder_handoff={
+                "speaker_role": "Claude Builder",
+                "speaker_executor": "claude",
+                "summary": summary,
+                "next_action": "Grant commit permission and retry.",
+                "next_owner_role": "Claude Tester",
+            },
+            failure_reason_code="NO_CANDIDATE_COMMIT",
+        )
+
+    result = reliability_rig.run(executor)
+    transition = jdb.list_transitions(
+        reliability_rig.conn, reliability_rig.job_id
+    )[-1]
+
+    assert (result.state, result.failure_class, result.reason) == (
+        "FAILED",
+        "TASK_FAILURE",
+        "IMPLEMENTATION_FAILED",
+    )
+    assert transition["handoff"]["summary"] == summary
 
 
 def test_identical_provider_evidence_is_not_retried(reliability_rig):
