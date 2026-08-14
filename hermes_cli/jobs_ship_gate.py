@@ -41,7 +41,7 @@ from typing import Optional
 # Bumped whenever the truth table itself changes. Both engines report it, and
 # the dual-engine selftest asserts they agree — a mismatch means one side is
 # running a stale vendored copy.
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 
 # Ship evidence, not a note. Only the activation writer may mint this kind.
 RESERVED_RECEIPT_KIND = "jobs-activation"
@@ -51,6 +51,72 @@ RESERVED_RECEIPT_KIND = "jobs-activation"
 SEAL_NOOP = "__seal_noop__"
 
 _COMPLETE = ("finished", "complete")
+
+
+# ── a git we can believe ─────────────────────────────────────────────────────
+#
+# 2026-08-14 adversarial review. Three separate ways to make these probes lie,
+# all of them reachable by the builder lane, which by construction has write
+# access to the repository it builds in and controls its own environment:
+#
+#   N1  ``git rev-parse --verify main`` follows gitrevisions disambiguation,
+#       where ``$GIT_DIR/main``, ``refs/main`` and ``refs/tags/main`` ALL
+#       outrank ``refs/heads/main``. One ``git tag main <sha>`` and an unmerged
+#       commit reads as merged. This was demonstrated end-to-end through
+#       ``hermes jobs activate``. Every ref is now fully qualified.
+#   N2  ``git -C <dir>`` changes directory; it does NOT override ``GIT_DIR``.
+#       One inherited environment variable pointed both probes at an entirely
+#       different repository. The environment is now built from scratch.
+#   P2  ``git`` was resolved by bare name, so a shadowing binary earlier on
+#       PATH answered instead. PATH is now fixed, and the binary is resolved
+#       once against it.
+#
+# Fail-closed throughout: if git cannot be found on the trusted PATH, the
+# probes return ``None``, which the gate treats exactly like "not merged".
+
+_MAIN_REF = "refs/heads/main"
+
+_TRUSTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+
+
+def _git_env() -> dict:
+    """A minimal environment: no GIT_* inheritance, no caller PATH.
+
+    Everything a git subprocess could read to change which repository it
+    answers about — GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_OBJECT_*,
+    GIT_CONFIG*, GIT_ALTERNATE_* — is simply absent rather than blocklisted,
+    because a blocklist is only ever as current as the last time somebody read
+    the git manual. HOME is pinned to a nonexistent path so no user-level
+    gitconfig applies either.
+    """
+    return {
+        "PATH": _TRUSTED_PATH,
+        "HOME": "/nonexistent",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LC_ALL": "C",
+    }
+
+
+def _git(repository: str, *args, timeout: int = 10):
+    """Run one git command in ``repository``, or ``None`` if it cannot be run."""
+    import shutil
+
+    binary = shutil.which("git", path=_TRUSTED_PATH)
+    if not binary:
+        return None
+    try:
+        return subprocess.run(
+            [binary, "-C", repository, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=_git_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 # ── evidence helpers ─────────────────────────────────────────────────────────
@@ -114,19 +180,20 @@ def commit_changes_require_migration(
     requires the activation receipt to state ``applied`` or ``not_required``;
     when Git evidence *is* available, a migration-bearing build may only use
     ``applied``.
+
+    2026-08-14 adversarial review (N5): when ``base_commit == commit_sha`` the
+    diff is empty *by construction*, so a migration-bearing commit passed as
+    ``not_required`` merely by recording its own sha as the base — and five of
+    the live completed Jobs already carry that shape. An empty-by-definition
+    diff is not evidence of anything; it is the absence of evidence, which this
+    gate spells ``None``.
     """
     if not repository or not os.path.isdir(repository):
         return None
-    try:
-        proc = subprocess.run(
-            ["git", "-C", repository, "diff", "--name-only", base_commit, commit_sha],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
+    if not base_commit or not commit_sha or base_commit == commit_sha:
         return None
-    if proc.returncode != 0:
+    proc = _git(repository, "diff", "--name-only", base_commit, commit_sha)
+    if proc is None or proc.returncode != 0:
         return None
     files = [line.strip().lower() for line in proc.stdout.splitlines() if line.strip()]
     return any(
@@ -136,23 +203,19 @@ def commit_changes_require_migration(
 
 
 def commit_is_on_main(repository: str, commit_sha: str) -> Optional[bool]:
-    """Bounded local merge proof; ``None`` means proof was unavailable."""
+    """Bounded local merge proof; ``None`` means proof was unavailable.
+
+    The ref is fully qualified. ``main`` alone resolves through gitrevisions
+    disambiguation, where a tag or a loose ref of that name wins over the
+    branch — see the note on :func:`_git`.
+    """
     if not repository or not os.path.isdir(repository):
         return None
-    try:
-        has_main = subprocess.run(
-            ["git", "-C", repository, "rev-parse", "--verify", "-q", "main"],
-            capture_output=True,
-            timeout=10,
-        ).returncode == 0
-        if not has_main:
-            return None
-        proc = subprocess.run(
-            ["git", "-C", repository, "merge-base", "--is-ancestor", commit_sha, "main"],
-            capture_output=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
+    verified = _git(repository, "rev-parse", "--verify", "-q", _MAIN_REF)
+    if verified is None or verified.returncode != 0:
+        return None
+    proc = _git(repository, "merge-base", "--is-ancestor", commit_sha, _MAIN_REF)
+    if proc is None:
         return None
     if proc.returncode == 0:
         return True

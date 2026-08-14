@@ -4024,6 +4024,21 @@ def _insert_reliability_receipt_locked(
     blob: str,
     created_at: int,
 ) -> None:
+    # 2026-08-14 adversarial review (P1). This is the release engine's fourth
+    # receipt door — reached from record_preflight and record_transition — and
+    # it was the only one that never checked ``kind``. ``_receipt_blob``
+    # validates exactly one field (receipt_id) and then stores the whole
+    # mapping, and the activation matcher ignores extra keys, so a single dict
+    # could be both a valid preflight envelope and a complete jobs-activation
+    # receipt bound to the right job and attempt. Demonstrated: forge, then
+    # transition to complete on a commit with no honest activation.
+    try:
+        payload = json.loads(blob)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+    reserved = jsg.reserved_kind_refusal(payload)
+    if reserved is not None:
+        raise ValueError(reserved)
     existing = conn.execute(
         "SELECT * FROM job_receipts WHERE id = ?", (receipt_id,)
     ).fetchone()
