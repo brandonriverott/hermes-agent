@@ -98,8 +98,9 @@ def test_coercion_reimposes_conditionals_on_benign_decoration():
     # Real disagreements pass through untouched and fail strict normalization.
     failed = {"outcome": "failed", "failure_class": None, "reason": None}
     assert jr._coerce_api_schema_result("codex", "build", failed) == failed
-    # Claude results are never touched.
-    assert jr._coerce_api_schema_result("claude", "build", succeeded) == succeeded
+    # Claude now receives the same API-safe schema, so it coerces too.
+    fixed = jr._coerce_api_schema_result("claude", "build", succeeded)
+    assert fixed["failure_class"] is None and fixed["reason"] is None
 
 
 def test_sanitizer_keeps_evidence_with_ansi_colors(tmp_path):

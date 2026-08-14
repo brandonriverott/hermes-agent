@@ -1009,7 +1009,7 @@ def _coerce_api_schema_result(
     untrustworthy, per test_nonpassing_or_incomplete_review_never_becomes_approval)
     — still hits the strict normalizer and fails the attempt.
     """
-    if provider != "codex" or not isinstance(reported, dict):
+    if not isinstance(reported, dict):
         return reported
     if phase == "build" and reported.get("outcome") == "succeeded":
         return {**reported, "failure_class": None, "reason": None}
