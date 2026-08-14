@@ -97,3 +97,16 @@ def test_coercion_reimposes_conditionals_on_benign_decoration():
     assert jr._coerce_api_schema_result("codex", "build", failed) == failed
     # Claude results are never touched.
     assert jr._coerce_api_schema_result("claude", "build", succeeded) == succeeded
+
+
+def test_sanitizer_keeps_evidence_with_ansi_colors(tmp_path):
+    """A pytest transcript with color codes must survive sanitization."""
+    noisy = tmp_path / "build-stdout.json"
+    noisy.write_bytes(
+        b'{"evidence": "\x1b[32m2 passed\x1b[0m in 0.01s"}\n'
+        b'{"more": "plain line"}\n'
+    )
+    body = jr._sanitize_phase_file(noisy)
+    assert b"redacted" not in body
+    assert b"2 passed" in body
+    assert b"\x1b" not in body

@@ -443,10 +443,35 @@ def _valid_phase_metadata(
     )
 
 
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])"
+)
+
+
+def _strip_terminal_noise(text: str) -> str:
+    """Remove ANSI escapes and stray control characters, keeping the words.
+
+    Provider streams embed real tool transcripts (pytest, rg) whose color
+    codes are category-Cc control characters. Screening the raw text made a
+    single ESC byte redact the ENTIRE evidence file to
+    "[redacted unsafe worker output]", which blinded every diagnosis and let
+    the reviewer refuse for missing evidence. Strip the noise first; the
+    unsafe screen then judges only what a human would actually read.
+    """
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    return "".join(
+        character
+        for character in text
+        if character in "\r\n\t"
+        or unicodedata.category(character) not in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+    )
+
+
 def _sanitize_phase_file(path: Path) -> bytes:
     text = jobs_execution.bounded_text(path)
     if text is None:
         return b""
+    text = _strip_terminal_noise(text)
     screening_text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
     sanitized = (
         "[redacted unsafe worker output]"
