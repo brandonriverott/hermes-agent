@@ -61,3 +61,25 @@ def test_claude_command_keeps_strict_schema_text(tmp_path):
     )
     schema_text = command[command.index("--json-schema") + 1]
     assert list(_banned(json.loads(schema_text)))
+
+
+def test_default_process_runner_actually_runs_a_process(tmp_path):
+    """The runner must survive a real spawn.
+
+    Every unit test stubs the process runner, which let it ship calling
+    ``time.monotonic()`` without importing ``time`` — every real spawn
+    crashed the engine one line after Popen and orphaned the child as
+    PROCESS_CRASHED. This is the one test that runs the real thing.
+    """
+    result = jr._default_process_runner(
+        ["/bin/cat"],
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin"},
+        prompt=b"runner smoke\n",
+        stdout_path=tmp_path / "out.txt",
+        stderr_path=tmp_path / "err.txt",
+        timeout=30,
+    )
+    assert result.returncode == 0
+    assert not result.timed_out
+    assert (tmp_path / "out.txt").read_bytes() == b"runner smoke\n"

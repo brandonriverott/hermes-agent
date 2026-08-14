@@ -14,6 +14,7 @@ import platform
 import posixpath
 import re
 import shutil
+import time
 import subprocess
 import hashlib
 import tempfile
