@@ -944,6 +944,30 @@ def _codex_git_metadata_dirs(worktree: Path) -> tuple[Path, ...]:
     return tuple(locations)
 
 
+def _api_safe_schema(value: object) -> object:
+    """Return a copy of ``value`` acceptable to OpenAI structured outputs.
+
+    The schema files on disk are the strict contract: the engine validates
+    results against them with full JSON Schema, so their ``allOf``
+    conditional-consistency rules and ``oneOf`` branches stay. But the model
+    API refuses exactly those two keywords (``invalid_json_schema``: "'allOf'
+    is not permitted", "'oneOf' is not permitted"), which killed every codex
+    build at spawn in ~4s and settled it as INFRA_FAILURE. This transform is
+    the API-facing view only — dropping ``allOf`` (the engine re-checks those
+    rules on the result) and relaxing ``oneOf`` to ``anyOf`` (equivalent
+    acceptance for disjoint shapes) — and is never written back to disk.
+    """
+    if isinstance(value, dict):
+        return {
+            ("anyOf" if key == "oneOf" else key): _api_safe_schema(item)
+            for key, item in value.items()
+            if key != "allOf"
+        }
+    if isinstance(value, list):
+        return [_api_safe_schema(item) for item in value]
+    return value
+
+
 def _provider_command(
     provider: str,
     *,
@@ -953,6 +977,14 @@ def _provider_command(
 ) -> list[str]:
     schema = _BUILD_SCHEMA if phase == "build" else _REVIEW_SCHEMA
     if provider == "codex":
+        api_schema_path = Path(result_path).parent / f"{phase}-schema.api.json"
+        api_schema_path.write_text(
+            json.dumps(
+                _api_safe_schema(json.loads(schema.read_text(encoding="utf-8")))
+            ),
+            encoding="utf-8",
+        )
+        schema = api_schema_path
         command = [
             "codex",
             "exec",
