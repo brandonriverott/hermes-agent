@@ -1116,6 +1116,43 @@ def _claude_auth_failure(reported: object) -> bool:
     )
 
 
+def _assurance_prompt_block(context: object, *, for_review: bool) -> str:
+    """State the contract terms the outcome gate will compare verbatim.
+
+    ``verify_outcome`` refuses the attempt unless the evidence echoes the
+    contract's ``critical_user_journey`` string exactly and (for review)
+    ``checks_run`` contains every ``verification_steps`` entry verbatim. The
+    models can only echo what they have been shown — before this block the
+    contract lived solely in the database and JOURNEY_MISMATCH was guaranteed.
+    """
+    contract = getattr(context, "assurance_contract", None)
+    if not isinstance(contract, Mapping):
+        return ""
+    journey = contract.get("critical_user_journey")
+    if not isinstance(journey, str) or not journey:
+        return ""
+    lines = [
+        "\nASSURANCE CONTRACT",
+        (
+            "critical_user_journey (echo this string EXACTLY, character for "
+            "character, as your critical_user_journey.name): " + journey
+        )
+        if not for_review
+        else (
+            "critical_user_journey (echo this string EXACTLY, character for "
+            "character, as outcome_evidence.critical_user_journey): " + journey
+        ),
+    ]
+    steps = contract.get("verification_steps")
+    if for_review and isinstance(steps, (list, tuple)):
+        lines.append(
+            "verification_steps — perform each and include each string "
+            "VERBATIM in outcome_evidence.checks_run:"
+        )
+        lines.extend(f"- {step}" for step in steps if isinstance(step, str))
+    return "\n".join(lines) + "\n"
+
+
 def _build_prompt(context: object) -> bytes:
     builder, _ = _worker_roles(str(getattr(context, "executor")))
     prior = getattr(context, "prior_handoff", None)
@@ -1140,6 +1177,7 @@ def _build_prompt(context: object) -> bytes:
         "Write the handoff summary and next action in first-person as the "
         "builder who performed the work. Do not include raw output or secrets.\n\n"
         + str(getattr(context, "goal"))
+        + _assurance_prompt_block(context, for_review=False)
         + previous
     ).encode("utf-8")
 
@@ -1212,6 +1250,7 @@ def _review_prompt(
         "The untrusted JSON array is ordered as builder summary, builder next "
         "action, journey name, journey result, and journey evidence.\n"
         f"UNTRUSTED BUILDER HANDOFF\n{bounded}\n"
+        + _assurance_prompt_block(context, for_review=True)
     )
     return prompt.encode("utf-8")
 

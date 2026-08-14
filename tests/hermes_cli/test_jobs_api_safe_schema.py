@@ -133,3 +133,36 @@ def test_review_phase_can_execute_but_not_write(tmp_path):
         "codex", phase="review", context=context, result_path=tmp_path / "r.json"
     )
     assert codex_review[codex_review.index("--sandbox") + 1] == "workspace-write"
+
+
+def test_prompts_carry_the_contract_terms_verbatim(tmp_path):
+    contract = {
+        "critical_user_journey": "A user divides two numbers safely.",
+        "verification_steps": ["python3 -m unittest discover -v runs green"],
+    }
+    context = SimpleNamespace(
+        executor="claude",
+        goal="do the thing",
+        assurance_contract=contract,
+        prior_handoff=None,
+        base_commit="b" * 40,
+    )
+    build = jr._build_prompt(context).decode()
+    assert "A user divides two numbers safely." in build
+    assert "EXACTLY" in build
+
+    review = jr._review_prompt(
+        context,
+        "c" * 40,
+        builder_handoff={"summary": "s", "next_action": "n"},
+        journey={"name": "j", "result": "pass", "evidence": "e"},
+    ).decode()
+    assert "A user divides two numbers safely." in review
+    assert "python3 -m unittest discover -v runs green" in review
+    assert "checks_run" in review
+
+    # No contract, no block.
+    bare = SimpleNamespace(
+        executor="claude", goal="g", assurance_contract=None, prior_handoff=None
+    )
+    assert "ASSURANCE CONTRACT" not in jr._build_prompt(bare).decode()
