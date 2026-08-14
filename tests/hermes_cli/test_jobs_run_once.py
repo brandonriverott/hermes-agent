@@ -207,8 +207,9 @@ def test_run_once_claims_runs_and_settles_one_job(home, tmp_path, repo):
     assert a["worktree"] == res["worktree"]
     assert a["repository"] == str(path)
 
-    # Custody was returned; the Job settled.
-    assert (after.status, after.step) == ("finished", "complete")
+    # Custody was returned; the Job settled. 2026-08-14: settlement parks a
+    # would-be ship for the operator instead of granting complete.
+    assert (after.status, after.step) == ("needs_you", "waiting_for_decision")
     assert after.claimed_by is None and after.lease_expires_at is None
     assert after.current_attempt_id is None
 

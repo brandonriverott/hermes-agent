@@ -2894,8 +2894,25 @@ def test_claim_skips_needs_you_and_finished(conn):
 def test_claim_requires_executable_step(conn):
     jid = jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
     # Working but parked on a non-executable step: not claimable.
-    jdb.set_step(conn, jid, "complete")
+    # 2026-08-14: this used to park the job on "complete". set_step can no
+    # longer reach that step at all (it was the unguarded way *in* to a
+    # sealed verdict), so the fixture uses another non-executable step. The
+    # property under test is unchanged.
+    jdb.set_step(conn, jid, "failed")
     assert jdb.claim_job(conn, specialist="claude-builder", worker="w1", lease_seconds=60) is None
+
+
+def test_set_step_cannot_reach_complete(conn):
+    """set_step is not a door to complete — it never consults the ship gate.
+
+    Before 2026-08-14 this engine had no seal at all: set_step could write
+    ``complete`` on a Job with zero attempts, and transition could then
+    rewrite the shipped verdict straight back out again.
+    """
+    jid = jdb.create_job(conn, requested_lane="claude", name="A", goal="a")
+    with pytest.raises(jdb.InvalidTransition, match="set_step cannot reach"):
+        jdb.set_step(conn, jid, "complete")
+    assert jdb.get_job(conn, jid).step != "complete"
 
 
 def test_claim_matches_specialist(conn):
@@ -3521,7 +3538,9 @@ def test_conflicting_replay_appends_no_event_and_leaves_state_unchanged(conn):
 # Every terminal outcome moves the same Job atomically and clears custody.
 # (attempt status, failure class) -> (public status, step)
 _OUTCOMES = [
-    ("succeeded", None, "finished", "complete"),
+    # 2026-08-14: a succeeded attempt parks for the operator instead of
+    # granting complete — settlement proves a build, not a deployment.
+    ("succeeded", None, "needs_you", "waiting_for_decision"),
     ("review_rejected", "reviewer_rejection", "working", "correcting"),
     ("failed", "reviewer_rejection", "working", "correcting"),
     ("failed", "authentication", "needs_you", "waiting_for_login"),
@@ -3599,7 +3618,7 @@ def test_success_outcome_finishes_and_clears_custody(conn):
     aid = jdb.start_attempt(conn, jid, claim_token=token)
     jdb.finish_attempt(conn, aid, status="succeeded", claim_token=token)
     job = jdb.get_job(conn, jid)
-    assert job.status == "finished" and job.step == "complete"
+    assert job.status == "needs_you" and job.step == "waiting_for_decision"
     assert job.claimed_by is None and job.current_attempt_id is None
     assert job.goal == goal  # verified success never rewrites the goal
 
@@ -3870,8 +3889,13 @@ def test_settle_attempt_writes_the_attempt_and_its_final_receipt_together(conn):
     assert len(receipts) == 1
     assert receipts[0]["id"] == settled["receipt_id"]
     assert receipts[0]["idempotency_key"] == f"{aid}:final"
+    # 2026-08-14: settlement no longer grants complete. A succeeded attempt
+    # proves a build, never a deployment, so it parks for the operator and
+    # only `hermes jobs activate` (which passes the full ship gate) can reach
+    # finished/complete. The property under test — custody clears in the same
+    # write — is unchanged.
     assert receipts[0]["attempt_id"] == aid
-    assert jdb.get_job(conn, jid).status == "finished"
+    assert jdb.get_job(conn, jid).status == "needs_you"
 
 
 def test_settle_attempt_refuses_a_receipt_that_contradicts_the_attempt(conn):

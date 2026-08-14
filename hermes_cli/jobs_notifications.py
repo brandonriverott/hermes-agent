@@ -114,7 +114,13 @@ def milestone_for_state(
     if target_state == "BLOCKED":
         return MILESTONE_NEEDS_YOU
     if target_state == "COMPLETED":
-        return MILESTONE_FINISHED
+        # A COMPLETED graph edge no longer means the Job is complete: since the
+        # ship gate landed, settlement parks a would-be ship at
+        # needs_you/waiting_for_decision and only ``hermes jobs activate`` can
+        # reach complete. Announcing "Finished — complete" here would tell
+        # Brandon the opposite of what the board says, which is exactly the
+        # false-ship claim the gate exists to stop.
+        return MILESTONE_NEEDS_YOU
     if target_state == "FAILED":
         return (
             MILESTONE_FAILURE if attempt_terminal_failure == 1 else MILESTONE_CORRECTING

@@ -38,6 +38,7 @@ from hermes_cli import jobs_exec as jx
 from hermes_cli import jobs_identity as ji
 from hermes_cli import jobs_run as jrun
 from hermes_cli import jobs_scorecard
+from hermes_cli import jobs_ship_gate as jsg
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +257,18 @@ def build_parser(
     )
     p_ra.add_argument("--json", action="store_true", help="Emit JSON")
 
+    p_act = sub.add_parser(
+        "activate",
+        help="Record merge/deploy/live evidence for the latest build and complete",
+    )
+    p_act.add_argument("job", help="Job id or number")
+    p_act.add_argument(
+        "--migrations", required=True, choices=("applied", "not_required"),
+        help="Whether this build's migrations have been applied",
+    )
+    p_act.add_argument("--notes", default=None, help="Free-text activation note")
+    p_act.add_argument("--json", action="store_true", help="Emit JSON")
+
     p_rl = sub.add_parser("receipts", help="List a job's receipts")
     p_rl.add_argument("job", help="Job id or number")
     p_rl.add_argument("--json", action="store_true", help="Emit JSON")
@@ -399,6 +412,7 @@ def jobs_command(args: argparse.Namespace) -> int:
         "intake": _cmd_intake,
         "scorecard": _cmd_scorecard,
         "receipt-add": _cmd_receipt_add,
+        "activate": _cmd_activate,
         "receipts": _cmd_receipts,
         "attempts": _cmd_attempts,
         "status": _cmd_status,
@@ -951,6 +965,137 @@ def _cmd_receipt_add(args: argparse.Namespace) -> int:
         _emit_json({"receipt": stored})
     else:
         print(f"Stored receipt {rid} on {args.job}")
+    return 0
+
+
+def _cmd_activate(args: argparse.Namespace) -> int:
+    """Write the canonical ship receipt for the latest attempt, then complete.
+
+    The handoff ends with "merge, apply the SQL, deploy". Recording that used
+    to mean hand-assembling a jobs-activation receipt whose exact shape lives
+    in the gate's source; on 2026-08-07 an agent got it wrong twice and forced
+    the row with raw SQL instead, which is precisely the false "complete" the
+    gate exists to stop. One command, one shape, no drift.
+
+    2026-08-14: the preflight runs unconditionally. The plugin's copy skipped
+    it whenever ``commit_sha == base_commit``, on the reasoning that a
+    no-change run has nothing to merge — but it still wrote the durable
+    "merged, deployed, live_verified" receipt, so a later merge of unrelated
+    work let ``transition`` accept a claim nobody had ever checked. A commit
+    that is not on main cannot honestly be called shipped, no-change or not,
+    and for a genuine no-change build the diff is empty so the migration check
+    passes on its own.
+    """
+    with jdb.connect_closing() as conn:
+        job = _resolve_or_report(conn, args.job)
+        if job is None:
+            return 1
+        attempt = conn.execute(
+            "SELECT id, status, commit_sha, base_commit, repository "
+            "FROM job_attempts WHERE job_id = ? ORDER BY ordinal DESC LIMIT 1",
+            (job.id,),
+        ).fetchone()
+        if attempt is None or not attempt["commit_sha"]:
+            print(
+                f"jobs: {job.label} has no build commit to activate; there is "
+                f"nothing to record as shipped.",
+                file=sys.stderr,
+            )
+            return 2
+        if attempt["status"] != "succeeded":
+            print(
+                f"jobs: {job.label}'s latest attempt {attempt['id']} is "
+                f"{attempt['status']}, not succeeded — resolve or rerun it "
+                f"before recording ship evidence.",
+                file=sys.stderr,
+            )
+            return 2
+        # Pre-flight the gate's receipt-independent checks. Writing the
+        # receipt first and letting the transition refuse would leave durable
+        # "deployed: true, live_verified: true" evidence on a job that never
+        # shipped — pre-planted proof a later transition would happily accept.
+        # The gate below still re-checks all of this; this only decides
+        # whether it is safe to make the claim durable at all.
+        repository = str(attempt["repository"] or "")
+        base_commit = str(attempt["base_commit"] or "")
+        commit_sha = str(attempt["commit_sha"])
+        merged = jsg.commit_is_on_main(repository, commit_sha)
+        if merged is None:
+            print(
+                f"jobs: cannot verify that {job.label} commit "
+                f"{commit_sha[:12]} is on main in "
+                f"{repository or '(missing repo)'}; refusing to record "
+                f"ship evidence.",
+                file=sys.stderr,
+            )
+            return 2
+        if not merged:
+            print(
+                f"jobs: {job.label} commit {commit_sha[:12]} is not on "
+                f"main in {repository}. Merge it first, then activate.",
+                file=sys.stderr,
+            )
+            return 2
+        needs_migration = jsg.commit_changes_require_migration(
+            repository, base_commit, commit_sha
+        )
+        if needs_migration is None:
+            print(
+                f"jobs: cannot verify {job.label}'s migration diff for "
+                f"commit {commit_sha[:12]}; refusing to record ship "
+                f"evidence.",
+                file=sys.stderr,
+            )
+            return 2
+        if needs_migration and args.migrations != "applied":
+            print(
+                f"jobs: {job.label} changes migration files, so "
+                f"--migrations must be 'applied' (got "
+                f"{args.migrations!r}). Apply the migration first.",
+                file=sys.stderr,
+            )
+            return 2
+
+        receipt = {
+            "schema_version": 1,
+            "kind": "jobs-activation",
+            "job_id": job.id,
+            "attempt_id": str(attempt["id"]),
+            "commit": str(attempt["commit_sha"]),
+            "merged": True,
+            "deployed": True,
+            "live_verified": True,
+            "migrations": args.migrations,
+        }
+        if args.notes:
+            receipt["notes"] = args.notes
+        try:
+            jdb.add_activation_receipt(
+                conn,
+                job.id,
+                data=jx.sanitize_receipt(receipt),
+                attempt_id=str(attempt["id"]),
+                # Same key => a rerun re-uses the first receipt instead of
+                # stacking a second copy of the same claim.
+                idempotency_key=(
+                    f"activation-{attempt['id']}-{attempt['commit_sha']}"
+                ),
+            )
+            updated = jdb.transition(
+                conn, job.id, status="finished", step="complete",
+                reason=args.notes or "activation recorded via jobs activate",
+            )
+        except (jx.UnsafeReceipt, jdb.InvalidTransition, ValueError) as exc:
+            print(f"jobs: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            _emit_json({"job": _job_view(updated), "activation": receipt})
+        else:
+            print(
+                f"{updated.label}: shipped — commit "
+                f"{str(attempt['commit_sha'])[:12]}, migrations="
+                f"{args.migrations}"
+            )
     return 0
 
 

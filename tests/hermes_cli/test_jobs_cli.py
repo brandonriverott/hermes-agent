@@ -417,7 +417,12 @@ def test_attempt_start_finish_via_cli(home, capsys):
     # The outcome moved the Job and cleared custody in the same write.
     with jdb.connect_closing() as conn:
         job = jdb.get_job(conn, 1)
-    assert (job.status, job.step) == ("finished", "complete")
+    # 2026-08-14: settlement no longer grants complete. A succeeded attempt
+    # proves a build, never a deployment, so it parks for the operator and
+    # only `hermes jobs activate` (which passes the full ship gate) can reach
+    # finished/complete. The property under test — custody clears in the same
+    # write — is unchanged.
+    assert (job.status, job.step) == ("needs_you", "waiting_for_decision")
     assert job.claimed_by is None and job.current_attempt_id is None
 
 

@@ -54,6 +54,7 @@ LIVE_PROFILES = frozenset({"mac", "pc"})
 RELEASE_FILES: tuple[str, ...] = (
     "gateway/jobs_dispatcher.py",
     "gateway/jobs_notifications.py",
+    "gateway/jobs_watcher.py",
     "gateway/run.py",
     "hermes_cli/data/jobs-codex-result.v1.schema.json",
     "hermes_cli/data/jobs-build-result.v1.schema.json",
@@ -81,6 +82,7 @@ RELEASE_FILES: tuple[str, ...] = (
     "hermes_cli/jobs_release.py",
     "hermes_cli/jobs_run.py",
     "hermes_cli/jobs_runtime.py",
+    "hermes_cli/jobs_ship_gate.py",
     "hermes_cli/jobs_skills.py",
     "hermes_cli/jobs_tool.py",
     "hermes_cli/plugins.py",

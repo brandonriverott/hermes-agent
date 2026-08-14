@@ -2433,6 +2433,7 @@ from gateway.session_state import (
     legacy_lease_token_property,
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
+from gateway.jobs_watcher import GatewayJobsWatcherMixin
 from gateway.jobs_notifications import GatewayJobsNotificationsMixin
 from gateway.jobs_dispatcher import GatewayJobsDispatcherMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
@@ -5861,6 +5862,7 @@ class TurnRunner:
 
 class GatewayRunner(
     GatewayAuthorizationMixin,
+    GatewayJobsWatcherMixin,
     GatewayKanbanWatchersMixin,
     GatewayJobsDispatcherMixin,
     GatewayJobsNotificationsMixin,
@@ -11762,6 +11764,20 @@ class GatewayRunner(
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
         self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
+
+        # Start background Jobs wake watcher — announces jobs that reach a
+        # terminal state (finished / needs_you) back into the chat session that
+        # created them. No-ops when the out-of-tree Jobs runner isn't installed
+        # (no jobs.db) or when no job carries an origin.
+        #
+        # 2026-08-14: this hook and gateway/jobs_watcher.py lived only in the
+        # mutable checkout — one uncommitted edit and one untracked file — so
+        # every release build dropped them (the bundle is `git archive HEAD`
+        # plus an explicit file list, and both refuse a dirty tree). Pinning
+        # the gateway to a release on 2026-08-13 15:04 therefore killed the
+        # watcher silently. Committing it here is what keeps it alive across
+        # the next cut.
+        self._spawn_supervised(self._jobs_wake_watcher, "jobs_wake_watcher")
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:

@@ -298,8 +298,13 @@ def test_legal_forward_path_is_append_only_and_maps_public_completion(graph_rig)
 
     assert [row["target_state"] for row in graph_rig.rows()] == FORWARD
     assert graph_rig.receipt_count() == len(FORWARD)
+    # 2026-08-14: settlement no longer grants complete. A succeeded attempt
+    # proves a build, never a deployment, so it parks for the operator and
+    # only `hermes jobs activate` (which passes the full ship gate) can reach
+    # finished/complete. The property under test — custody clears in the same
+    # write — is unchanged.
     job = jdb.get_job(graph_rig.conn, graph_rig.job_id)
-    assert (job.status, job.step) == ("finished", "complete")
+    assert (job.status, job.step) == ("needs_you", "waiting_for_decision")
 
 
 @pytest.mark.parametrize(("source", "target"), ILLEGAL_CASES)
@@ -545,7 +550,12 @@ def test_projection_is_read_only_deterministic_and_preserves_history(tmp_path):
 
     assert second_projection == first_projection
     job = first_projection["jobs"][0]
+    # 2026-08-14: settlement no longer grants complete. A succeeded attempt
+    # proves a build, never a deployment, so it parks for the operator and
+    # only `hermes jobs activate` (which passes the full ship gate) can reach
+    # finished/complete. The property under test — custody clears in the same
+    # write — is unchanged.
     assert job["state"] == "COMPLETED"
-    assert job["status"] == "finished"
+    assert job["status"] == "needs_you"
     assert [row["target_state"] for row in job["attempts"][0]["transitions"]] == FORWARD
     assert "claim_token" not in receipts.canonical_json_bytes(first_projection).decode()

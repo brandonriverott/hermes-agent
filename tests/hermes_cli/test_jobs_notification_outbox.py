@@ -314,7 +314,9 @@ def test_each_defined_phase_transition_creates_one_ordered_intent(conn, signing_
         "testing",
         "review",
         "review-approved",
-        "finished",
+        # 2026-08-14: the COMPLETED edge now announces "needs you" — it parks
+        # for a ship decision rather than claiming the Job is complete.
+        "needs-you",
     ]
     assert [row.payload["handoff"] for row in rows[1:]] == visible_handoffs
     assert [r.id for r in rows] == sorted(r.id for r in rows)

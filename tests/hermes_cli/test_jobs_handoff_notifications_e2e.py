@@ -402,7 +402,9 @@ def test_full_handoff_conversation_is_substantive_and_exact_origin(
             "testing",
             "review",
             "review-approved",
-            "finished",
+            # 2026-08-14: the COMPLETED edge now announces "needs you" — it parks
+            # for a ship decision rather than claiming the Job is complete.
+            "needs-you",
         ]
         assert all(row.delivered_at is not None for row in rows)
         assert all(row.transition_id is not None for row in rows[1:])

@@ -56,6 +56,7 @@ from typing import (
 
 from hermes_cli import jobs_identity as ji
 from hermes_cli import jobs_notifications as jnotif
+from hermes_cli import jobs_ship_gate as jsg
 from hermes_cli.sqlite_util import add_column_if_missing, write_txn
 from hermes_constants import get_hermes_home
 
@@ -1783,21 +1784,37 @@ def transition(
             conn, job.id, idempotency_key
         ):
             return job
+        # The seal comes before the transition table: a shipped verdict is not
+        # rewritable, and finished->finished is legal in VALID_TRANSITIONS, so
+        # without this the step is unconstrained on the way back out. That is
+        # the hole this engine fell through when it relabelled a shipped Job
+        # complete -> failed -> cancelled.
+        sealed = jsg.seal_check(
+            job.status, job.step, job.label, status=status, step=step
+        )
+        if sealed == jsg.SEAL_NOOP:
+            return job
+        if sealed is not None:
+            raise InvalidTransition(sealed)
         if status not in VALID_TRANSITIONS[job.status]:
             raise InvalidTransition(
                 f"cannot transition job {job.label} from {job.status!r} to {status!r}"
             )
         if status == "finished" and step == "complete":
-            latest = conn.execute(
-                "SELECT id FROM job_attempts WHERE job_id = ? "
-                "ORDER BY ordinal DESC LIMIT 1",
-                (job.id,),
-            ).fetchone()
-            if latest is None:
-                raise InvalidTransition(
-                    f"SHIP GATE: job {job.label} has no attempt, so nothing was "
-                    "built, merged, deployed, or verified live"
-                )
+            # Brandon's 100% ship rule. Until 2026-08-14 this engine's entire
+            # gate was "does any attempt row exist" — the attempt could be
+            # failed, could carry no commit, and nothing anywhere checked that
+            # the commit was merged or that a deployment had been recorded.
+            # The truth table now lives in exactly one file, vendored
+            # byte-identical into the plugin (see jobs_ship_gate).
+            refusal = jsg.complete_refusal(
+                conn, job.id, job.label, job.number,
+                is_on_main=_commit_is_on_main,
+                requires_migration=_commit_changes_require_migration,
+                activation_receipt=_matching_activation_receipt,
+            )
+            if refusal is not None:
+                raise InvalidTransition(refusal)
         if status in _CUSTODY_CLEARING_STATUSES:
             # A general transition must never silently orphan a running attempt.
             # Clearing custody underneath one would strand it ``running`` with an
@@ -1960,6 +1977,13 @@ def set_step(
             conn, job.id, idempotency_key
         ):
             return job
+        # set_step never consults the ship gate, so it is guarded in *both*
+        # directions: it cannot reach ``complete`` (the back door in — a
+        # zero-attempt Job could be stepped straight to complete and then seal
+        # itself), and it cannot rewrite a shipped verdict (the back door out).
+        refusal = jsg.step_refusal(job.status, job.step, job.label, step)
+        if refusal is not None:
+            raise InvalidTransition(refusal)
         conn.execute(
             "UPDATE jobs SET step = ?, updated_at = ?, revision = revision + 1 "
             "WHERE id = ?",
@@ -2272,6 +2296,42 @@ def _outcome_for(
     return ("working", "correcting")
 
 
+def _matching_activation_receipt(
+    conn: sqlite3.Connection, job_id: str, attempt_id: str, commit_sha: str
+) -> Optional[dict]:
+    """Thin delegate — see :func:`jobs_ship_gate.matching_activation_receipt`.
+
+    Module-level so the canaries can monkeypatch this name to exercise the
+    gate's fail-closed branches, and so both engines expose the same seam.
+    """
+    return jsg.matching_activation_receipt(conn, job_id, attempt_id, commit_sha)
+
+
+def _commit_changes_require_migration(
+    repository: str, base_commit: str, commit_sha: str
+) -> Optional[bool]:
+    """Thin delegate — see :func:`jobs_ship_gate.commit_changes_require_migration`."""
+    return jsg.commit_changes_require_migration(repository, base_commit, commit_sha)
+
+
+def _commit_is_on_main(repository: str, commit_sha: str) -> Optional[bool]:
+    """Thin delegate — see :func:`jobs_ship_gate.commit_is_on_main`."""
+    return jsg.commit_is_on_main(repository, commit_sha)
+
+
+def _ship_gate(outcome: tuple, attempt_row=None, commit: Optional[str] = None) -> tuple:
+    """Settlement never auto-completes — see :func:`jobs_ship_gate.settlement_outcome`.
+
+    Kept as a named wrapper (rather than folding the rule into
+    :func:`_outcome_for`) so both engines expose the same symbol and the
+    canaries can assert on it by name. ``attempt_row`` and ``commit`` are
+    accepted for signature parity with the plugin's copy and are deliberately
+    unused: the rule is deterministic on ``outcome`` alone, which is what
+    preserves terminal replay equivalence.
+    """
+    return jsg.settlement_outcome(outcome)
+
+
 # Caller keyword -> settled column, for terminal replay equivalence. Evidence
 # is part of the result, not decoration: a replay that reports a different
 # commit is asking for a different outcome than the one on record.
@@ -2476,8 +2536,12 @@ def finish_attempt(
             branch=branch,
             worktree=worktree,
             repository=repository,
-            outcome=_outcome_for(
-                status, failure_class, terminal_failure=terminal_failure
+            outcome=_ship_gate(
+                _outcome_for(
+                    status, failure_class, terminal_failure=terminal_failure
+                ),
+                row,
+                commit,
             ),
         )
     return get_attempt(conn, attempt_id)
@@ -2731,6 +2795,13 @@ def _add_final_receipt_locked(
     """
     if not isinstance(receipt, dict):
         raise ValueError("final receipt data must be a JSON object (dict)")
+    # Settlement documents a run; it does not get to assert a deployment. This
+    # door never checked ``kind``, so a caller could hand settlement a forged
+    # ``jobs-activation`` payload and have it stored verbatim — an event trail
+    # byte-identical in shape to a legitimate ship.
+    reserved = jsg.reserved_kind_refusal(receipt)
+    if reserved is not None:
+        raise ValueError(reserved)
     if authoritative is not None:
         for key, expected in authoritative.items():
             if key in ("schema_version", "kind", "evidence"):
@@ -2990,8 +3061,12 @@ def settle_attempt(
             branch=branch,
             worktree=worktree,
             repository=repository,
-            outcome=_outcome_for(
-                status, failure_class, terminal_failure=terminal_failure
+            outcome=_ship_gate(
+                _outcome_for(
+                    status, failure_class, terminal_failure=terminal_failure
+                ),
+                row,
+                commit,
             ),
             receipt=receipt,
             v3_narrative=v3_narrative,
@@ -3745,6 +3820,14 @@ def add_receipt(
     """
     if not isinstance(data, dict):
         raise ValueError("receipt data must be a JSON object (dict)")
+    # The ship gate trusts any receipt whose fields match, and this function
+    # accepts arbitrary JSON — so "deployed, live_verified" was a thing any
+    # caller could simply assert about a build it never deployed. Writing it
+    # belongs to :func:`add_activation_receipt`, which only ``jobs activate``
+    # reaches, after its own live checks.
+    reserved = jsg.reserved_kind_refusal(data)
+    if reserved is not None:
+        raise ValueError(reserved)
     if is_final_receipt_key(idempotency_key):
         raise ValueError(
             f"idempotency key {idempotency_key!r} is in the final-receipt "
@@ -3784,6 +3867,77 @@ def add_receipt(
                 idempotency_key,
                 now,
             ),
+        )
+        _bump_revision_locked(conn, job.id, now)
+        _append_event_locked(
+            conn,
+            job.id,
+            "receipt_added",
+            data={"receipt_id": rid, "attempt_id": attempt_id},
+            now=now,
+        )
+    return rid
+
+
+def add_activation_receipt(
+    conn: sqlite3.Connection,
+    id_or_number,
+    *,
+    data: dict,
+    attempt_id: str,
+    idempotency_key: str,
+) -> str:
+    """Write the one receipt kind :func:`add_receipt` refuses.
+
+    This is the ship command's private writer. Keeping it separate is the whole
+    point: activation evidence has exactly one legitimate author, so the public
+    receipt door can refuse the kind outright instead of trying to tell a real
+    deployment claim from a forged one after the fact.
+
+    ``attempt_id`` is mandatory and must belong to the Job — activation is
+    evidence about a specific build, and a receipt floating free of an attempt
+    could be matched against a later one it says nothing about.
+
+    Replay is content-bound rather than first-write-wins: re-running ``jobs
+    activate`` with the same key and the same claim is a no-op, but the same key
+    carrying a *different* claim (say, migrations flipped to 'applied') is a
+    rewrite of durable evidence and raises :class:`ReplayIntegrity`.
+    """
+    if not isinstance(data, dict) or data.get("kind") != jsg.RESERVED_RECEIPT_KIND:
+        raise ValueError(
+            "the activation writer only writes 'jobs-activation' receipts"
+        )
+    if not attempt_id or not idempotency_key:
+        raise ValueError("activation receipts require an attempt and a key")
+    job = get_job(conn, id_or_number)
+    if job is None:
+        raise ValueError(f"no such job: {id_or_number!r}")
+    attempt = get_attempt(conn, attempt_id)
+    if attempt is None or attempt["job_id"] != job.id:
+        raise ValueError(
+            f"attempt {attempt_id!r} does not belong to job {job.label}"
+        )
+    encoded = _canonical(data)
+    now = _now()
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT id, data FROM job_receipts "
+            "WHERE job_id = ? AND idempotency_key = ?",
+            (job.id, idempotency_key),
+        ).fetchone()
+        if existing is not None:
+            if existing["data"] != encoded:
+                raise ReplayIntegrity(
+                    f"activation key {idempotency_key!r} already records "
+                    f"different ship evidence for job {job.label}"
+                )
+            return existing["id"]
+        rid = _new_receipt_id()
+        conn.execute(
+            "INSERT INTO job_receipts "
+            "(id, job_id, attempt_id, data, idempotency_key, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (rid, job.id, attempt_id, encoded, idempotency_key, now),
         )
         _bump_revision_locked(conn, job.id, now)
         _append_event_locked(
@@ -4104,7 +4258,13 @@ def _graph_public_state_locked(
         status, step = nonterminal[request.target_state]
         return status, step, False
     if request.target_state == "COMPLETED":
-        return "finished", "complete", True
+        # Settlement never auto-completes, on this path either. A COMPLETED
+        # graph edge means the build succeeded and its evidence verified — it
+        # does not mean the commit was merged, deployed, or seen alive. Park it
+        # for the operator; ``hermes jobs activate`` is the only door to
+        # complete, and it passes the full ship gate.
+        status, step = _ship_gate(("finished", "complete"))
+        return status, step, True
     if request.target_state == "CANCELLED":
         return "finished", "cancelled", True
     if request.target_state == "BLOCKED":
@@ -4180,6 +4340,18 @@ def record_transition(
         job_row = _require_job_revision_locked(
             conn, request.job_id, request.expected_job_revision
         )
+        # The graph path writes public state with its own UPDATE, so it has to
+        # answer to the seal too — this is the door the engine actually walked
+        # through when it rewrote a shipped verdict to cancelled. A genuine
+        # idempotent replay already returned above on the stored key, so a
+        # sealed Job here means a *new* edge: refuse it outright, whatever the
+        # target state.
+        if (job_row["status"], job_row["step"]) == ("finished", "complete"):
+            raise GraphConflict(
+                f"job Job #{job_row['number']} is complete, and a shipped "
+                f"Job's verdict is sealed: it cannot be rewritten by a graph "
+                f"transition to {request.target_state}"
+            )
         _require_attempt_job_locked(conn, request.attempt_id, request.job_id)
         attempt_row = conn.execute(
             "SELECT * FROM job_attempts WHERE id = ?", (request.attempt_id,)

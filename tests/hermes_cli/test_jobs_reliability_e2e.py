@@ -405,7 +405,10 @@ def test_provider_free_happy_path_reaches_exact_completed_graph(reliability_rig)
     ]
     projection = graph.compute_work_control(reliability_rig.conn, now=999)
     assert projection["jobs"][0]["state"] == "COMPLETED"
-    assert projection["jobs"][0]["status"] == "finished"
+    # 2026-08-14: a COMPLETED graph edge no longer implies a shipped Job. The
+    # public state parks for the operator; only `hermes jobs activate` — which
+    # proves merge, deployment and migration — reaches finished/complete.
+    assert projection["jobs"][0]["status"] == "needs_you"
     assert "claim_token" not in json.dumps(projection)
     assert result.action_outcome == "succeeded"
     attempt = jdb.get_attempt(reliability_rig.conn, result.attempt_id)
