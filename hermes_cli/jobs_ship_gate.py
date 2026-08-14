@@ -41,7 +41,7 @@ from typing import Optional
 # Bumped whenever the truth table itself changes. Both engines report it, and
 # the dual-engine selftest asserts they agree — a mismatch means one side is
 # running a stale vendored copy.
-CONTRACT_VERSION = 2
+CONTRACT_VERSION = 3
 
 # Ship evidence, not a note. Only the activation writer may mint this kind.
 RESERVED_RECEIPT_KIND = "jobs-activation"
@@ -96,6 +96,18 @@ def _git_env() -> dict:
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_CONFIG_SYSTEM": "/dev/null",
         "GIT_TERMINAL_PROMPT": "0",
+        # Round 2 of the adversarial review found N6: history itself is
+        # rewritable from inside the repository, without touching the
+        # environment or the ref names this file already pins. A line in
+        # ``.git/info/grafts`` or an entry under ``refs/replace/`` makes an
+        # unmerged commit an ancestor of the real ``refs/heads/main``, and
+        # ``merge-base --is-ancestor`` believes it — in the correct repository
+        # that honest builds use, written by a builder that already has commit
+        # access to it. Both are off by construction here: replace refs
+        # disabled outright, and the graft file pointed at an empty path so the
+        # repo-local one is never read.
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": "/dev/null",
         "LC_ALL": "C",
     }
 
