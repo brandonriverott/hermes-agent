@@ -59,8 +59,13 @@ def test_claude_build_command_allows_verification_and_commit_but_review_does_not
         "Bash(npx:*) Bash(node:*) Bash(tsc:*) Bash(vitest:*) "
         "Bash(python3:*) Bash(pytest:*)"
     )
-    assert "--allowedTools" not in review
-    assert review[review.index("--permission-mode") + 1] == "plan"
+    # Review may execute (run-only allowlist) but never write: no git add or
+    # commit patterns, default mode instead of plan, and the engine refuses
+    # the attempt afterwards if the worktree is dirty or HEAD moved.
+    review_allow = review[review.index("--allowedTools") + 1]
+    assert "Bash(pytest:*)" in review_allow
+    assert "git add" not in review_allow and "git commit" not in review_allow
+    assert review[review.index("--permission-mode") + 1] == "default"
 
 
 class ReliabilityRig:

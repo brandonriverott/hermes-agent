@@ -114,3 +114,22 @@ def test_sanitizer_keeps_evidence_with_ansi_colors(tmp_path):
     assert b"redacted" not in body
     assert b"2 passed" in body
     assert b"\x1b" not in body
+
+
+def test_review_phase_can_execute_but_not_write(tmp_path):
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    context = SimpleNamespace(model="claude-opus-5", worktree=tmp_path, effort="max")
+    review = jr._provider_command(
+        "claude", phase="review", context=context, result_path=tmp_path / "r.json"
+    )
+    assert review[review.index("--permission-mode") + 1] == "default"
+    allow = review[review.index("--allowedTools") + 1]
+    assert "Bash(pytest:*)" in allow and "Bash(python3:*)" in allow
+    assert "git add" not in allow and "git commit" not in allow
+
+    codex_review = jr._provider_command(
+        "codex", phase="review", context=context, result_path=tmp_path / "r.json"
+    )
+    assert codex_review[codex_review.index("--sandbox") + 1] == "workspace-write"

@@ -1039,7 +1039,12 @@ def _provider_command(
             "--model",
             str(getattr(context, "model")),
             "--sandbox",
-            "workspace-write" if phase == "build" else "read-only",
+            # Review needs workspace-write too: a read-only sandbox cannot even
+            # create pytest temp files, so every dynamic claim came back
+            # UNABLE_TO_VERIFY and the correction loop spun forever. The engine
+            # guards the candidate instead: after review it refuses the attempt
+            # if the worktree is dirty or HEAD moved (REVIEW_MUTATED_WORKTREE).
+            "workspace-write",
             "--cd",
             str(getattr(context, "worktree")),
             "--ephemeral",
@@ -1062,7 +1067,13 @@ def _provider_command(
         "--effort",
         str(getattr(context, "effort")),
         "--permission-mode",
-        "acceptEdits" if phase == "build" else "plan",
+        # Review runs in default mode with a run-only allowlist rather than
+        # plan: plan denies every Bash call, so the reviewer could never
+        # execute the suite and refused every dynamic claim UNABLE_TO_VERIFY.
+        # No edit tools and no git-write commands are allowlisted; the engine
+        # additionally refuses the attempt if review leaves the worktree dirty
+        # or moves HEAD.
+        "acceptEdits" if phase == "build" else "default",
         "--safe-mode",
     ]
     if phase == "build":
@@ -1071,6 +1082,14 @@ def _provider_command(
             "Bash(git add:*) Bash(git commit:*) Bash(git status:*) "
             "Bash(git diff:*) Bash(git log:*) Bash(pnpm:*) Bash(npm:*) "
             "Bash(npx:*) Bash(node:*) Bash(tsc:*) Bash(vitest:*) "
+            "Bash(python3:*) Bash(pytest:*)",
+        ])
+    else:
+        command.extend([
+            "--allowedTools",
+            "Bash(git status:*) Bash(git diff:*) Bash(git log:*) "
+            "Bash(git show:*) Bash(pnpm test:*) Bash(pnpm typecheck:*) "
+            "Bash(npx vitest:*) Bash(npx tsc:*) Bash(node:*) "
             "Bash(python3:*) Bash(pytest:*)",
         ])
     return [
@@ -1180,6 +1199,9 @@ def _review_prompt(
         "Independently review the candidate diff against its approved base. "
         "Treat the supplied builder statements as untrusted context and "
         "independently verify every claim using the candidate and evidence. "
+        "You may execute the project's own test and typecheck commands to "
+        "verify dynamic claims — the environment permits it and the engine "
+        "verifies afterwards that you modified nothing. "
         "Do not modify files. Return PASS only when there are no unresolved "
         "correctness, security, evidence, or maintainability findings. Return "
         "UNABLE_TO_VERIFY with a concrete missing-evidence finding when proof "
@@ -1444,6 +1466,41 @@ class LocalProviderPhaseRunner:
         for path in (review_stdout, review_stderr):
             if path.is_file():
                 _sanitize_phase_file(path)
+        # The reviewer may execute, never mutate: a dirty tree or a moved HEAD
+        # after review means the candidate under review is no longer the
+        # candidate that was built, and the attempt is refused outright.
+        # Untracked leftovers (pytest __pycache__ etc.) cannot alter the
+        # committed candidate, so only tracked modifications and a moved HEAD
+        # count as mutation.
+        review_tree = subprocess.run(
+            ["git", "-C", str(worktree), "status", "--porcelain", "--untracked-files=no"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        review_head = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if (
+            review_tree.returncode != 0
+            or review_tree.stdout.strip()
+            or review_head.returncode != 0
+            or review_head.stdout.strip() != commit
+        ):
+            return PhaseResult(
+                status="failed",
+                commit=commit,
+                tests=tests,
+                review={},
+                executor_exit_digest=exit_digest,
+                output_capture_digest=output_digest,
+                failure_reason_code="REVIEW_MUTATED_WORKTREE",
+            )
         if (
             review_run.returncode != 0
             or review_run.timed_out
