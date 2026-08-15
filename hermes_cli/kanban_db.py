@@ -4834,6 +4834,8 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and restore its source phase.
 
@@ -4843,11 +4845,17 @@ def reclaim_task(
     when an operator wants to abort a running worker without waiting
     for the TTL to expire (e.g. after seeing a hallucination warning).
 
+    ``expected_run_id`` and ``expected_claim_lock`` bind an operator action
+    to the worker ownership it observed.  A mismatch returns False instead of
+    reclaiming a replacement worker.  Both guards are checked again inside
+    the write transaction immediately before the task and run are mutated.
+
     Returns True if a reclaim happened, False if the task isn't in a
-    reclaimable state (not running, or doesn't exist).
+    reclaimable state (not running, doesn't exist, or ownership changed).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, current_run_id "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -4855,18 +4863,50 @@ def reclaim_task(
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    if (
+        expected_run_id is not None
+        and row["current_run_id"] != int(expected_run_id)
+    ):
+        return False
+    if (
+        expected_claim_lock is not None
+        and row["claim_lock"] != expected_claim_lock
+    ):
+        return False
     prev_lock = row["claim_lock"]
+    prev_run_id = row["current_run_id"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
     with write_txn(conn):
+        current = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not current:
+            return False
+        if (
+            current["claim_lock"] != prev_lock
+            or current["current_run_id"] != prev_run_id
+        ):
+            return False
+        if (
+            expected_run_id is not None
+            and current["current_run_id"] != int(expected_run_id)
+        ):
+            return False
+        if (
+            expected_claim_lock is not None
+            and current["claim_lock"] != expected_claim_lock
+        ):
+            return False
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (retry_status, task_id, prev_lock),
+            "AND claim_lock IS ? AND current_run_id IS ?",
+            (retry_status, task_id, prev_lock, prev_run_id),
         )
         if cur.rowcount != 1:
             return False

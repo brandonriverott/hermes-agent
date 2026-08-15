@@ -239,10 +239,18 @@ def terminate_run(
             run.ended_at is not None
             or task.status != "running"
             or getattr(task, "current_run_id", None) != run_id
+            or getattr(run, "claim_lock", None) is None
+            or getattr(task, "claim_lock", None) != run.claim_lock
         ):
             raise HTTPException(status_code=409, detail="run target is no longer active")
         reason = (payload.reason or "Stopped from Live Agents").strip()
-        if not kanban_db.reclaim_task(conn, payload.task_id, reason=reason):
+        if not kanban_db.reclaim_task(
+            conn,
+            payload.task_id,
+            reason=reason,
+            expected_run_id=run_id,
+            expected_claim_lock=run.claim_lock,
+        ):
             raise HTTPException(status_code=409, detail="worker could not be stopped")
         return {"ok": True, "run_id": run_id, "task_id": payload.task_id}
     finally:
