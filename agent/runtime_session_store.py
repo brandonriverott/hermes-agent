@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 import threading
 
 
 _worker_process = False
+_loop_refusal_logged = False  # ponytail: one stack per process names the loop-thread caller
 
 
 def is_worker_process():
@@ -106,7 +108,9 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     """Synchronous durable results with a private byte-bounded retry journal.
 
     A failed write remains pending, and failure is sticky until explicit retry or
-    adoption. Local queue acceptance is never returned as canonical commit.
+    adoption. A refusal before journaling (a running event loop on the caller's
+    thread) is neither pending nor sticky. Local queue acceptance is never returned
+    as canonical commit.
     Pending journals live outside age-pruned cache trees.
     """
     def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024):
@@ -204,6 +208,22 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 raise WorkerPersistenceError(self.failure)
             if self.journal['pending']:
                 raise WorkerPersistenceError('pending_receipt')
+            # WorkerRPC refuses a call made on a running event loop before any I/O. Refuse it here,
+            # before journaling: nothing was sent, so the failure must not turn sticky. Otherwise one
+            # swallowed best-effort write (activity heartbeat, usage) on a loop thread fails every
+            # later transcript write of the run.
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                global _loop_refusal_logged
+                if not _loop_refusal_logged:
+                    _loop_refusal_logged = True
+                    logging.getLogger(__name__).warning(
+                        "worker persistence %s refused on an event-loop thread (not sent, not sticky)",
+                        operation, stack_info=True)
+                raise WorkerPersistenceError('synchronous_rpc_on_event_loop')
             entry = {'sequence': self.journal['next_sequence'], 'operation': operation, 'payload': payload}
             candidate = json.loads(json.dumps(self.journal))
             candidate['pending'].append(json.loads(json.dumps(entry, allow_nan=False)))
