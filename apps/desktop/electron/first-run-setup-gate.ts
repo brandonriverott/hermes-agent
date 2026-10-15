@@ -64,6 +64,7 @@ export function createFirstRunSetupGate({
 
   const wait = async (backend?: FirstRunSetupBackend | null) => {
     if (!shouldGate(backend)) {
+      if (backend && backend.kind !== 'bootstrap-needed') { resetForRetry() }
       return 'continue-local' as const
     }
 
@@ -109,6 +110,7 @@ export function createFirstRunSetupGate({
     // Settle the old boot explicitly so it cannot fall through into local
     // bootstrap and cannot leak a forever-pending connection promise.
     settleWaiter('reset')
+    hideChoice?.()
   }
 
   const resetForRepair = () => {

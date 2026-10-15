@@ -13,13 +13,14 @@ import {
   modelOptionsQueryKey,
   requestModelOptions
 } from '@/lib/model-options'
-import { notifyError } from '@/store/notifications'
+import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
   $currentReasoningEffortWire,
+  type ComposerModelSource,
   getComposerSelectionGeneration,
   getCurrentModelSource,
   markComposerSelectionManual,
@@ -41,6 +42,85 @@ interface ModelSwitchResponse {
   confirm_message?: string
   confirm_required?: boolean
   deferred?: boolean
+}
+
+// One pending intent per owned conversation. A later picker choice supersedes it;
+// the running turn is never interrupted to change its frozen model policy.
+const pendingModelSwitches = new Map<string, symbol>()
+
+const acknowledgedModels = new Map<string, {
+  model: string; provider: string; source: ComposerModelSource; wire: string
+}>()
+
+const waitForModelTurn = () => new Promise<void>(resolve => { window.setTimeout(resolve, 1000) })
+
+function modelSwitchBaseline(pendingKey: string, touchesPrimary: boolean, liveSessionId: null | string) {
+  return acknowledgedModels.get(pendingKey) ?? {
+    model: touchesPrimary ? $currentModel.get() : ($sessionStates.get()[liveSessionId!]?.model ?? ''),
+    provider: touchesPrimary ? $currentProvider.get() : ($sessionStates.get()[liveSessionId!]?.provider ?? ''),
+    wire: touchesPrimary
+      ? $currentReasoningEffortWire.get()
+      : ($sessionStates.get()[liveSessionId!]?.reasoningEffortWire ?? ''),
+    source: getCurrentModelSource()
+  }
+}
+
+async function runQueuedModelSwitch({
+  isCurrentIntent, requestGateway, sessionId, requestSwitch, handleConfirmation,
+  touchesPrimary, paintSelection, cacheSelection, selection, onError, onDone
+}: {
+  isCurrentIntent: () => boolean
+  requestGateway: ModelControlsOptions['requestGateway']
+  sessionId: string
+  requestSwitch: () => Promise<ModelSwitchResponse>
+  handleConfirmation: (result: ModelSwitchResponse) => Promise<boolean>
+  touchesPrimary: boolean
+  paintSelection: () => void
+  cacheSelection: (provider: string, model: string) => void
+  selection: ModelSelection
+  onError: (error: unknown) => void
+  onDone: () => void
+}): Promise<void> {
+  try {
+    while (isCurrentIntent()) {
+      await waitForModelTurn()
+
+      if (!isCurrentIntent()) { return }
+
+      const active = await requestGateway<{ sessions: Array<{ id: string; status: string }> }>(
+        'session.active_list', { current_session_id: sessionId })
+
+      if (!Array.isArray(active.sessions)) { throw new Error('Could not verify whether the turn ended') }
+      const status = active.sessions.find(row => row.id === sessionId)?.status
+
+      if (status === 'starting' || status === 'waiting' || status === 'working') { continue }
+      await requestGateway('session.activate', { session_id: sessionId })
+
+      if (!isCurrentIntent()) { return }
+      let result: ModelSwitchResponse
+
+      try {
+        result = await requestSwitch()
+      } catch (retryError) {
+        if (isBusySessionModelSwitch(retryError)) { continue }
+        throw retryError
+      }
+
+      if (!isCurrentIntent()) { return }
+
+      if (result?.confirm_required) { await handleConfirmation(result) }
+      else {
+        if (!touchesPrimary || $activeSessionId.get() === sessionId) { paintSelection() }
+        cacheSelection(selection.provider, selection.model)
+      }
+
+      return
+    }
+  } catch (retryError) {
+    if (isCurrentIntent()) { onError(retryError) }
+  } finally {
+    if (isCurrentIntent()) { onDone() }
+  }
 }
 
 export function useModelControls({
@@ -257,18 +337,32 @@ export function useModelControls({
       const liveSessionId = 'sessionId' in selection ? (selection.sessionId ?? null) : primaryRuntimeId
       const touchesPrimary = !liveSessionId || liveSessionId === primaryRuntimeId
 
-      const prevModel = touchesPrimary ? $currentModel.get() : ($sessionStates.get()[liveSessionId!]?.model ?? '')
-
-      const prevProvider = touchesPrimary
-        ? $currentProvider.get()
-        : ($sessionStates.get()[liveSessionId!]?.provider ?? '')
-
-      const prevWire = touchesPrimary
-        ? $currentReasoningEffortWire.get()
-        : ($sessionStates.get()[liveSessionId!]?.reasoningEffortWire ?? '')
-
-      const prevSource = getCurrentModelSource()
       const liveGatewayProfile = cacheProfile || $activeGatewayProfile.get()
+      const pendingKey = JSON.stringify([cacheOwnerConnectionId, liveGatewayProfile, liveSessionId])
+
+      // A superseding picker sees the earlier optimistic paint. Keep the last
+      // acknowledged route instead of treating that paint as the rollback target.
+      const previous = modelSwitchBaseline(pendingKey, touchesPrimary, liveSessionId)
+
+      if (pendingModelSwitches.has(pendingKey)) { dismissNotification(`model-switch-${pendingKey}`) }
+      pendingModelSwitches.delete(pendingKey)
+      // Claim this choice before the first RPC: an older response can arrive
+      // after a newer choice has already been applied.
+      const token = Symbol('model pick')
+
+      if (liveSessionId) {
+        pendingModelSwitches.set(pendingKey, token)
+        acknowledgedModels.set(pendingKey, previous)
+      }
+
+      const isCurrentIntent = () => pendingModelSwitches.get(pendingKey) === token
+
+      const clearIntent = () => {
+        if (isCurrentIntent()) {
+          pendingModelSwitches.delete(pendingKey)
+          acknowledgedModels.delete(pendingKey)
+        }
+      }
 
       const paintSelection = () => {
         if (touchesPrimary) {
@@ -292,22 +386,26 @@ export function useModelControls({
       }
 
       const rollbackSelection = () => {
+        if (liveSessionId && !isCurrentIntent()) { return }
+
+        if (touchesPrimary && liveSessionId && $activeSessionId.get() !== liveSessionId) { return }
+
         if (touchesPrimary) {
-          setCurrentModel(prevModel)
-          setCurrentProvider(prevProvider)
+          setCurrentModel(previous.model)
+          setCurrentProvider(previous.provider)
           // The setters withdraw the wire stamp on a change; the old route's stamp is still true.
-          setCurrentReasoningEffortWire(prevWire)
-          setCurrentModelSource(prevSource)
+          setCurrentReasoningEffortWire(previous.wire)
+          setCurrentModelSource(previous.source)
         } else if (liveSessionId) {
           sessionTileDelegate()?.updateSession(liveSessionId, state => ({
             ...state,
-            model: prevModel,
-            provider: prevProvider,
-            reasoningEffortWire: prevWire
+            model: previous.model,
+            provider: previous.provider,
+            reasoningEffortWire: previous.wire
           }))
         }
 
-        cacheSelection(prevProvider, prevModel)
+        cacheSelection(previous.provider, previous.model)
       }
 
       paintSelection()
@@ -335,53 +433,60 @@ export function useModelControls({
       const isSessionOnlyPreset = (selection.provider || '').toLowerCase() === 'moa'
       const scope = touchesPrimary && !isSessionOnlyPreset ? '' : ' --session'
 
-      const requestSwitch = (confirmExpensiveModel = false) =>
-        requestGateway<ModelSwitchResponse>('config.set', {
+      const requestSwitch = async (confirmExpensiveModel = false) => {
+        const result = await requestGateway<ModelSwitchResponse>('config.set', {
           session_id: liveSessionId,
           key: 'model',
           value: `${selection.model} --provider ${selection.provider}${scope}`,
           ...(confirmExpensiveModel ? { confirm_expensive_model: true } : {})
         })
 
-      const finishSwitch = (result: ModelSwitchResponse | undefined) => {
-        // A pick made DURING a turn is queued by the gateway and applied at the
-        // next turn start (`deferred`). Re-fetching now would answer with the
-        // model still running and repaint the old name over the user's choice —
-        // the switch publishes session.info when it lands, and that is what
-        // re-syncs every surface.
-        if (!result?.deferred) {
+        // Record every committed response, including queued/confirmed requests
+        // superseded while in flight. Newer intent keeps its optimistic paint,
+        // but must roll back to the model the gateway actually acknowledged.
+        if (!result?.confirm_required && !result?.deferred) {
+          if (acknowledgedModels.get(pendingKey) === previous) {
+            previous.model = selection.model
+            previous.provider = selection.provider
+            previous.wire = ''
+            previous.source = 'manual'
+          }
+
           void queryClient.invalidateQueries({
             queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId, cacheOwnerConnectionId)
           })
         }
+
+        return result
       }
 
-      try {
-        const result = await requestSwitch()
+      const handleConfirmation = (result: ModelSwitchResponse) => {
+        if (!isCurrentIntent() || (touchesPrimary && $activeSessionId.get() !== liveSessionId)) {
+          return Promise.resolve(false)
+        }
 
-        if (result?.confirm_required) {
-          rollbackSelection()
+        rollbackSelection()
+
           // ONE shared applier for guarded switches (#95293): the same
           // confirm flow the Bots editor routes through — never fork this
           // logic per surface.
           // Not awaited: `selectModel` answers "was the switch applied NOW",
           // and that answer only exists once the user answers the dialog.
-          void surfaceModelSwitchConfirm({
+        return surfaceModelSwitchConfirm({
             confirmMessage: result.confirm_message,
             failureMessage: copy.modelSwitchFailed,
-            finish: finishSwitch,
             // Staleness guard — the session or model can move on while the
             // dialog is open. Answering it must not clobber the newer choice:
             // bail (with a notice) if the live state no longer matches the
             // snapshot this prompt was created for.
             isStale: () =>
-              touchesPrimary
+              !isCurrentIntent() || (touchesPrimary
                 ? $activeSessionId.get() !== liveSessionId ||
-                  $currentModel.get() !== prevModel ||
-                  $currentProvider.get() !== prevProvider
+                  $currentModel.get() !== previous.model ||
+                  $currentProvider.get() !== previous.provider
                 : !liveSessionId ||
-                  $sessionStates.get()[liveSessionId]?.model !== prevModel ||
-                  $sessionStates.get()[liveSessionId]?.provider !== prevProvider,
+                  $sessionStates.get()[liveSessionId]?.model !== previous.model ||
+                  $sessionStates.get()[liveSessionId]?.provider !== previous.provider),
             model: selection.model,
             repaint: () => {
               paintSelection()
@@ -389,25 +494,66 @@ export function useModelControls({
             },
             requestConfirmed: () => requestSwitch(true),
             rollback: rollbackSelection
+        })
+      }
+
+      try {
+        const result = await requestSwitch()
+
+        if (!isCurrentIntent()) {
+          return false
+        }
+
+        if (result?.confirm_required) {
+          void handleConfirmation(result).finally(() => {
+            clearIntent()
           })
 
           return false
         }
 
-        finishSwitch(result)
+        clearIntent()
 
         return true
       } catch (err) {
-        // An OLDER gateway refuses a mid-turn switch outright (4009) instead of
-        // deferring it. Don't punish the user for a backend they haven't
-        // updated: keep the pick painted as the composer's selection, which is
-        // what the NEXT turn runs anyway. Current gateways never take this
-        // path — they answer `deferred`.
+        if (!isCurrentIntent()) { return false }
+
+        // The canonical owner refuses a mutation while the turn owns its frozen
+        // policy. Keep the current model truthful, then retry after the owner
+        // reports that turn idle. A fresh resume supplies the new CAS revision.
         if (isBusySessionModelSwitch(err)) {
+          rollbackSelection()
+
+          const notificationId = notify({
+            id: `model-switch-${pendingKey}`,
+            kind: 'info',
+            title: 'Model switch queued',
+            message: 'The current reply will finish before the model changes.',
+            durationMs: 0
+          })
+
+          void runQueuedModelSwitch({
+            isCurrentIntent,
+            requestGateway,
+            sessionId: liveSessionId,
+            requestSwitch,
+            handleConfirmation,
+            touchesPrimary,
+            paintSelection,
+            cacheSelection,
+            selection,
+            onError: retryError => notifyError(retryError, copy.modelSwitchFailed),
+            onDone: () => {
+              clearIntent()
+              dismissNotification(notificationId)
+            }
+          })
+
           return true
         }
 
         rollbackSelection()
+        clearIntent()
         notifyError(err, copy.modelSwitchFailed)
 
         return false

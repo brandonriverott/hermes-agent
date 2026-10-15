@@ -11,7 +11,7 @@ import {
   windowsUpdatePrerequisiteError
 } from './updater-process'
 
-test('PM update prerequisites use the exact published launcher, not checkout venv files', (): void => {
+test('PM update prerequisites use the exact published launcher, not checkout venv files', async () => {
   const root: string = fs.mkdtempSync(path.join(os.tmpdir(), 'update-launcher-'))
 
   try {
@@ -19,22 +19,22 @@ test('PM update prerequisites use the exact published launcher, not checkout ven
     fs.mkdirSync(path.join(root, '.hermes', 'bin'), { recursive: true })
     const launcher: string = path.join(root, '.hermes', 'bin', 'hermes.cmd')
     fs.writeFileSync(launcher, '@echo off')
-    assert.equal(resolveInstallationLauncher(root, true), launcher)
-    assert.equal(windowsUpdatePrerequisiteError(root), null)
+    assert.equal(await resolveInstallationLauncher(root, true), launcher)
+    assert.equal(await windowsUpdatePrerequisiteError(root), null)
     const scripts: string = path.join(root, 'scripts', 'desktop-update')
     fs.mkdirSync(scripts, { recursive: true })
     fs.writeFileSync(path.join(scripts, 'windows.ps1'), '')
-    assert.equal(windowsUpdatePrerequisiteError(root), null) // old handoff is a manual transition
+    assert.equal(await windowsUpdatePrerequisiteError(root), null) // old handoff is a manual transition
     fs.writeFileSync(path.join(scripts, 'runtime.ps1'), '')
-    assert.equal(windowsUpdatePrerequisiteError(root), null)
+    assert.equal(await windowsUpdatePrerequisiteError(root), null)
     fs.unlinkSync(launcher)
-    assert.equal(resolveInstallationLauncher(root, true), null)
+    assert.equal(await resolveInstallationLauncher(root, true), null)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
 
-test('earlier PM user-bin launchers are accepted only for the reported source tree', (): void => {
+test('earlier PM user-bin launchers are accepted only for the reported source tree', async () => {
   const base: string = fs.mkdtempSync(path.join(os.tmpdir(), 'old-pm-launcher-'))
 
   try {
@@ -54,11 +54,11 @@ test('earlier PM user-bin launchers are accepted only for the reported source tr
         : `#!/bin/sh\nprintf '%s\\n' 'Install directory: ${reported}'\n`
 
     fs.writeFileSync(launcher, body(root), { mode: 0o755 })
-    assert.equal(launcherTargetsInstallation(launcher, root), true)
-    assert.equal(resolveInstallationLauncher(root, process.platform === 'win32', home), launcher)
+    assert.equal(await launcherTargetsInstallation(launcher, root), true)
+    assert.equal(await resolveInstallationLauncher(root, process.platform === 'win32', home), launcher)
     fs.writeFileSync(launcher, body(other), { mode: 0o755 })
-    assert.equal(launcherTargetsInstallation(launcher, root), false)
-    assert.equal(resolveInstallationLauncher(root, process.platform === 'win32', home), null)
+    assert.equal(await launcherTargetsInstallation(launcher, root), false)
+    assert.equal(await resolveInstallationLauncher(root, process.platform === 'win32', home), null)
   } finally {
     fs.rmSync(base, { recursive: true, force: true })
   }
@@ -69,14 +69,14 @@ test('earlier PM user-bin launchers are accepted only for the reported source tr
 // being handed to the shell. Windows-only: POSIX launchers never touch a shell.
 test.skipIf(process.platform !== 'win32')(
   'a .cmd launcher path with cmd metacharacters is refused, not executed',
-  (): void => {
+  async () => {
     const root: string = fs.mkdtempSync(path.join(os.tmpdir(), 'cmd-meta-launcher-'))
 
     try {
       const launcher: string = path.join(root, 'a&b', 'hermes.cmd')
       fs.mkdirSync(path.dirname(launcher))
       fs.writeFileSync(launcher, `@echo off\r\necho Install directory: ${root}\r\n`)
-      assert.equal(launcherTargetsInstallation(launcher, root), false)
+      assert.equal(await launcherTargetsInstallation(launcher, root), false)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
     }

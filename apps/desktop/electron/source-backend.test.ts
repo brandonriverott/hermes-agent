@@ -197,9 +197,9 @@ test.skipIf(process.platform === 'win32')(
       }
 
       fs.unlinkSync(fixture.launcher)
-      assert.equal(
-        await resolveSourceInstallationBackend(fixture.root, serveBackendArgs(), { hermesHome: env.HERMES_HOME, env }),
-        null,
+      await assert.rejects(
+        resolveSourceInstallationBackend(fixture.root, serveBackendArgs(), { hermesHome: env.HERMES_HOME, env }),
+        /installation launcher is unavailable/,
         'a missing PM command must not fall back to the stale venv'
       )
     } finally {

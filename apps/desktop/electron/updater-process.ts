@@ -1,7 +1,8 @@
-import { execFileSync, spawn, type SpawnOptions, spawnSync, type SpawnSyncReturns } from 'node:child_process'
+import { execFile, execFileSync, spawn, type SpawnOptions } from 'node:child_process'
 import { existsSync, realpathSync, statSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { promisify } from 'node:util'
 
 /** Historical layouts still matter when uninstalling or migrating a source install. */
 export function resolveVenvDir(updateRoot: string): string {
@@ -24,11 +25,11 @@ import { platformDefaultHermesHome } from './data-paths'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 
 /** Exact installation identity; PATH may refer to another checkout. */
-export function resolveInstallationLauncher(
+export async function resolveInstallationLauncher(
   updateRoot: string,
   isWindows: boolean = process.platform === 'win32',
   hermesHome: string = process.env.HERMES_HOME ?? ''
-): string | null {
+): Promise<string | null> {
   const names: string[] = isWindows ? ['hermes.exe', 'hermes.cmd'] : ['hermes']
 
   for (const name of names) {
@@ -45,7 +46,7 @@ export function resolveInstallationLauncher(
     const extraDirs: string[] = isWindows ? [path.join(path.dirname(updateRoot), 'bin')] : []
 
     for (const candidate of userBinLaunchers(isWindows, hermesHome, extraDirs)) {
-      if (launcherTargetsInstallation(candidate, updateRoot)) {
+      if (await launcherTargetsInstallation(candidate, updateRoot)) {
         return candidate
       }
     }
@@ -87,24 +88,32 @@ function userBinLaunchers(isWindows: boolean, hermesHome: string, extraDirs: str
  * published. Return the install directory that launcher reports, when it is a
  * Hermes source tree; the caller still resolves and probes it by root.
  */
-export function userLauncherInstallRoot(
+export async function userLauncherInstallRoot(
   isWindows: boolean = process.platform === 'win32',
   hermesHome: string = process.env.HERMES_HOME ?? ''
-): { launcher: string; root: string } | null {
+): Promise<{ launcher: string; root: string } | null> {
+  let failure: unknown
   for (const launcher of userBinLaunchers(isWindows, hermesHome)) {
-    const root: string | null = launcherInstallDirectory(launcher)
+    let root: string | null
+    try {
+      root = await launcherInstallDirectory(launcher)
+    } catch (error) {
+      failure = error
+      continue
+    }
 
     if (root && existsSync(path.join(root, 'hermes_cli', 'main.py'))) {
       return { launcher, root }
     }
   }
 
+  if (failure) { throw failure }
   return null
 }
 
-export function launcherTargetsInstallation(launcher: string, root: string): boolean {
+export async function launcherTargetsInstallation(launcher: string, root: string): Promise<boolean> {
   try {
-    const reported: string | null = launcherInstallDirectory(launcher, root)
+    const reported: string | null = await launcherInstallDirectory(launcher, root)
 
     return reported !== null && reported === realpathSync(root)
   } catch {
@@ -112,37 +121,46 @@ export function launcherTargetsInstallation(launcher: string, root: string): boo
   }
 }
 
+const executeLauncher: typeof execFile.__promisify__ = promisify(execFile)
+const launcherProbes = new Map<string, Promise<string | null>>()
+
+/** Share only in-flight probes. A later retry must observe runtime recovery. */
+function launcherInstallDirectory(launcher: string, root?: string): Promise<string | null> {
+  const key = JSON.stringify([launcher, root])
+  const pending = launcherProbes.get(key)
+  if (pending) { return pending }
+  const probe = probeLauncherInstallDirectory(launcher, root).finally(() => launcherProbes.delete(key))
+  launcherProbes.set(key, probe)
+  return probe
+}
+
 /** The real install directory a launcher's `--version` reports, or null. */
-function launcherInstallDirectory(launcher: string, root?: string): string | null {
+async function probeLauncherInstallDirectory(launcher: string, root?: string): Promise<string | null> {
+  // Node refuses to exec a .cmd directly (CVE-2024-27980), and `shell:true`
+  // would hand an interpolated path to cmd.exe wholesale. Invoke cmd.exe
+  // explicitly instead: a fixed argv, the path quoted verbatim and screened
+  // for cmd metacharacters, and nothing else for the shell to interpret.
+  const viaCmd: boolean = process.platform === 'win32' && /\.cmd$/i.test(launcher)
+
+  if (viaCmd && CMD_UNSAFE_PATH.test(launcher)) {
+    return null
+  }
+
+  const command: string = viaCmd ? (process.env.ComSpec ?? 'cmd.exe') : launcher
+  const args: string[] = viaCmd ? ['/d', '/s', '/c', `""${launcher}" --version"`] : ['--version']
+
+  const probe = await executeLauncher(command, args, {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: 15000,
+    windowsHide: true,
+    windowsVerbatimArguments: viaCmd,
+    env: root ? { ...process.env, HERMES_INSTALL_ROOT: root } : process.env
+  })
+
+  const reported: string | undefined = /^Install directory: (.+)$/m.exec(probe.stdout)?.[1]?.trim()
+
   try {
-    // Node refuses to exec a .cmd directly (CVE-2024-27980), and `shell:true`
-    // would hand an interpolated path to cmd.exe wholesale. Invoke cmd.exe
-    // explicitly instead: a fixed argv, the path quoted verbatim and screened
-    // for cmd metacharacters, and nothing else for the shell to interpret.
-    const viaCmd: boolean = process.platform === 'win32' && /\.cmd$/i.test(launcher)
-
-    if (viaCmd && CMD_UNSAFE_PATH.test(launcher)) {
-      return null
-    }
-
-    const command: string = viaCmd ? (process.env.ComSpec ?? 'cmd.exe') : launcher
-    const args: string[] = viaCmd ? ['/d', '/s', '/c', `""${launcher}" --version"`] : ['--version']
-
-    const probe: SpawnSyncReturns<string> = spawnSync(command, args, {
-      cwd: root,
-      encoding: 'utf8',
-      timeout: 15000,
-      windowsHide: true,
-      windowsVerbatimArguments: viaCmd,
-      env: root ? { ...process.env, HERMES_INSTALL_ROOT: root } : process.env
-    })
-
-    if (probe.error || probe.status !== 0) {
-      return null
-    }
-
-    const reported: string | undefined = /^Install directory: (.+)$/m.exec(probe.stdout)?.[1]?.trim()
-
     return reported ? realpathSync(reported) : null
   } catch {
     return null
@@ -150,8 +168,8 @@ function launcherInstallDirectory(launcher: string, root?: string): string | nul
 }
 
 /** File prerequisites only: dependency recovery remains reachable through update. */
-export function windowsUpdatePrerequisiteError(updateRoot: string, hermesHome?: string): string | null {
-  if (!resolveInstallationLauncher(updateRoot, true, hermesHome)) {
+export async function windowsUpdatePrerequisiteError(updateRoot: string, hermesHome?: string): Promise<string | null> {
+  if (!await resolveInstallationLauncher(updateRoot, true, hermesHome)) {
     return `Update aborted: the installation launcher under ${updateRoot} is missing. Repair this installation before retrying.`
   }
 

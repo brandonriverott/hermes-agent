@@ -199,22 +199,17 @@ test('a dial against a replaced local gateway forgets the cached endpoint once a
   expect(ensures).toBe(2)
 })
 
-test('a ready owner running other code than this Hermes is restarted once, then re-ensured', async () => {
-  // After `hermes update` the live gateway still serves the old code and answers model calls
-  // 503 "Restart required"; attaching to it on every dial pinned the user to it forever.
-  const { createStaleGatewayRestarter } = await import('./local-gateway')
+test('a ready owner running older code is kept attached across repeated dials', async () => {
+  const { createStaleGatewayAttacher } = await import('./local-gateway')
   const endpoint = { profile_id: '/h/profiles/w', control_home: '/h', instance_id: 'old', authority_epoch: 1, runtime_protocol: 1, api_origin: 'http://127.0.0.1:1234', capabilities: ['session-authority-v1'], supervisor: 'none', code_sha: 'OLD' }
-  const answers = [{ ...endpoint, code_sha: 'old' }, { ...endpoint, instance_id: 'new', code_sha: 'new' }, endpoint, endpoint]
-  const restarted: string[] = []
-  const restartStale = createStaleGatewayRestarter(async owner => { restarted.push(owner) }, () => undefined)
+  const answers = [{ ...endpoint, code_sha: 'old' }, { ...endpoint, code_sha: 'old' }]
+  const logs: string[] = []
+  const restartStale = createStaleGatewayAttacher(message => { logs.push(message) })
   const ensure = () => ensureLocalGateway(async () => ({ code: 0, stdout: JSON.stringify({ state: 'ready', endpoint: answers.shift(), client_code_sha: 'new' }) }), undefined, restartStale)
 
-  expect((await ensure()).gatewayEndpoint.instance_id).toBe('new')
-  // A served secondary is replaced through the multiplexer that owns its process, not `-p w`.
-  expect(restarted).toEqual(['default'])
-  // A restart that cannot move the owner (a unit pinned to another checkout) is not repeated per dial.
   expect((await ensure()).gatewayEndpoint.instance_id).toBe('old')
-  expect(restarted).toEqual(['default'])
+  expect((await ensure()).gatewayEndpoint.instance_id).toBe('old')
+  expect(logs).toHaveLength(2)
 })
 
 test('a dial that keeps failing after one re-ensure surfaces the error instead of looping', async () => {

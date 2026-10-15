@@ -71,8 +71,8 @@ export interface GatewayEndpoint {
   code_sha?: string | null
 }
 
-/** Restarts a ready owner whose code differs from this client's; true when a restart was requested. */
-export type StaleGatewayRestart = (endpoint: GatewayEndpoint, stale: { gateway: string; client: string }) => Promise<boolean>
+/** Return true only when an owner replacement has actually been requested. */
+export type StaleGatewayPolicy = (endpoint: GatewayEndpoint, stale: { gateway: string; client: string }) => Promise<boolean>
 
 /** The profile whose `hermes --profile P gateway restart` replaces the process behind `endpoint`:
  *  the multiplexer root (`default`) for a served secondary, else the endpoint's own profile home. */
@@ -82,44 +82,13 @@ export function gatewayOwnerProfile(endpoint: GatewayEndpoint): string {
   return path.basename(path.dirname(home)) === 'profiles' ? path.basename(home) : 'default'
 }
 
-/** One restart per (owner process, stale gateway, client) per Desktop process. An owner a restart cannot move
- *  (a service unit pinned to another checkout) is then attached as-is instead of being restarted
- *  on every dial. */
-export function createStaleGatewayRestarter(
-  restart: (ownerProfile: string) => Promise<void>,
-  log: (message: string) => void
-): StaleGatewayRestart {
-  // Concurrent dials (primary + a served profile) that see the same stale owner share ONE restart;
-  // a dial arriving after it finished attaches as-is.
-  const restarts = new Map<string, { done: boolean; promise: Promise<void> }>()
+/** A code mismatch can coexist with active turns for hours. Keep the serving owner
+ *  attached; only an explicit, separately quiesced lifecycle action may replace it. */
+export function createStaleGatewayAttacher(log: (message: string) => void): StaleGatewayPolicy {
+  return async (_endpoint, stale) => {
+    log(`[gateway] owner runs ${stale.gateway} (this Hermes is ${stale.client}); attaching without interrupting active work`)
 
-  return async (endpoint, stale) => {
-    const key = `${gatewayOwnerProfile(endpoint)}\n${stale.gateway}\n${stale.client}`.toLowerCase()
-    const pending = restarts.get(key)
-
-    if (pending && !pending.done) {
-      await pending.promise
-
-      return true
-    }
-
-    if (pending) {
-      log(`[gateway] owner still runs ${stale.gateway} (this Hermes is ${stale.client}) after a restart; attaching as-is`)
-
-      return false
-    }
-
-    log(`[gateway] owner runs ${stale.gateway} but this Hermes is ${stale.client}; restarting it`)
-    const entry = { done: false, promise: restart(gatewayOwnerProfile(endpoint)) }
-    restarts.set(key, entry)
-
-    try {
-      await entry.promise
-    } finally {
-      entry.done = true
-    }
-
-    return true
+    return false
   }
 }
 
@@ -143,7 +112,7 @@ export function parseGatewayEnsureOutput(result: { code: number; stdout: string;
 }
 
 /** `{ gateway, client }` commits when a ready owner provably runs other code than the ensure
- *  client (a gateway that outlived `hermes update` answers model calls 503 "Restart required");
+ *  client. A gateway that outlived an update may refuse settings writes until restarted;
  *  null when they match or either side cannot name its code. */
 export function staleGatewayCode(payload: Record<string, any>): { gateway: string; client: string } | null {
   const gateway = payload?.endpoint?.code_sha
@@ -169,15 +138,15 @@ function assertLocalGatewayEndpoint(endpoint: GatewayEndpoint): void {
 export async function ensureLocalGateway(
   run: () => Promise<{ code: number; stdout: string; stderr?: string }>,
   beforeEnsure?: () => Promise<void>,
-  restartStale?: StaleGatewayRestart
+  restartStale?: StaleGatewayPolicy
 ) {
   await beforeEnsure?.()
   let result = await run()
   let payload = parseGatewayEnsureOutput(result)
   const stale = restartStale && result.code === 0 && payload.state === 'ready' ? staleGatewayCode(payload) : null
 
-  // Attaching would pin a stale owner (503 "Restart required" forever): replace it once, then
-  // take whatever answers the re-ensure.
+  // A lifecycle request can drain an active owner beyond Desktop's deadline.
+  // Attach to the serving owner while recording code skew for a later explicit update.
   if (stale && await restartStale!(payload.endpoint, stale)) {
     result = await run()
     payload = parseGatewayEnsureOutput(result)

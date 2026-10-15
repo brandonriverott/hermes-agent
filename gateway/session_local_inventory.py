@@ -176,14 +176,59 @@ def session_inventory(authority, policy, agent, cwd):
     return info
 
 
-async def snapshot_info(authority, ref):
-    """``local_session_info`` plus main's inventory, the builders run off the owner loop."""
+async def snapshot_info(authority, ref, *, defer_inventory=False):
+    """Return the session snapshot promptly; publish slow banner inventory when ready.
+
+    A skill scan can take longer than Desktop's resume deadline. The history and
+    current model are already authoritative, so a slow presentation inventory
+    must not prevent a viewer from reconnecting to an active reply.
+    """
     from gateway.session_local import local_session_info
     from gateway.session_policy import policy_for_source
     info = local_session_info(authority, ref)
-    policy = policy_for_source(authority.runner, authority.sessions[ref.session_id].source)
+    live = authority.sessions[ref.session_id]
+    policy = policy_for_source(authority.runner, live.source)
     agent = authority.agent(ref)
-    inventory = await asyncio.to_thread(session_inventory, authority, policy, agent, info.get("cwd"))
+    tasks = getattr(authority, '_session_inventory_tasks', None)
+    if tasks is None:
+        tasks = authority._session_inventory_tasks = {}
+    entry = tasks.get(ref.session_id)
+    if entry is None or entry['policy'] is not policy or entry['agent'] is not agent:
+        task = asyncio.create_task(asyncio.to_thread(session_inventory, authority, policy, agent, info.get('cwd')))
+        entry = {'policy': policy, 'agent': agent, 'task': task, 'deferred': False}
+        tasks[ref.session_id] = entry
+
+        def finished(done):
+            if tasks.get(ref.session_id) is not entry:
+                return
+            tasks.pop(ref.session_id, None)
+            if done.cancelled():
+                return
+            try:
+                inventory = done.result()
+            except Exception:
+                logger.warning('session inventory: delayed scan failed', exc_info=True)
+                return
+            if (not entry['deferred'] or authority.sessions.get(ref.session_id) is not live
+                    or policy_for_source(authority.runner, live.source) is not policy
+                    or authority.agent(ref) is not agent):
+                return
+            current = local_session_info(authority, ref)
+            if current.get('tool_count') is None:
+                current['tool_count'] = sum(len(names) for names in (inventory.get('tools') or {}).values())
+            live.event_stream.publish(ref.session_id, {**inventory, **current}, event_type='session.info')
+
+        task.add_done_callback(finished)
+    try:
+        # Classic CLI/TUI startup consumes this very snapshot to draw its
+        # banner once. Only Desktop has a later session.info paint path.
+        if defer_inventory:
+            inventory = await asyncio.wait_for(asyncio.shield(entry['task']), timeout=0.15)
+        else:
+            inventory = await asyncio.shield(entry['task'])
+    except TimeoutError:
+        entry['deferred'] = True
+        return info
     if info.get('tool_count') is None:
         # A lazy session: the tools its first turn loads (the banner's own count).
         info['tool_count'] = sum(len(names) for names in (inventory.get('tools') or {}).values())

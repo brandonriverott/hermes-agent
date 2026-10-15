@@ -15,8 +15,9 @@ export function createInstalledRuntimeGate(env: NodeJS.ProcessEnv, log: (message
   let installedThisLaunch = false
 
   return {
-    /** The ACTIVE_HERMES_ROOT rung: probe the installed runtime unless the flag skips it. */
-    async resolve<T>(root: string, probe: () => Promise<T | null>): Promise<T | null> {
+    /** Gate the entire installed-runtime discovery ladder, including user-bin probes. */
+    async resolve<T>(root: string, probe: () => Promise<T | null>, repairRequested = false): Promise<T | null> {
+      if (repairRequested) { return null }
       if (env.HERMES_DESKTOP_IGNORE_EXISTING === '1' && !installedThisLaunch) {
         log(`[bootstrap] HERMES_DESKTOP_IGNORE_EXISTING=1; skipping the installed runtime at ${root}`)
 

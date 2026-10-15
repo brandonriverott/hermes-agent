@@ -12,6 +12,31 @@ afterEach((): void => {
   vi.unstubAllEnvs()
 })
 
+test.skipIf(process.platform === 'win32')('launcher discovery yields the event loop and shares concurrent probes', async () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'launcher-responsive-')))
+  const home = path.join(base, 'home')
+  const root = path.join(base, 'repo')
+  sourceTree(root)
+  const launcher = publishLauncher(path.join(home, '.local', 'bin'), root)
+  const calls = path.join(base, 'calls')
+  fs.writeFileSync(launcher, `#!/bin/sh\nprintf 'call\\n' >> '${calls}'\nsleep 0.1\nprintf '%s\\n' 'Install directory: ${root}'\n`, { mode: 0o755 })
+  vi.stubEnv('HOME', home)
+  let heartbeat = false
+  const timer = setTimeout(() => { heartbeat = true }, 0)
+  try {
+    const results = await Promise.all([
+      userLauncherInstallRoot(false, path.join(home, '.hermes')),
+      userLauncherInstallRoot(false, path.join(home, '.hermes'))
+    ])
+    assert.equal(heartbeat, true)
+    assert.deepEqual(results.map(result => result?.root), [root, root])
+    assert.equal(fs.readFileSync(calls, 'utf8'), 'call\n')
+  } finally {
+    clearTimeout(timer)
+    fs.rmSync(base, { recursive: true, force: true })
+  }
+})
+
 function sourceTree(root: string): void {
   fs.mkdirSync(path.join(root, 'hermes_cli'), { recursive: true })
   fs.mkdirSync(path.join(root, 'pm'))
@@ -49,7 +74,7 @@ test.skipIf(process.platform === 'win32')(
       vi.stubEnv('HOME', home)
       vi.stubEnv('PATH', '/usr/bin:/bin:/usr/sbin:/sbin')
 
-      const found = userLauncherInstallRoot(false, path.join(home, '.hermes'))
+      const found = await userLauncherInstallRoot(false, path.join(home, '.hermes'))
       assert.deepEqual(found, { launcher, root })
 
       const backend = await resolveSourceInstallationBackend(root, ['serve'], {
@@ -66,7 +91,7 @@ test.skipIf(process.platform === 'win32')(
   }
 )
 
-test('a user-bin launcher is ignored when it reports no Hermes source tree', (): void => {
+test('a user-bin launcher is ignored when it reports no Hermes source tree', async () => {
   const base: string = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'user-launcher-')))
 
   try {
@@ -79,10 +104,10 @@ test('a user-bin launcher is ignored when it reports no Hermes source tree', ():
     vi.stubEnv('USERPROFILE', home)
     vi.stubEnv('LOCALAPPDATA', path.join(home, 'AppData', 'Local'))
 
-    assert.equal(userLauncherInstallRoot(process.platform === 'win32', hermesHome), null)
+    assert.equal(await userLauncherInstallRoot(process.platform === 'win32', hermesHome), null)
 
     sourceTree(notSource)
-    assert.equal(userLauncherInstallRoot(process.platform === 'win32', hermesHome)?.root, notSource)
+    assert.equal((await userLauncherInstallRoot(process.platform === 'win32', hermesHome))?.root, notSource)
   } finally {
     fs.rmSync(base, { recursive: true, force: true })
   }
