@@ -148,7 +148,9 @@ export function ComposerStatusStack({ onSubmit, queue, sessionId }: ComposerStat
   const sharedMetricsConsent = useStore($sharedMetricsConsent)
   const sharedMetricsOffer = ownsFreeTierNotice && !freeTierNotice && sharedMetricsOfferPending(sharedMetricsConsent)
 
-  const isStructuredSupported = controlEntry?.capability === 'supported'
+  // Structured controls replace the legacy goal only once there is a snapshot to show; a read
+  // refused inside a mid-turn compression window marks the entry supported with none yet.
+  const isStructuredSupported = controlEntry?.capability === 'supported' && controlEntry.snapshot !== null
 
   // Every group, before the shelf decides what to SHOW: whether a dev server is
   // running is a fact about the session (it keeps its localhost preview chip
