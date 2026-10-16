@@ -794,10 +794,16 @@ export async function refreshSessionControl(
     }
 
     // A mid-turn compression moves the chat to a new session id, and the gateway re-points the
-    // route only at turn end; reads refused in that window are not a user-visible fault. Keep the
-    // last snapshot quietly; the after-turn refresh reads again once the route catches up.
-    if (options.background && isStaleGeneration(error)) {
-      publishEntry(sessionId, { ...($sessionControlBySession.get()[sessionId] ?? emptyEntry()), loading: false })
+    // route only at turn end; reads refused in that window are not a user-visible fault. That holds
+    // for the open/switch hydration read too, which can land anywhere in a long turn. Keep the last
+    // snapshot quietly. The refusal proves the RPC exists, so mark it supported and the after-turn
+    // refresh reads again once the route catches up. Actions still report it.
+    if (isStaleGeneration(error)) {
+      publishEntry(sessionId, {
+        ...($sessionControlBySession.get()[sessionId] ?? emptyEntry()),
+        capability: 'supported',
+        loading: false
+      })
 
       return $sessionControlBySession.get()[sessionId]
     }
