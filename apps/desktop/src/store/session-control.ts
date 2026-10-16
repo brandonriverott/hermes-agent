@@ -793,10 +793,25 @@ export async function refreshSessionControl(
       return $sessionControlBySession.get()[sessionId]
     }
 
+    // A mid-turn compression moves the chat to a new session id, and the gateway re-points the
+    // route only at turn end; reads refused in that window are not a user-visible fault. Keep the
+    // last snapshot quietly; the after-turn refresh reads again once the route catches up.
+    if (options.background && isStaleGeneration(error)) {
+      publishEntry(sessionId, { ...($sessionControlBySession.get()[sessionId] ?? emptyEntry()), loading: false })
+
+      return $sessionControlBySession.get()[sessionId]
+    }
+
     publishFailure(sessionId, token, error, false)
 
     return $sessionControlBySession.get()[sessionId]
   }
+}
+
+function isStaleGeneration(error: unknown): boolean {
+  const data = isRecord(error) ? error.data : undefined
+
+  return isRecord(data) && data.reason === 'stale_generation'
 }
 
 /** Runs an allowlisted backend control action; callers own any composer/UI dispatch. */

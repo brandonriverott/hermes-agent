@@ -169,6 +169,32 @@ describe('session-control store', () => {
     expect(entry.loading).toBe(false)
   })
 
+  it('keeps a background read quiet while the route catches up after a mid-turn compression', async () => {
+    applySessionControlSnapshot('s1', FULL_SNAPSHOT)
+
+    const staleGeneration = () =>
+      new JsonRpcGatewayError('stale_generation', { code: 4001, data: { reason: 'stale_generation' } })
+
+    useGateway(
+      vi.fn(async () => {
+        throw staleGeneration()
+      })
+    )
+
+    await refreshSessionControl('s1', { background: true })
+
+    expect($sessionControlBySession.get().s1).toMatchObject({
+      capability: 'supported',
+      error: null,
+      loading: false,
+      snapshot: { revision: FULL_SNAPSHOT.revision }
+    })
+
+    await refreshSessionControl('s1')
+
+    expect($sessionControlBySession.get().s1!.error).toBe('stale_generation')
+  })
+
   it('downgrades a current action method-not-found once, preserves its snapshot, and still rejects', async () => {
     applySessionControlSnapshot('s1', FULL_SNAPSHOT)
     useGateway(
