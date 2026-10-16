@@ -72,7 +72,7 @@ export async function readSourceUpdate(probe: SourceUpdateProbe): Promise<Source
   const managed = existsSync(path.join(probe.updateRoot, 'pm'))
 
   const launcher = managed
-    ? resolveInstallationLauncher(probe.updateRoot, process.platform === 'win32', probe.hermesHome)
+    ? await resolveInstallationLauncher(probe.updateRoot, process.platform === 'win32', probe.hermesHome)
     : null
 
   if (managed && !launcher) {

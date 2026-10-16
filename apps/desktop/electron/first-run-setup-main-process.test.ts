@@ -7,6 +7,31 @@ import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 
+test('a recovered startup dismisses and retires an older install choice without bootstrapping it', async () => {
+  let visible = false
+  const gate = createFirstRunSetupGate({
+    promptChoice: () => { visible = true }, hideChoice: () => { visible = false }, stuckAfterMs: 0
+  })
+  let backend = { kind: 'bootstrap-needed', local: 'none' as 'none' | 'installed' }
+  const ensured: string[] = []
+  const start = () => runPrimaryBackendStartup({
+    assertCurrentAttempt: () => {},
+    connectRemote: async () => null,
+    ensureLocalRuntime: async current => { ensured.push(current.kind); return current },
+    prepareLocalBackend: async () => backend,
+    resolveRemote: async () => null,
+    waitForDecision: gate.wait,
+    waitForLocalStart: async () => {}
+  })
+  const stale = start().catch(error => error)
+  await vi.waitFor(() => assert.equal(gate.hasWaiter(), true))
+  backend = { kind: 'command', local: 'installed' }
+  assert.deepEqual(await start(), { kind: 'local', backend })
+  assert.equal((await stale).firstRunSetupReset, true)
+  assert.equal(visible, false)
+  assert.deepEqual(ensured, ['command'])
+})
+
 test('a first-run bootstrap-needed remote apply connects without ensuring or bootstrapping locally', async () => {
   const gate = createFirstRunSetupGate({ stuckAfterMs: 0 })
 

@@ -407,16 +407,24 @@ describe('useModelControls', () => {
     expect(notifyError).not.toHaveBeenCalled()
   })
 
-  it('keeps the pick when an OLDER gateway refuses a mid-turn switch', async () => {
-    // Pre-deferral backends answer 4009 instead of parking the pick. Rolling
-    // back would bounce the pill to the old model and toast an error at a user
-    // who did nothing wrong; the pick still applies to the next turn.
+  it('activates the runtime identity after a busy turn before applying a model pick', async () => {
     $activeSessionId.set('session-1')
     setCurrentModel('fable-5')
     setCurrentProvider('nous')
 
-    const requestGateway = vi.fn(async () => {
-      throw new Error('session busy — /interrupt the current turn before switching models')
+    let working = true
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.active_list') {
+        return { sessions: [{ id: 'session-1', status: working ? 'working' : 'idle' }] } as never
+      }
+
+      if (method === 'session.resume') { throw new Error('No stored session matches this runtime identity') }
+      if (method === 'session.activate') { return { session_id: 'session-1' } as never }
+
+      if (working) { throw new Error('session_busy') }
+
+      return { ok: true } as never
     })
 
     let controls!: Controls
@@ -425,9 +433,152 @@ describe('useModelControls', () => {
 
     await expect(controls.selectModel({ model: 'grok-4.5', provider: 'xai' })).resolves.toBe(true)
 
+    expect($currentModel.get()).toBe('fable-5')
+    expect($currentProvider.get()).toBe('nous')
+    expect(requestGateway.mock.calls.filter(([method]) => method === 'config.set')).toHaveLength(1)
+    working = false
+    await waitFor(() => expect(requestGateway.mock.calls.filter(([method]) => method === 'config.set')).toHaveLength(2), { timeout: 4000 })
     expect($currentModel.get()).toBe('grok-4.5')
     expect($currentProvider.get()).toBe('xai')
     expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it('only applies the newest queued model pick when the turn settles', async () => {
+    $activeSessionId.set('session-1')
+    setCurrentModel('fable-5')
+    setCurrentProvider('nous')
+    let working = true
+    const applied: string[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.active_list') {
+        return { sessions: [{ id: 'session-1', status: working ? 'working' : 'idle' }] } as never
+      }
+
+      if (method === 'session.activate') { return { session_id: 'session-1' } as never }
+
+      if (working) { throw new Error('session_busy') }
+      applied.push(String(params?.value))
+
+      return { ok: true } as never
+    })
+
+    let controls!: Controls
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    await controls.selectModel({ model: 'first', provider: 'xai' })
+    await controls.selectModel({ model: 'second', provider: 'xai' })
+    working = false
+    await waitFor(() => expect(applied).toEqual(['second --provider xai']), { timeout: 4000 })
+    expect($currentModel.get()).toBe('second')
+    expect(requestGateway.mock.calls.filter(([method]) => method === 'config.set')).toHaveLength(3)
+  })
+
+  it('ignores an older busy response that arrives after a newer pick succeeds', async () => {
+    notify.mockClear()
+    $activeSessionId.set('session-1')
+    setCurrentModel('fable-5')
+    setCurrentProvider('nous')
+    const first = deferred<{ ok: boolean }>()
+
+    const requestGateway = vi.fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValueOnce({ ok: true })
+
+    let controls!: Controls
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    const oldPick = controls.selectModel({ model: 'first', provider: 'xai' })
+    await expect(controls.selectModel({ model: 'second', provider: 'xai' })).resolves.toBe(true)
+    first.reject(new Error('session_busy'))
+    await expect(oldPick).resolves.toBe(false)
+
+    expect($currentModel.get()).toBe('second')
+    expect($currentProvider.get()).toBe('xai')
+    expect(requestGateway).toHaveBeenCalledTimes(2)
+    expect(notify).not.toHaveBeenCalledWith(expect.objectContaining({ title: 'Model switch queued' }))
+  })
+
+  it('rolls overlapping busy picks back to the last acknowledged model', async () => {
+    $activeSessionId.set('overlap-session')
+    setCurrentModel('fable-5')
+    setCurrentProvider('nous')
+    const first = deferred<never>()
+    const second = deferred<never>()
+
+    const requestGateway = vi.fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise)
+      .mockResolvedValue({ sessions: [{ id: 'overlap-session', status: 'working' }] })
+
+    let controls!: Controls
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    const oldPick = controls.selectModel({ model: 'first', provider: 'xai' })
+    const newPick = controls.selectModel({ model: 'second', provider: 'xai' })
+    first.reject(new Error('session_busy'))
+    second.reject(new Error('session_busy'))
+    await expect(oldPick).resolves.toBe(false)
+    await expect(newPick).resolves.toBe(true)
+
+    expect($currentModel.get()).toBe('fable-5')
+    expect($currentProvider.get()).toBe('nous')
+  })
+
+  it.each(['queued', 'confirmed'] as const)('retains a committed %s switch when its replacement fails', async mode => {
+    const sessionId = `superseded-${mode}`
+    $activeSessionId.set(sessionId)
+    setCurrentModel('fable-5')
+    setCurrentProvider('nous')
+    const committed = deferred<{ ok: boolean }>()
+    const replacement = deferred<never>()
+    let switches = 0
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.active_list') { return { sessions: [] } as never }
+      if (method === 'session.activate') { return { session_id: sessionId } as never }
+      switches += 1
+      if (switches === 1) {
+        if (mode === 'queued') { throw new Error('session_busy') }
+        return { confirm_required: true } as never
+      }
+      return (switches === 2 ? committed.promise : replacement.promise) as never
+    })
+    confirmMock.mockResolvedValueOnce(true)
+    const queryClient = new QueryClient()
+    const { result } = renderHook(() => useModelControls({ queryClient, requestGateway }))
+
+    await result.current.selectModel({ model: 'first', provider: 'xai' })
+    await waitFor(() => expect(switches).toBe(2), { timeout: 4000 })
+    const next = result.current.selectModel({ model: 'second', provider: 'openai-codex' })
+    await act(async () => { committed.resolve({ ok: true }) })
+
+    expect($currentModel.get()).toBe('second')
+    expect(queryClient.getQueryState(modelOptionsQueryKey('default', sessionId))?.isInvalidated).toBe(true)
+    replacement.reject(new Error('revision_conflict'))
+    await expect(next).resolves.toBe(false)
+    expect($currentModel.get()).toBe('first')
+    expect($currentProvider.get()).toBe('xai')
+  })
+
+  it('does not roll back another chat when a delayed confirmation arrives', async () => {
+    $activeSessionId.set('session-a')
+    setCurrentModel('fable-5')
+    setCurrentProvider('nous')
+    const confirmation = deferred<{ confirm_required: boolean; confirm_message: string }>()
+    const requestGateway = vi.fn(async () => await confirmation.promise as never)
+    let controls!: Controls
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    const oldPick = controls.selectModel({ model: 'first', provider: 'xai' })
+    $activeSessionId.set('session-b')
+    setCurrentModel('second')
+    setCurrentProvider('openai-codex')
+    confirmation.resolve({ confirm_required: true, confirm_message: 'Confirm this model.' })
+    await expect(oldPick).resolves.toBe(false)
+
+    expect($currentModel.get()).toBe('second')
+    expect($currentProvider.get()).toBe('openai-codex')
+    expect(confirmMock).not.toHaveBeenCalled()
   })
 
   it('still rolls back and reports a real switch failure', async () => {

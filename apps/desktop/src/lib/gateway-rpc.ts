@@ -75,10 +75,12 @@ export function isMissingPendingPromptRequest(error: unknown, key: string): bool
   return message.toLowerCase().includes(`no pending ${key.toLowerCase()} request`)
 }
 
-/** True when a pre-deferral backend refused a mid-turn model switch (4009).
- *  Current gateways park the pick and answer `scope: "pending"` instead. */
+/** True when a model mutation was refused because its session is executing.
+ *  The canonical owner reports `session_busy`; older sidecars used prose. */
 export function isBusySessionModelSwitch(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
+  const reason = (error as { data?: { reason?: unknown } })?.data?.reason
 
-  return /session busy/i.test(message) && /switching models/i.test(message)
+  return reason === 'session_busy' || /\bsession_busy\b/i.test(message)
+    || (/session busy/i.test(message) && /switching models/i.test(message))
 }

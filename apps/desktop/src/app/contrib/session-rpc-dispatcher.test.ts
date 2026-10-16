@@ -132,6 +132,18 @@ describe('createSessionRpcDispatcher: fail closed', () => {
 })
 
 describe('createSessionRpcDispatcher: exact owner rungs', () => {
+  it('routes an active-list poll by its original session after focus moves', async () => {
+    setSessions([makeSessionInfo({ connection_id: 'local', id: 'stored-omar', profile: 'omar' })])
+    const { ambientRequest, request } = dispatcher()
+
+    await expect(request('session.active_list', { current_session_id: 'rt-omar' })).resolves.toEqual({ routed: true })
+
+    expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledWith('local', 'omar', 'session.active_list', {
+      current_session_id: 'rt-omar'
+    })
+    expect(ambientRequest).not.toHaveBeenCalled()
+  })
+
   it('routes by the connection-tagged row when the hint is gone (runtime id translated to the stored id)', async () => {
     setSessions([makeSessionInfo({ connection_id: 'local', id: 'stored-omar', profile: 'omar' })])
     const { ambientRequest, request } = dispatcher()

@@ -62,7 +62,10 @@ export function createSessionRpcDispatcher(deps: SessionRpcDispatcherDeps): Ambi
   const { ambientRequest, runtimeIdByStoredSessionIdRef, selectedStoredSessionIdRef, sessionStateByRuntimeIdRef } = deps
 
   return async <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) => {
-    const paramSessionId = typeof params?.session_id === 'string' && params.session_id ? params.session_id : undefined
+    // active_list accepts current_session_id as its session hint. Route that
+    // off-turn poll to the original owner even after focus moves elsewhere.
+    const sessionHint = method === 'session.active_list' ? params?.current_session_id : params?.session_id
+    const paramSessionId = typeof sessionHint === 'string' && sessionHint ? sessionHint : undefined
 
     const routingSessionId = resolveRoutingSessionId({
       focusedStoredSessionId: $focusedStoredSessionId.get(),

@@ -1,7 +1,13 @@
 import { JsonRpcGatewayError } from '@hermes/shared'
 import { describe, expect, it } from 'vitest'
 
-import { isMissingPendingPromptRequest, isMissingRpcMethod, isOfflineMaintenance } from './gateway-rpc'
+import { isBusySessionModelSwitch, isMissingPendingPromptRequest, isMissingRpcMethod, isOfflineMaintenance } from './gateway-rpc'
+
+it('recognizes the canonical busy model refusal without treating unrelated errors as busy', () => {
+  expect(isBusySessionModelSwitch(new JsonRpcGatewayError('session_busy', { code: 4009, data: { reason: 'session_busy' } }))).toBe(true)
+  expect(isBusySessionModelSwitch(new Error('session_busy'))).toBe(true)
+  expect(isBusySessionModelSwitch(new Error('no such model'))).toBe(false)
+})
 
 describe('isMissingRpcMethod', () => {
   it('trusts the JSON-RPC code over the message when the frame survived', () => {

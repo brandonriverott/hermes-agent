@@ -223,8 +223,8 @@ export class CanonicalDesktopProtocol {
     // failure carries no reason; its outcome is unknown and the token stays for the exact retry.
     if (typeof reason === 'string') { this.settleModelConfirmation(params) }
 
-    // A typed busy refusal of a rewind or a move wrote nothing either; the retry is a new request at the new revision.
-    if (reason !== 'revision_conflict' && !(reason === 'session_busy' && ['rewind', 'workspace'].includes(params.operation as string))) { return }
+    // A typed busy refusal wrote nothing; a retry after the turn settles must use its new revision.
+    if (reason !== 'revision_conflict' && !(reason === 'session_busy' && ['model', 'rewind', 'workspace'].includes(params.operation as string))) { return }
 
     // A confirmed CAS refusal did not mutate. Ambiguous transport failures keep
     // the original revision/id so a retry cannot overwrite another user's edit.
@@ -295,10 +295,10 @@ export class CanonicalDesktopProtocol {
 
     // N93: a watch window's legacy `lazy` attach is not in the owner's resume contract (the owner
     // holds the agent; nothing to defer). It skipped the REST prefetch, so it takes the transcript.
-    if (method === 'session.resume' && 'lazy' in params) {
+    if (method === 'session.resume') {
       const { lazy: _lazy, ...resume } = params
 
-      return { ...resume, omit_messages: false }
+      return { ...resume, source: 'desktop', ...('lazy' in params ? { omit_messages: false } : {}) }
     }
 
     if (method === 'session.interrupt' || method === 'session.redirect' || method === 'session.steer') {
@@ -559,6 +559,14 @@ export class CanonicalDesktopProtocol {
 
   private mutationReceipt(method: string, params: Record<string, unknown>, value: any): any {
     if (value.session_id !== params.session_id) { throw new Error('Metadata receipt destination mismatch') }
+
+    // Policy commits advance the generation before their event fanout arrives.
+    // The next option edit must use that receipt; an exact retry must not rewind it.
+    const owner = canonicalSessionKey(value.session_id, params.profile)
+
+    if (typeof value.execution_generation === 'number') {
+      this.generations.set(owner, Math.max(this.generations.get(owner) ?? -1, value.execution_generation))
+    }
 
     for (const [key, mutation] of this.mutations) { if (mutation.request_id === params.request_id) { this.mutations.delete(key) } }
     this.settleModelConfirmation(params)

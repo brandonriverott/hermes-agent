@@ -2,6 +2,17 @@ import { expect, test } from 'vitest'
 
 import { CanonicalDesktopProtocol } from './canonical-protocol'
 
+test.each([
+  ['session.resume', {}],
+  ['session.resume', { lazy: true }],
+  ['session.activate', {}]
+])('Desktop %s declares the current viewer when resuming', (method, options) => {
+  const protocol = new CanonicalDesktopProtocol()
+  const params = protocol.prepare(method as string, { session_id: 's', profile: 'sibling', ...options as object })
+  expect(params).toMatchObject({ session_id: 's', profile: 'sibling', source: 'desktop' })
+  expect(params).not.toHaveProperty('lazy')
+})
+
 test('sibling routes survive every rebuilt control and compression follow-up', async () => {
   const protocol = new CanonicalDesktopProtocol()
   protocol.result('session.resume', { session_id: 's', profile: 'sibling' }, {
@@ -227,6 +238,18 @@ test('the composer model picker travels as the canonical model mutation, not an 
   // Other preferences, and model flags the mutation has no field for, keep their own route.
   expect(protocol.wire('config.set', protocol.prepare('config.set', { session_id: 's', key: 'busy', value: 'queue' }))).toBe('config.set')
   expect(protocol.wire('config.set', protocol.prepare('config.set', { session_id: 's', key: 'model', value: 'gpt-5 --global' }))).toBe('config.set')
+})
+
+test('a busy model refusal releases its stale revision so the settled turn can be retried', () => {
+  const protocol = new CanonicalDesktopProtocol()
+  protocol.result('session.resume', { session_id: 's' }, { session_id: 's', revision: 3, execution_generation: 2 })
+  const input = { session_id: 's', key: 'model', value: 'gpt-5 --provider openrouter' }
+  const busy = protocol.prepare('config.set', input)
+  protocol.failure(busy, { data: { reason: 'session_busy' } })
+  protocol.result('session.resume', { session_id: 's' }, { session_id: 's', revision: 4, execution_generation: 2 })
+  const retry = protocol.prepare('config.set', input)
+  expect(retry.request_id).not.toBe(busy.request_id)
+  expect(retry.expected_revision).toBe(4)
 })
 
 test('a message-level branch carries its durable boundary row; a whole-chat branch copies everything', () => {

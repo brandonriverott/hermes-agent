@@ -48,6 +48,22 @@ test('first-run setup gate prompts once for concurrent waits', async () => {
   assert.equal(gate.isLocalBootstrapConfirmed(), true)
 })
 
+test('rediscovering an installed runtime retires the stale setup waiter without authorizing installation', async () => {
+  let visible = false
+  const gate = createFirstRunSetupGate({
+    promptChoice: () => { visible = true },
+    hideChoice: () => { visible = false },
+    stuckAfterMs: 0
+  })
+  const pending = gate.wait(bootstrapBackend)
+  assert.equal(visible, true)
+  assert.equal(await gate.wait({ kind: 'command', local: 'installed' }), 'continue-local')
+  assert.equal(visible, false)
+  assert.equal(await pending, 'reset')
+  assert.equal(gate.hasWaiter(), false)
+  assert.equal(gate.isLocalBootstrapConfirmed(), false)
+})
+
 test('continueLocal keeps the setup choice visible until bootstrap owns the overlay', async () => {
   let hidden = 0
   const gate = createFirstRunSetupGate({ hideChoice: () => hidden++, stuckAfterMs: 0 })

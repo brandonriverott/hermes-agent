@@ -329,20 +329,27 @@ export function DesktopInstallOverlay({ enabled = true }: DesktopInstallOverlayP
     }
 
     let cancelled = false
+    let pendingEvents: DesktopBootstrapEvent[] | null = []
+    const off = desktop.onBootstrapEvent(ev => {
+      pendingEvents?.push(ev)
+      setState(prev => applyEvent(prev, ev))
+    })
 
     desktop
       .getBootstrapState()
       .then(snapshot => {
         if (!cancelled && snapshot) {
-          setState(snapshot)
+          // An IPC snapshot can arrive after recovery events. Replay those
+          // transitions so an old install choice cannot cover a ready gateway.
+          setState((pendingEvents ?? []).reduce(applyEvent, snapshot))
         }
+        pendingEvents = null
       })
       .catch(() => {
+        pendingEvents = null
         // Older Electron build without the IPC handler -- bootstrap UI just
         // stays empty, app falls through to existing onboarding flow.
       })
-
-    const off = desktop.onBootstrapEvent(ev => setState(prev => applyEvent(prev, ev)))
 
     return () => {
       cancelled = true

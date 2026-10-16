@@ -1,7 +1,7 @@
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 
 import type { GatewayEndpoint } from './local-gateway'
-import { configurePythonGatewayTicketClient, createLocalGatewayDials, createStaleGatewayRestarter, ensureLocalGateway, gatewayOwnerProfile, mintLocalGatewayTicket, nativeGatewayHttpHeaders, redialLocalGateway, routedGatewayEndpoint, runGatewayEnsure } from './local-gateway'
+import { configurePythonGatewayTicketClient, createLocalGatewayDials, createStaleGatewayAttacher, ensureLocalGateway, gatewayOwnerProfile, mintLocalGatewayTicket, nativeGatewayHttpHeaders, redialLocalGateway, routedGatewayEndpoint, runGatewayEnsure } from './local-gateway'
 import { closeGatewayTicketBridges, createGatewayTicketResolver } from './local-gateway-python'
 const localGatewayDials = createLocalGatewayDials()
 configurePythonGatewayTicketClient(createGatewayTicketResolver(
@@ -553,7 +553,7 @@ import {
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
 import { removeStaleSingletonLock } from './singleton-lock'
-import { createSourcePythonBackend, resolveSourceInstallationBackend, type SourceBackend } from './source-backend'
+import { createSourcePythonBackend, isSourceRuntimeUsable, resolveInstalledSourceBackend, type SourceBackend } from './source-backend'
 import { resolveSourcePython } from './source-python'
 import { resolveSshBinary } from './ssh-binary'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
@@ -615,8 +615,7 @@ import {
   resolveStagedUpdaterBinary,
   resolveVenvDir,
   spawnUpdaterProcess,
-  stagedUpdaterSupportsPrewrittenMarker,
-  userLauncherInstallRoot
+  stagedUpdaterSupportsPrewrittenMarker
 } from './updater-process'
 import { AppInstallerStrategy } from './updater/app-installer'
 import { createChannelAppInstallerStrategy } from './updater/app-installer'
@@ -2642,7 +2641,7 @@ async function waitForFirstRunSetupChoice(backend) {
   const gate = getFirstRunSetupGate()
 
   if (!gate.shouldGate(backend)) {
-    return 'continue-local'
+    return gate.wait(backend)
   }
 
   updateBootProgress(
@@ -3740,7 +3739,7 @@ function resolveCheckoutUpdateStrategy(): CheckoutStrategy {
       // contract as readSourceUpdate and the hand-off script.
       const managed: boolean = directoryExists(path.join(root, 'pm'))
 
-      const launcher: string | null = managed ? resolveInstallationLauncher(root, IS_WINDOWS, HERMES_HOME) : null
+      const launcher: string | null = managed ? await resolveInstallationLauncher(root, IS_WINDOWS, HERMES_HOME) : null
 
       if (managed && !launcher) {
         const message =
@@ -4589,7 +4588,7 @@ async function handOffWindowsBootstrapRecovery(reason) {
   // Recovery can run without Python. Keep the chosen branch; do not guess a replacement.
   const branch: string = configuredBranch || DEFAULT_UPDATE_BRANCH
 
-  const updaterArgs: string[] = chooseUpdaterArgs({ runtimeUsable: await isSourceRuntimeUsable(updateRoot) }, branch)
+  const updaterArgs: string[] = chooseUpdaterArgs({ runtimeUsable: await isSourceRuntimeUsable(updateRoot, { hermesHome: HERMES_HOME }) }, branch)
 
   await stopBackendsForUpdate()
 
@@ -4699,15 +4698,6 @@ function readJson(filePath) {
 //   }
 function readBootstrapMarker() {
   return readJson(BOOTSTRAP_COMPLETE_MARKER)
-}
-
-// Marker-independent: is the canonical install at ACTIVE_HERMES_ROOT actually
-// runnable right now? A complete CLI install (`install.sh --include-desktop`)
-// or a DMG launch over a prior CLI install satisfies this WITHOUT the desktop
-// ever having written the bootstrap marker -- so we must be able to recognise
-// "already installed" off the filesystem alone, not just the marker.
-async function isSourceRuntimeUsable(root: string): Promise<boolean> {
-  return (await resolveSourceInstallationBackend(root, [], { hermesHome: HERMES_HOME })) !== null
 }
 
 function activeRuntimeState(backend: SourceBackend | null): ActiveRuntimeState {
@@ -5121,16 +5111,20 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
   //    the CLI can publish the same installation launcher, and older desktop
   //    builds could leave a healthy install behind without the marker. If the
   //    active runtime is usable, launch it directly; only fall through to
-  //    bootstrap when the runtime itself is unusable.
-  //    HERMES_DESKTOP_IGNORE_EXISTING=1 skips this rung (see backend-resolution).
+  //    bootstrap when no installed runtime exists.
+  // 5. If the canonical install is unavailable, try the source install reported
+  //    by a published user-bin launcher (GUI launches may omit it from PATH).
+  //    HERMES_DESKTOP_IGNORE_EXISTING=1 skips both rungs before any probe.
   const activeBackend: SourceBackend | null = await installedRuntimeGate.resolve(ACTIVE_HERMES_ROOT, () =>
-    resolveSourceInstallationBackend(ACTIVE_HERMES_ROOT, backendArgs, { hermesHome: HERMES_HOME })
+    resolveInstalledSourceBackend(ACTIVE_HERMES_ROOT, backendArgs, { hermesHome: HERMES_HOME }), bootstrapRepairRequested
   )
 
   const activeRuntime: ActiveRuntimeState = activeRuntimeState(activeBackend)
 
-  if (activeBackend && !bootstrapRepairRequested) {
-    if (!activeRuntime.hasValidMarker) {
+  if (activeBackend) {
+    if (activeBackend.root !== ACTIVE_HERMES_ROOT) {
+      rememberLog(`[boot] Using published Hermes install at ${activeBackend.root}`)
+    } else if (!activeRuntime.hasValidMarker) {
       rememberLog(
         `[bootstrap] Active Hermes runtime at ${ACTIVE_HERMES_ROOT} is usable but the bootstrap marker is missing or stale; skipping first-run bootstrap.`
       )
@@ -5141,29 +5135,6 @@ async function resolveHermesBackend(backendArgs: string[]): Promise<ResolvedHerm
 
   if (bootstrapRepairRequested) {
     rememberLog('[bootstrap] repair requested; bypassing the usable active runtime to re-run the installer')
-  } else {
-    // 5. A source install outside ACTIVE_HERMES_ROOT (install.sh --dir, a
-    //    setup-hermes.sh clone), found through the launcher it published at a
-    //    fixed user-bin location: a Finder/Dock launch inherits a PATH without
-    //    ~/.local/bin. The reported root is then resolved and probed like any
-    //    installed runtime; HERMES_DESKTOP_IGNORE_EXISTING=1 skips it too.
-    const userInstall: ReturnType<typeof userLauncherInstallRoot> = userLauncherInstallRoot(IS_WINDOWS, HERMES_HOME)
-
-    if (userInstall) {
-      const userBackend: SourceBackend | null = await installedRuntimeGate.resolve(userInstall.root, () =>
-        resolveSourceInstallationBackend(userInstall.root, backendArgs, { hermesHome: HERMES_HOME })
-      )
-
-      if (userBackend) {
-        rememberLog(`[boot] Using Hermes install at ${userInstall.root} (published launcher ${userInstall.launcher})`)
-
-        return userBackend
-      }
-
-      rememberLog(`[bootstrap] Hermes install at ${userInstall.root} (from ${userInstall.launcher}) is not usable`)
-    } else {
-      rememberLog(`[bootstrap] no usable Hermes install at ${ACTIVE_HERMES_ROOT} and no published user-bin launcher`)
-    }
   }
 
   // 6. Nothing usable yet -- signal the bootstrap runner that we need to
@@ -11825,9 +11796,9 @@ async function restartLocalGatewayOwner(ownerProfile: string): Promise<void> {
   rememberLog(`[gateway] hermes --profile ${ownerProfile} gateway restart exited ${result.code}${reason ? `: ${reason}` : ''}`)
 }
 
-// A ready gateway whose boot commit differs from this Hermes (it outlived `hermes update`) is
-// restarted once before attaching instead of being re-attached on every dial.
-const restartStaleLocalGateway = createStaleGatewayRestarter(restartLocalGatewayOwner, rememberLog)
+// A ready gateway may own active replies when this checkout advances. Keep the
+// owner serving; an explicit restart is a separate operation after quiescence.
+const restartStaleLocalGateway = createStaleGatewayAttacher(rememberLog)
 
 // Models-page "Restart Hermes": restart the local gateway behind `profile`'s cached descriptor.
 // A remote/SSH descriptor has no gatewayEndpoint, so nothing local is touched for it.
@@ -12246,6 +12217,7 @@ async function startHermes(requestedProfile?: string) {
     backendConnectionState.assertCurrentAttempt(connectionAttempt)
 
     backendStartFailure = null
+    getFirstRunSetupGate().resetForRetry()
     rememberLog('[backend] Hermes gateway is ready')
     updateBootProgress({ phase: 'backend.ready', message: 'Hermes gateway is ready', progress: 94, running: true, error: null })
     bootstrapRepairAttempt = 0

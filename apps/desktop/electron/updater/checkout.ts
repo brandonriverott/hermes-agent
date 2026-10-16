@@ -429,7 +429,7 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): CheckoutStra
     // Earlier PM scripts still demand checkout/venv. Do not invoke that known
     // incompatible handoff: one exact-install CLI update obtains the new scripts.
     if (existsSync(path.join(root, 'pm')) && !existsSync(path.join(root, 'scripts', 'desktop-update', 'runtime.ps1'))) {
-      const launcher: string | null = resolveInstallationLauncher(root, deps.isWindows, deps.hermesHome)
+      const launcher: string | null = await resolveInstallationLauncher(root, deps.isWindows, deps.hermesHome)
 
       if (!launcher) {
         return { ok: false, error: 'installation-launcher-missing' }
@@ -515,7 +515,7 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): CheckoutStra
     await deps.preflightStateDb(deps.hermesHome, deps.rememberLog)
 
     if (deps.isWindows && resolveUpdateScriptHandoff(updateRoot)) {
-      const message = windowsUpdatePrerequisiteError(updateRoot, deps.hermesHome)
+      const message = await windowsUpdatePrerequisiteError(updateRoot, deps.hermesHome)
 
       if (message) {
         deps.emitUpdateProgress({ stage: 'error', message, percent: null })

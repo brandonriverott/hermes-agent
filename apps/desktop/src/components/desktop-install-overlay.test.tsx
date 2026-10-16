@@ -92,6 +92,22 @@ afterEach(() => {
 })
 
 describe('DesktopInstallOverlay first-run setup', () => {
+  it('does not resurrect setup from a snapshot older than runtime recovery', async () => {
+    const stale = bootstrapState({ setupChoice: {
+      platform: 'darwin', activeRoot: '/existing/hermes', local: 'none', bundled: false
+    } })
+    const desktop = installDesktopMock(stale)
+    let resolveSnapshot!: (state: DesktopBootstrapState) => void
+    desktop.getBootstrapState.mockReturnValue(new Promise(resolve => { resolveSnapshot = resolve }))
+    render(<DesktopInstallOverlay />)
+    await act(async () => {
+      desktop.emitBootstrapEvent({ type: 'setup-choice', active: false })
+      resolveSnapshot(stale)
+    })
+    expect(screen.queryByText('Set up Hermes Desktop')).toBeNull()
+    expect(desktop.continueBootstrapLocal).not.toHaveBeenCalled()
+  })
+
   it('shows the remote/local choice without installer progress', async () => {
     installDesktopMock(
       bootstrapState({

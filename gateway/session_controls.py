@@ -334,7 +334,7 @@ class AuthorityConnection:
                 await tracked_write(self.authority, partial(title_new_session, self.authority, ref, title))
             if hidden:
                 await tracked_write(self.authority, partial(self.authority.db.set_session_hidden, ref.session_id, True))
-        return await self.resume(ref, {})
+        return await self.resume(ref, {'source': 'desktop'} if params.get('source') == 'gui' else {})
 
     async def ping(self, ref, params):
         if not self.actor.capabilities:
@@ -457,7 +457,8 @@ class AuthorityConnection:
         info = {'desktop_protocol': CANONICAL_GATEWAY_PROTOCOL}
         source = self.authority.sessions[snapshot.handle.ref.session_id].source
         if source is not None and source.platform == Platform.LOCAL:
-            info = await snapshot_info(self.authority, snapshot.handle.ref)
+            info = await snapshot_info(self.authority, snapshot.handle.ref,
+                                       defer_inventory=params.get('source') == 'desktop')
         display = {}
         if params.get('display_projection'):
             display['display_messages'] = display_projection(snapshot.history, self.authority.profile_id)
