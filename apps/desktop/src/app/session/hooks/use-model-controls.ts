@@ -55,26 +55,24 @@ const acknowledgedModels = new Map<string, {
 const waitForModelTurn = () => new Promise<void>(resolve => { window.setTimeout(resolve, 1000) })
 
 function modelSwitchBaseline(pendingKey: string, touchesPrimary: boolean, liveSessionId: null | string) {
+  const state = liveSessionId ? $sessionStates.get()[liveSessionId] : undefined
   return acknowledgedModels.get(pendingKey) ?? {
-    model: touchesPrimary ? $currentModel.get() : ($sessionStates.get()[liveSessionId!]?.model ?? ''),
-    provider: touchesPrimary ? $currentProvider.get() : ($sessionStates.get()[liveSessionId!]?.provider ?? ''),
-    wire: touchesPrimary
-      ? $currentReasoningEffortWire.get()
-      : ($sessionStates.get()[liveSessionId!]?.reasoningEffortWire ?? ''),
+    model: state?.model ?? (touchesPrimary ? $currentModel.get() : ''),
+    provider: state?.provider ?? (touchesPrimary ? $currentProvider.get() : ''),
+    wire: state?.reasoningEffortWire ?? (touchesPrimary ? $currentReasoningEffortWire.get() : ''),
     source: getCurrentModelSource()
   }
 }
 
 async function runQueuedModelSwitch({
   isCurrentIntent, requestGateway, sessionId, requestSwitch, handleConfirmation,
-  touchesPrimary, paintSelection, cacheSelection, selection, onError, onDone
+  paintSelection, cacheSelection, selection, onError, onDone
 }: {
   isCurrentIntent: () => boolean
   requestGateway: ModelControlsOptions['requestGateway']
   sessionId: string
   requestSwitch: () => Promise<ModelSwitchResponse>
   handleConfirmation: (result: ModelSwitchResponse) => Promise<boolean>
-  touchesPrimary: boolean
   paintSelection: () => void
   cacheSelection: (provider: string, model: string) => void
   selection: ModelSelection
@@ -110,7 +108,7 @@ async function runQueuedModelSwitch({
 
       if (result?.confirm_required) { await handleConfirmation(result) }
       else {
-        if (!touchesPrimary || $activeSessionId.get() === sessionId) { paintSelection() }
+        paintSelection()
         cacheSelection(selection.provider, selection.model)
       }
 
@@ -365,19 +363,25 @@ export function useModelControls({
       }
 
       const paintSelection = () => {
-        if (touchesPrimary) {
-          setCurrentModel(selection.model)
-          setCurrentProvider(selection.provider)
-          markComposerSelectionManual()
-        } else if (liveSessionId) {
-          // Optimistic tile paint — session.info will confirm; rollback on error. The wire stamp
-          // belongs to the old route, so it is withdrawn until session.info re-stamps it.
+        if (liveSessionId) {
+          // Every live surface, including primary, renders from its session slice.
+          // Update the owning cache even if focus moved while the RPC was pending.
           sessionTileDelegate()?.updateSession(liveSessionId, state => ({
             ...state,
             model: selection.model,
             provider: selection.provider,
-            reasoningEffortWire: ''
+            // session.info can confirm this route before the mutation response.
+            // Only withdraw a stamp that still belongs to a different route.
+            reasoningEffortWire: state.model === selection.model && state.provider === selection.provider
+              ? state.reasoningEffortWire
+              : ''
           }))
+        }
+
+        if (touchesPrimary && (!liveSessionId || $activeSessionId.get() === liveSessionId)) {
+          setCurrentModel(selection.model)
+          setCurrentProvider(selection.provider)
+          markComposerSelectionManual()
         }
       }
 
@@ -388,21 +392,21 @@ export function useModelControls({
       const rollbackSelection = () => {
         if (liveSessionId && !isCurrentIntent()) { return }
 
-        if (touchesPrimary && liveSessionId && $activeSessionId.get() !== liveSessionId) { return }
-
-        if (touchesPrimary) {
-          setCurrentModel(previous.model)
-          setCurrentProvider(previous.provider)
-          // The setters withdraw the wire stamp on a change; the old route's stamp is still true.
-          setCurrentReasoningEffortWire(previous.wire)
-          setCurrentModelSource(previous.source)
-        } else if (liveSessionId) {
+        if (liveSessionId) {
           sessionTileDelegate()?.updateSession(liveSessionId, state => ({
             ...state,
             model: previous.model,
             provider: previous.provider,
             reasoningEffortWire: previous.wire
           }))
+        }
+
+        if (touchesPrimary && (!liveSessionId || $activeSessionId.get() === liveSessionId)) {
+          setCurrentModel(previous.model)
+          setCurrentProvider(previous.provider)
+          // The setters withdraw the wire stamp on a change; the old route's stamp is still true.
+          setCurrentReasoningEffortWire(previous.wire)
+          setCurrentModelSource(previous.source)
         }
 
         cacheSelection(previous.provider, previous.model)
@@ -461,11 +465,9 @@ export function useModelControls({
       }
 
       const handleConfirmation = (result: ModelSwitchResponse) => {
-        if (!isCurrentIntent() || (touchesPrimary && $activeSessionId.get() !== liveSessionId)) {
-          return Promise.resolve(false)
-        }
-
+        if (!isCurrentIntent()) { return Promise.resolve(false) }
         rollbackSelection()
+        if (touchesPrimary && $activeSessionId.get() !== liveSessionId) { return Promise.resolve(false) }
 
           // ONE shared applier for guarded switches (#95293): the same
           // confirm flow the Bots editor routes through — never fork this
@@ -512,6 +514,7 @@ export function useModelControls({
           return false
         }
 
+        if (!result?.deferred) { paintSelection() }
         clearIntent()
 
         return true
@@ -538,7 +541,6 @@ export function useModelControls({
             sessionId: liveSessionId,
             requestSwitch,
             handleConfirmation,
-            touchesPrimary,
             paintSelection,
             cacheSelection,
             selection,
