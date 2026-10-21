@@ -123,12 +123,12 @@ class GatewayVoiceMixin:
         except Exception:
             auto_tts_default = False
         if hasattr(adapter, "_auto_tts_default"):
-            # A2A never inherits the global speak default. The flag is written by
+            # Text-only transports never inherit the global speak default. It is written by
             # Desktop "Read replies aloud" / voice.auto_tts and is meant for human
             # chat surfaces; an agent peer's replies must stay text (its adapter has
             # no native send_voice, so auto-TTS would synthesize an MP3 and then
             # fail delivery) — /voice scoped modes never applied to A2A anyway.
-            if platform.value == "a2a":
+            if platform.value in ("a2a", "api_server"):
                 adapter._auto_tts_default = False
             else:
                 adapter._auto_tts_default = auto_tts_default
@@ -383,9 +383,10 @@ class GatewayVoiceMixin:
         # agent already produced (#90103). Keep /voice scoped to human platforms.
         if getattr(event.source.platform, "value", None) == "a2a":
             return False
-        # A local session's speech plays in its own client: LocalSessionAdapter has no audio delivery,
-        # so an owner-side synthesis would be a paid provider call nobody hears.
-        if event.source.platform == Platform.LOCAL:
+        # Local speech belongs to the client, and the text API has no audio delivery.
+        # Synthesizing here makes text replies wait for a paid call nobody can hear,
+        # even when a saved per-chat voice mode explicitly requests speech.
+        if event.source.platform in (Platform.LOCAL, Platform.API_SERVER):
             return False
         chat_id = event.source.chat_id
         voice_mode = self._voice_mode.get(self._voice_key_for_source(event.source))

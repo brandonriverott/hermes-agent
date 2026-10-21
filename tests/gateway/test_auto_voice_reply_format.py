@@ -149,6 +149,40 @@ class TestAutoVoiceReplyFormat:
 
         assert runner._should_send_voice_reply(local, "the reply", []) is False
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("saved_mode", [None, "all", "voice_only"])
+    @pytest.mark.parametrize("message_type", [MessageType.TEXT, MessageType.VOICE])
+    async def test_api_final_reply_does_not_wait_for_audio(self, saved_mode, message_type):
+        """The text API cannot deliver speech, including from a saved voice opt-in."""
+        runner = _make_runner()
+        adapter = _make_adapter(Platform.API_SERVER)
+        adapter._should_auto_tts_for_chat.return_value = True
+        adapter._streaming_tts_turn_completed.return_value = False
+        runner.adapters[Platform.API_SERVER] = adapter
+        event = _make_event(Platform.API_SERVER, message_type=message_type)
+        if saved_mode is not None:
+            runner._voice_mode[runner._voice_key_for_source(event.source)] = saved_mode
+        runner._send_voice_reply = AsyncMock()
+
+        response = await runner._hmwa_deliver_turn_response(
+            event, event.source, None, "api-test", 1,
+            {}, [], "the answer", "", False,
+        )
+
+        assert response == "the answer"
+        runner._send_voice_reply.assert_not_awaited()
+
+    def test_api_adapter_does_not_inherit_global_auto_tts(self):
+        runner = _make_runner()
+        adapter = _make_adapter(Platform.API_SERVER)
+        adapter._auto_tts_disabled_chats = set()
+        adapter._auto_tts_enabled_chats = set()
+
+        with patch("hermes_cli.config.load_config", return_value={"voice": {"auto_tts": True}}):
+            runner._sync_voice_mode_state_to_adapter(adapter)
+
+        assert adapter._auto_tts_default is False
+
     def test_sync_voice_mode_state_never_inherits_global_auto_tts_for_a2a(self):
         """The adapter-side default must match the runner-side skip (#90103).
 
