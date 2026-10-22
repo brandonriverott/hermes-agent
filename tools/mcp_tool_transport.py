@@ -4,6 +4,7 @@ protocol negotiation and initial tool discovery. Split from tools/mcp_tool.py.""
 
 import logging
 import asyncio
+import inspect
 import os
 import urllib.parse
 import urllib.request
@@ -12,7 +13,7 @@ from typing import Dict, Optional, Set
 from utils import normalize_proxy_url
 from agent.proxy_bypass import is_loopback_host, should_bypass_proxy
 from agent import runtime_cwd as _runtime_cwd
-from tools.mcp_tool_errors import NonMcpEndpointError, _apply_identity_header, _describe_http_failure, _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern, _is_streamable_http_rejection, _make_http_rejection_recorder, _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert, _unwrap_exception_group
+from tools.mcp_tool_errors import NonMcpEndpointError, _MCP_HTTP_MAX_BODY_BYTES, _apply_identity_header, _describe_http_failure, _handshake_answered_with_unsupported_version, _handshake_rejected_as_modern, _is_streamable_http_rejection, _make_http_rejection_recorder, _make_mcp_body_cap_transport, _make_redirect_header_stripper, _resolve_client_cert, _unwrap_exception_group
 from tools.mcp_tool_lifecycle import _filter_mcp_children, _leader_start_time, _orphan_stdio_pid_servers, _orphan_stdio_pids, _stdio_pgids, _stdio_pids, _stdio_starttimes
 from tools.mcp_tool_common import _core
 from tools.mcp_tool_node_abi import node_abi_error
@@ -40,6 +41,16 @@ def _is_2xx(resp) -> bool:
 def _present(**kwargs) -> dict:
     """*kwargs* minus the ``None`` values (optional httpx client arguments)."""
     return {k: v for k, v in kwargs.items() if v is not None}
+
+
+def _sdk_sse_limit(client) -> dict:
+    """Align newer SDKs' 1 MiB parser default with our existing bounded wire limit.
+
+    Older SDKs lack the argument; the transport still enforces the same cap there.
+    """
+    if "max_sse_event_size" in inspect.signature(client).parameters:
+        return {"max_sse_event_size": _MCP_HTTP_MAX_BODY_BYTES}
+    return {}
 
 
 def _mcp_proxy_mounts(httpx_mod, url: str, ssl_verify, client_cert, server_name: str = "") -> Optional[dict]:
@@ -557,7 +568,7 @@ class MCPServerTransportMixin:
                 **_present(mounts=_mcp_proxy_mounts(_httpx_mod, url, ssl_verify, client_cert, self.name),
                            headers=headers, auth=auth))
         sse_kwargs["httpx_client_factory"] = _sse_client_factory
-        return _core.sse_client(**sse_kwargs)
+        return _core.sse_client(**sse_kwargs, **_sdk_sse_limit(_core.sse_client))
 
     def _streamable_http_transport(self, url: str, headers: dict, connect_timeout: float,
                                    ssl_verify, client_cert, oauth_auth,
@@ -589,7 +600,9 @@ class MCPServerTransportMixin:
         @asynccontextmanager
         async def _owned_client_streams():  # the SDK skips cleanup when http_client is provided
             async with _build_client(**client_kwargs) as http_client:
-                async with _core.streamable_http_client(url, http_client=http_client) as streams:
+                async with _core.streamable_http_client(
+                    url, http_client=http_client, **_sdk_sse_limit(_core.streamable_http_client),
+                ) as streams:
                     yield streams
         return _owned_client_streams()
 
