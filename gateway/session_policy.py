@@ -1089,7 +1089,8 @@ def policy_for_source(runner, source):
 def workspace_ready(policy) -> bool:
     """Readiness, not structure: a removed workspace keeps the chat readable and movable, but no
     turn runs in a missing directory."""
-    return Path(policy.cwd).is_dir()
+    cwd = Path(policy.cwd)  # absolute first: a Windows cwd restored on macOS must not resolve under the gateway's cwd
+    return cwd.is_absolute() and cwd.is_dir()
 
 
 def workspace_unavailable_result(policy) -> dict:

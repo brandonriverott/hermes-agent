@@ -60,7 +60,7 @@ def _run(command, cwd):
     from tools.environments.local import build_subprocess_env
     # shell=True keeps the user-facing !cmd grammar (pipes, redirects); the child never inherits
     # credentials the long-lived owner holds, nor a launch profile's .env residue in a routed one.
-    if not os.path.isdir(cwd):  # a deleted checkout / worktree: never fall back to the owner's cwd
+    if not (os.path.isabs(cwd) and os.path.isdir(cwd)):  # a deleted checkout / worktree, or another host's path: never fall back to the owner's cwd
         raise RuntimeStoreError('cwd_unavailable')
     env = build_subprocess_env(strip_launch_profile=True)
     try:
