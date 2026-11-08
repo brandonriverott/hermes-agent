@@ -43,3 +43,30 @@ def test_compression_child_keeps_parent_source(db, parent_source):
 
     assert agent.session_id != "parent"
     assert db.get_session(agent.session_id)["source"] == parent_source
+
+
+def test_local_owner_tool_session_child_is_a_chain_continuation(db):
+    """Regression: a local-owner ``--source tool`` session's child must be found by the lineage step.
+
+    ``_CHAIN_STEP_SQL`` never treats a source='tool' child as a continuation, so a tool-labelled child made
+    the local lineage check fail (storage_unavailable) and rolled every rotation back."""
+    from hermes_state_compression import _CHAIN_STEP_SQL
+
+    parent = "local-" + "a" * 64
+    db.create_session(parent, source="tool")
+    db.append_message(parent, "user", "hello")
+    db.append_message(parent, "assistant", "world")
+    agent = _agent(db, parent)
+
+    cc._publish_rotated_compaction(
+        agent, [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "world"}],
+        [{"role": "user", "content": "[handoff]"}], new_system_prompt="sys",
+        lease=types.SimpleNamespace(holder=None, ttl=60.0, watermark=None),
+        old_session_id=parent, compressed_user_turn_outcome="none",
+    )
+
+    child = agent.session_id
+    assert db.get_session(child)["source"] != "tool"
+    with db._read_ctx() as conn:
+        row = conn.execute(_CHAIN_STEP_SQL, (parent,)).fetchone()
+    assert row is not None and row["id"] == child

@@ -3214,7 +3214,11 @@ def _compression_child_source(agent: Any, parent_session_id: str) -> str:
     parent = None
     with contextlib.suppress(Exception):
         parent = agent._session_db.get_session(parent_session_id)
-    if parent and parent.get("source"):
+    # A local-owner session (id minted by local_identity) validates its lineage against _CHAIN_STEP_SQL, which
+    # never treats a source='tool' child as a continuation: a tool-labelled child makes publication fail with
+    # storage_unavailable and the rotation roll back forever. Its child takes the surface source instead.
+    if parent and parent.get("source") and not (
+            parent["source"] == "tool" and str(parent_session_id).startswith("local-")):
         return parent["source"]
     from agent.session_source import session_source_for
     return session_source_for(getattr(agent, "platform", None))
