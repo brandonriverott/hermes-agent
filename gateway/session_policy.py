@@ -6,7 +6,7 @@ from functools import cached_property
 import contextlib
 import json
 import logging
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from hermes_state_runtime import RuntimeStoreError
 
@@ -989,6 +989,15 @@ def route_launch_key(authority, policy, config):
     return launch_key(authority, policy)
 
 
+def _absolute_cwd(cwd):
+    """A stored cwd that is absolute here, or a Windows absolute path (``C:/x``, ``M:\\x``) written by
+    another machine's receipt. The path may not exist on this host; the run reports that, not restore."""
+    if Path(cwd).is_absolute():
+        return True
+    win = PureWindowsPath(cwd)
+    return bool(win.drive and win.root)
+
+
 def restore_policy(data):
     """Reject incomplete private policy rather than rebuilding from current defaults."""
     try:
@@ -997,7 +1006,7 @@ def restore_policy(data):
         surfaces = {**SURFACES, 'cron': 'cron', 'kanban': 'cli', 'bot_room': 'bot_room'}
         if ((not is_forward_policy(policy) and
              (policy.source not in surfaces or policy.platform != surfaces[policy.source]))
-                or not isinstance(policy.cwd, str) or not Path(policy.cwd).is_absolute()
+                or not isinstance(policy.cwd, str) or not _absolute_cwd(policy.cwd)
                 or not isinstance(policy.model, str) or not policy.model.strip()
                 or not isinstance(policy.toolsets, (list, tuple))
                 or any(not isinstance(name, str) for name in policy.toolsets)
