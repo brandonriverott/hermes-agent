@@ -323,24 +323,37 @@ def _restore_previous_entry(store: Store, entry, previous) -> None:
         _discard_entry(store, displaced.name)
 
 
+def _matches_staged(package, entry, staged, target) -> bool:
+    """True when the live entry is usable and byte-identical to the staged replacement."""
+    try:
+        return not package.verify(entry, target) and tree_digest(entry) == tree_digest(staged)
+    except OSError:
+        return False
+
+
 @contextmanager
-def _publish_entry(package, store, staged, entry, previous_entry, target):
-    """Keep rollback live through the caller's native facts commit, if any."""
+def _publish_entry(package, store, staged, entry, previous_entry, target, *, keep_identical=True):
+    """Keep rollback live through the caller's native facts commit, if any.
+
+    ``keep_identical=False`` (a fresh copy, which must own independent bytes) republishes an
+    identical entry unless a live process holds it."""
     kept_live = False
     if entry.exists() or entry.is_symlink():
-        try:
-            retry_held(lambda: entry.rename(previous_entry))
-        except OSError as rename_error:
-            try:
-                matches_staged = (not package.verify(entry, target)
-                                  and tree_digest(entry) == tree_digest(staged))
-            except OSError:
-                raise rename_error
-            if not matches_staged:
-                raise
-            LOG.warning("%s entry is in use but already matches the staged bytes; keeping it live",
-                        package.name)
+        # Check before renaming, not only when Windows refuses the rename: POSIX renames an entry
+        # that running processes execute from, and the discard below then deletes their executable's
+        # path. macOS TCC cannot attribute such processes and denies their protected-folder access.
+        if keep_identical and not entry.is_symlink() and _matches_staged(package, entry, staged, target):
+            LOG.info("%s entry already matches the staged bytes; keeping it live", package.name)
             kept_live = True
+        else:
+            try:
+                retry_held(lambda: entry.rename(previous_entry))
+            except OSError:
+                if not _matches_staged(package, entry, staged, target):
+                    raise
+                LOG.warning("%s entry is in use but already matches the staged bytes; keeping it live",
+                            package.name)
+                kept_live = True
     try:
         if not kept_live:
             store.publish(staged, entry.name)
@@ -504,7 +517,8 @@ def _install(
                     raise InstallError(package.name, f"staged entry failed verification: {reason}", remedy)
                 if facts is None:
                     (staged / ".pm-stage-pin.json").write_text(pin, encoding="utf-8")
-                with _publish_entry(package, store, staged, entry, previous_entry, target):
+                with _publish_entry(package, store, staged, entry, previous_entry, target,
+                                    keep_identical=not _fresh_copy):
                     if facts is not None:
                         facts.record(
                             package.name, version, entry_name, package.env(entry, target), store.root,
