@@ -958,6 +958,30 @@ def _clear_session_context(tokens: list) -> None:
             clear_session_vars(tokens)
 
 
+@contextlib.contextmanager
+def _session_context_scope(session_key: str, cwd: str | None = None):
+    """Bind *session_key* for helper work, reusing a binding this context already holds for it.
+
+    ``clear_session_vars`` is not nestable: it blanks every var. A helper that runs inside a turn
+    (e.g. the system-prompt refresh after a model switch applied at turn start) must therefore not
+    bind+clear the same session again, or the rest of the turn loses its session key and UI session
+    id and identity-keyed tool hooks fail closed.
+    """
+    try:
+        from gateway.session_context import bound_session_key
+        already_bound = bool(session_key) and bound_session_key() == session_key
+    except Exception:
+        already_bound = False
+    if already_bound:
+        yield
+        return
+    tokens = _set_session_context(session_key, cwd=cwd)
+    try:
+        yield
+    finally:
+        _clear_session_context(tokens)
+
+
 def _enable_gateway_prompts() -> None:
     """Route approvals through gateway callbacks instead of CLI input()."""
     os.environ.update(HERMES_GATEWAY_SESSION="1", HERMES_EXEC_ASK="1", HERMES_INTERACTIVE="1")
@@ -1134,15 +1158,14 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     # #50233) and session context (on the RPC thread _SESSION_CWD is unset → the process TERMINAL_CWD would
     # persist). The full scope, not HERMES_HOME alone: the external memory provider's system_prompt_block()
     # reads its credential through get_secret, which fails closed once this process multiplexes (#112927).
-    session_tokens = _set_session_context(session_key, cwd=_session_cwd(session))
-    try:
-        with _session_profile_runtime_scope(session):
-            prompt = agent._cached_system_prompt = agent._build_system_prompt(None)
-        db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
-    except Exception:
-        logger.warning("failed to persist live session system prompt for session %s", session_key, exc_info=True)
-    finally:
-        _clear_session_context(session_tokens)
+    # Inside a turn already bound to this session, keep the turn's binding (see _session_context_scope).
+    with _session_context_scope(session_key, cwd=_session_cwd(session)):
+        try:
+            with _session_profile_runtime_scope(session):
+                prompt = agent._cached_system_prompt = agent._build_system_prompt(None)
+            db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
+        except Exception:
+            logger.warning("failed to persist live session system prompt for session %s", session_key, exc_info=True)
 
 
 # Stable leading text of the model-switch marker (builder + dedup); only the newest marker is meaningful.

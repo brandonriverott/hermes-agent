@@ -454,12 +454,10 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
     except Exception:
         return
     try:
-        tokens = _set_session_context(sid, cwd=_session_cwd(session))
-        try:
+        # Runs at turn start inside the turn's binding: reuse it rather than blanking it on exit.
+        with _session_context_scope(session["session_key"], cwd=_session_cwd(session)):
             new_agent = _rebuild_session_agent(sid, session, session_id=session["session_key"],
                                                platform_override=_session_source(session))
-        finally:
-            _clear_session_context(tokens)
         new_agent._session_title_hint = "Bot Chat"
         _emit("notice", sid, {"message": "Capabilities updated — this bot's tools and prompt were refreshed."})
     except Exception as e:
