@@ -54,16 +54,56 @@ def test_persist_system_prompt_inside_a_turn_keeps_the_turn_identity():
     assert agent.seen_key == "turn-key"
 
 
-def test_persist_system_prompt_off_turn_still_binds_and_clears():
+def test_persist_system_prompt_off_turn_binds_the_session():
     agent = _FakeAgent()
     session = {"agent": agent, "session_key": "rpc-key"}
 
-    def rpc():
-        server._persist_live_session_system_prompt(session)
-        return get_session_env("HERMES_SESSION_KEY", "unset")
-
-    assert _run_in_fresh_context(rpc) == ""
+    _run_in_fresh_context(lambda: server._persist_live_session_system_prompt(session))
     assert agent.seen_key == "rpc-key"
+
+
+def test_real_switch_commit_inside_a_turn_keeps_the_turn_identity(monkeypatch):
+    """Drive _commit_agent_switch (the path _apply_pending_model_switch takes) inside a bound turn."""
+    from types import SimpleNamespace
+
+    agent = _FakeAgent()
+    agent.switch_model = lambda **kwargs: None
+    session = {"agent": agent, "session_key": "turn-key"}
+    for name in ("_restart_slash_worker", "_persist_live_session_runtime",
+                 "_append_model_switch_marker", "_emit_session_info"):
+        monkeypatch.setattr(server, name, lambda *a, **k: None)
+    result = SimpleNamespace(new_model="new", target_provider="p", api_key="k", base_url="", api_mode="")
+
+    def turn():
+        tokens = server._set_session_context("turn-key", ui_session_id="tab-1")
+        try:
+            server._commit_agent_switch("tab-1", session, agent, result, "old", None)
+            return (get_session_env("HERMES_SESSION_KEY"), get_session_env("HERMES_UI_SESSION_ID"))
+        finally:
+            server._clear_session_context(tokens)
+
+    assert _run_in_fresh_context(turn) == ("turn-key", "tab-1")
+    assert agent.seen_key == "turn-key"
+
+
+def test_a_failing_prompt_build_inside_a_turn_keeps_the_turn_identity():
+    agent = _FakeAgent()
+
+    def boom(system_message=None):
+        raise RuntimeError("build failed")
+
+    agent._build_system_prompt = boom
+    session = {"agent": agent, "session_key": "turn-key"}
+
+    def turn():
+        tokens = server._set_session_context("turn-key", ui_session_id="tab-1")
+        try:
+            server._persist_live_session_system_prompt(session)
+            return get_session_env("HERMES_UI_SESSION_ID")
+        finally:
+            server._clear_session_context(tokens)
+
+    assert _run_in_fresh_context(turn) == "tab-1"
 
 
 def test_a_different_bound_session_is_not_reused():

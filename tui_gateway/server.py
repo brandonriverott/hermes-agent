@@ -965,7 +965,8 @@ def _session_context_scope(session_key: str, cwd: str | None = None):
     ``clear_session_vars`` is not nestable: it blanks every var. A helper that runs inside a turn
     (e.g. the system-prompt refresh after a model switch applied at turn start) must therefore not
     bind+clear the same session again, or the rest of the turn loses its session key and UI session
-    id and identity-keyed tool hooks fail closed.
+    id and identity-keyed tool hooks fail closed. When the binding is reused, *cwd* is ignored: the
+    helper sees the turn's own cwd (the session's stored cwd), the same one the turn's tools use.
     """
     try:
         from gateway.session_context import bound_session_key
