@@ -58,3 +58,42 @@ def test_genuinely_different_upstream_still_strips_overlaps():
     inventory._strip_aggregator_overlaps(rows)
     assert rows[0]["models"] == ["deepseek/deepseek-v4.1-flash"]
     assert rows[0]["total_models"] == 1
+
+
+@pytest.mark.parametrize("declared", [
+    ["z-ai/glm-5.3-flash"],
+    "z-ai/glm-5.3-flash",
+    {"z-ai/glm-5.3-flash": {}},
+])
+def test_models_the_user_pinned_on_the_aggregator_survive_the_strip(declared):
+    # The user listed the id under ``providers.openrouter.models`` themselves: a discovering proxy
+    # (OrcaRouter serving hundreds of ids) that also has it must not hide that explicit pick.
+    rows = [
+        _builtin_openrouter_row(["z-ai/glm-5.3-flash", "openai/gpt-6"]),
+        _user_row("orcarouter", "https://api.orcarouter.ai/v1", ["Z-AI/GLM-5.3-Flash", "openai/gpt-6"]),
+    ]
+    inventory._strip_aggregator_overlaps(rows, {"openrouter": {"models": declared}})
+    assert rows[0]["models"] == ["z-ai/glm-5.3-flash"]
+    assert rows[0]["total_models"] == 1
+
+
+def test_pins_for_another_aggregator_do_not_protect_this_one():
+    rows = [
+        _builtin_openrouter_row(["openai/gpt-6"]),
+        _user_row("custom:proxy", "https://my-proxy.example.com/v1", ["openai/gpt-6"]),
+    ]
+    inventory._strip_aggregator_overlaps(rows, {"nous": {"models": ["openai/gpt-6"]}})
+    assert rows[0]["models"] == []
+
+
+@pytest.mark.parametrize("entry", [
+    {"models": ["z-ai/glm-5.3-flash"], "models_discovered": True},
+    {"models": {"z-ai/glm-5.3-flash": {}, "__discovered_model_catalog__": True}},
+])
+def test_a_catalog_hermes_discovered_is_not_a_pin(entry):
+    rows = [
+        _builtin_openrouter_row(["z-ai/glm-5.3-flash"]),
+        _user_row("orcarouter", "https://api.orcarouter.ai/v1", ["z-ai/glm-5.3-flash"]),
+    ]
+    inventory._strip_aggregator_overlaps(rows, {"openrouter": entry})
+    assert rows[0]["models"] == []

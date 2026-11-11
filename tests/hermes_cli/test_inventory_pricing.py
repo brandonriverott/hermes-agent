@@ -182,7 +182,7 @@ def test_model_options_cold_pricing_fetch_runs_off_the_request_path(monkeypatch)
     monkeypatch.setattr(inv, "_apply_featured", lambda _rows, **_kwargs: None)
     # The aggregator dedup asks models.dev about the row; in a cold process that is a live network
     # fetch, which is not the pricing path this bound is about (CI saw it take 9.5 s).
-    monkeypatch.setattr(inv, "_strip_aggregator_overlaps", lambda _rows: None)
+    monkeypatch.setattr(inv, "_strip_aggregator_overlaps", lambda _rows, _user_providers=None: None)
     monkeypatch.setattr(inv, "_pricing_prewarm_threads", {})
 
     try:

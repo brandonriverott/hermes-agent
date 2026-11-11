@@ -136,8 +136,9 @@ def build_models_payload(
             rows = list(rows) + _append_unconfigured_rows(rows, ctx, current_only=True)
 
     # A local proxy serving a model also in an aggregator's catalog would show under both, and picking
-    # the aggregator row silently breaks the call — aggregators only list models no specific provider has.
-    _strip_aggregator_overlaps(rows)
+    # the aggregator row silently breaks the call — aggregators only list models no specific provider has,
+    # except ids the user declared for the aggregator itself (an explicit pick there passes the provider).
+    _strip_aggregator_overlaps(rows, ctx.user_providers)
 
     if include_unconfigured:
         rows = list(rows) + _without_slug(_append_unconfigured_rows(rows, ctx), "moa")
@@ -170,11 +171,14 @@ def build_models_payload(
     return {"providers": rows, "model": ctx.current_model, "provider": ctx.current_provider}
 
 
-def _strip_aggregator_overlaps(rows: list[dict]) -> None:
+def _strip_aggregator_overlaps(rows: list[dict], user_providers: dict | None = None) -> None:
     """Drop models from TRUE routing aggregators (OpenRouter, custom:* proxies) that a user-defined
     provider also serves. The is_user_defined guard matters: is_routing_aggregator() is True for every
     custom:* slug, so without it the dedup would empty a user's own custom row. Flat-namespace
-    resellers (opencode-go/zen) serve every model first-party and keep shared names."""
+    resellers (opencode-go/zen) serve every model first-party and keep shared names. Ids the user
+    declared for the aggregator itself (``providers.<slug>.models``) are kept: an explicit pick on
+    that row must not vanish because a discovering proxy also serves the id (picks pass the provider,
+    so routing stays on the aggregator)."""
     try:
         from hermes_cli.providers import is_routing_aggregator
     except Exception:
@@ -218,10 +222,22 @@ def _strip_aggregator_overlaps(rows: list[dict]) -> None:
         # provider's own catalog (minimax-m3, glm-5, deepseek-v4-flash, ...) is silently gutted in the
         # picker. (#47077)
         original = row.get("models") or []
-        filtered = [m for m in original if m.lower() not in user_models]
+        pinned = _declared_aggregator_ids(user_providers, row.get("slug", ""))
+        filtered = [m for m in original if m.lower() not in user_models or m.lower() in pinned]
         if len(filtered) < len(original):
             row["models"] = filtered
             row["total_models"] = len(filtered)
+
+
+def _declared_aggregator_ids(user_providers: dict | None, slug: str) -> set[str]:
+    """Lower-cased model ids the user declared under ``providers.<slug>.models`` (any accepted shape)."""
+    from hermes_cli.config_providers import find_provider_entry
+    from hermes_cli.model_switch import _declared_model_ids, _entry_models_discovered
+
+    _key, entry = find_provider_entry(user_providers or {}, slug)
+    if not isinstance(entry, dict) or _entry_models_discovered(entry):
+        return set()  # a catalog Hermes persisted itself is never a user pick
+    return {m.lower() for m in _declared_model_ids(entry.get("models"))}
 
 
 def build_model_options_payload(
