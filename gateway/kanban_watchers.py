@@ -22,6 +22,7 @@ from gateway.kanban_watchers_common import (
     _resolve_auto_decompose_settings,
     _gc_retention_days,
     _to_thread_process_service,
+    _run_in_fresh_context,
     logger,
 )
 from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
@@ -35,6 +36,29 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
+
+
+class _DispatcherLockContended(Exception):
+    """Another gateway owns dispatch; this gateway remains a standby."""
+
+
+async def _dispatcher_service(func, *args):
+    """Keep election ownership until offloaded work actually stops on cancellation."""
+    # An executor Future is not an asyncio Task: loop shutdown must not cancel
+    # a child awaiter and mistake its cancellation for the OS thread finishing.
+    task = asyncio.get_running_loop().run_in_executor(None, _run_in_fresh_context, func, *args)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Cancelling to_thread's awaiter does not stop its OS thread. A new
+        # owner must not sweep the same boards until that thread has finished.
+        drain = asyncio.gather(task, return_exceptions=True)
+        while not drain.done():
+            try:
+                await asyncio.shield(drain)
+            except asyncio.CancelledError:
+                continue
+        raise
 
 
 class GatewayKanbanWatchersMixin:
@@ -209,9 +233,9 @@ class GatewayKanbanWatchersMixin:
     def _kanban_dispatcher_boot(self) -> Optional[tuple]:
         """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.
 
-        Config is read once at boot (restart to apply), except the auto-decompose
-        toggle which is re-read every tick. The env var is an escape hatch to
-        disable without editing YAML.
+        Config is read on each election attempt, then frozen after ownership
+        (except auto-decompose). Lock contention is retryable; disabled or
+        unavailable configuration still exits the watcher.
         """
         try:
             from hermes_cli.config import load_config as _load_config
@@ -244,8 +268,8 @@ class GatewayKanbanWatchersMixin:
         _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
         if _lock_state == "contended":
             logger.info("kanban dispatcher: another gateway already holds the dispatcher "
-                        "lock (%s); this gateway will NOT dispatch.", _lock_path)
-            return None
+                        "lock (%s); this gateway will wait for ownership.", _lock_path)
+            raise _DispatcherLockContended
         if _lock_state == "held":
             self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
             logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
@@ -254,79 +278,82 @@ class GatewayKanbanWatchersMixin:
                            "on config control alone.", _lock_path)
         return _load_config, _kb, kanban_cfg
 
-    async def _kanban_dispatcher_watcher(self) -> None:
-        """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
-
-        Gated by `kanban.dispatch_in_gateway` (default True); when false the
-        loop exits and an external `hermes kanban daemon` is expected. Each
-        tick runs :func:`kanban_db_dispatch.dispatch_once` in a thread; one tick's
-        failure never stops the next. Shutdown: ``self._running`` is checked
-        between ticks and the in-flight ``to_thread`` returns on its own.
-        """
-        boot = self._kanban_dispatcher_boot()
-        if boot is None:
-            return
-        _load_config, _kb, kanban_cfg = boot
-        settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
-        interval = settings.interval
-
-        # Initial delay so adapters are wired before workers spawn (matches the notifier).
-        await asyncio.sleep(5)
-
-        # Health telemetry (mirrors `_cmd_daemon`): warn when the ready queue
-        # is non-empty but spawns are 0 for N consecutive ticks — usually a
-        # broken PATH, missing venv, or credential loss.
-        bad_ticks = 0
-        last_warn_at = 0
-        results: Optional[list] = None
-        dispatcher = _KanbanDispatcher(_kb, settings)
-
-        logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
+    async def _wait_for_kanban_dispatcher_boot(self) -> Optional[tuple]:
+        """Stay eligible after losing an election, without dispatching concurrently."""
         while self._running:
             try:
-                # Reap zombies before per-board work so a board DB failure
-                # cannot block cleanup of unrelated workers.
-                from hermes_cli import kanban_db_dispatch as _kbd
-                pids = await _to_thread_process_service(_kbd.reap_worker_zombies)
-                if pids:
-                    logger.info("kanban dispatcher: reaped %d zombie worker(s), pids=%s", len(pids), pids)
-            except Exception:
-                logger.exception("kanban dispatcher: zombie reaper failed")
+                return self._kanban_dispatcher_boot()
+            except _DispatcherLockContended:
+                await self._sleep_between_ticks(5.0)
+        return None
 
-            try:
-                # Emergency stop (`hermes pause`): no auto-decompose or
-                # dispatch while paused; running workers finish naturally.
-                if not _kanban_dispatch_allowed():
-                    bad_ticks = 0
-                else:
-                    # Re-read the auto-decompose toggle live so disabling it
-                    # takes effect on the next tick, not on restart.
-                    _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
-                    # See #49638.
-                    if _ad_enabled:
-                        await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
-                    results = await _to_thread_process_service(dispatcher.tick_once)
-                    any_spawned = _log_spawn_results(results)
-                    ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
-                now = int(time.time())
-                if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
-                    held = _kbd.describe_suppression(res for _slug, res in (results or []))
-                    logger.warning(
-                        "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned.%s Check "
-                        "profile health (venv, PATH, credentials) and "
-                        "`hermes kanban list --status ready`.",
-                        bad_ticks, f" Last tick held back: {held}." if held else "",
-                    )
-                    last_warn_at = now
-            except asyncio.CancelledError:
-                logger.debug("kanban dispatcher: cancelled")
-                self._release_kanban_dispatcher_lock()
-                raise
-            except Exception:
-                logger.exception("kanban dispatcher: unexpected watcher error")
+    async def _kanban_dispatcher_watcher(self) -> None:
+        """Elect one dispatcher, then tick until shutdown; retry only contention."""
+        try:
+            boot = await self._wait_for_kanban_dispatcher_boot()
+            if boot is None:
+                return
+            _load_config, _kb, kanban_cfg = boot
+            settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
+            interval = settings.interval
 
-            await self._sleep_between_ticks(interval)
+            # Initial delay so adapters are wired before workers spawn (matches the notifier).
+            await asyncio.sleep(5)
 
-        self._release_kanban_dispatcher_lock()
+            # Health telemetry (mirrors `_cmd_daemon`): warn when the ready queue
+            # is non-empty but spawns are 0 for N consecutive ticks — usually a
+            # broken PATH, missing venv, or credential loss.
+            bad_ticks = 0
+            last_warn_at = 0
+            results: Optional[list] = None
+            dispatcher = _KanbanDispatcher(_kb, settings)
+
+            logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
+            while self._running:
+                try:
+                    # Reap zombies before per-board work so a board DB failure
+                    # cannot block cleanup of unrelated workers.
+                    from hermes_cli import kanban_db_dispatch as _kbd
+                    pids = await _dispatcher_service(_kbd.reap_worker_zombies)
+                    if pids:
+                        logger.info("kanban dispatcher: reaped %d zombie worker(s), pids=%s", len(pids), pids)
+                except Exception:
+                    logger.exception("kanban dispatcher: zombie reaper failed")
+
+                try:
+                    # Emergency stop (`hermes pause`): no auto-decompose or
+                    # dispatch while paused; running workers finish naturally.
+                    if not _kanban_dispatch_allowed():
+                        bad_ticks = 0
+                    else:
+                        # Re-read the auto-decompose toggle live so disabling it
+                        # takes effect on the next tick, not on restart.
+                        _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
+                        # See #49638.
+                        if _ad_enabled:
+                            await _dispatcher_service(dispatcher.auto_decompose_tick, _ad_per_tick)
+                        results = await _dispatcher_service(dispatcher.tick_once)
+                        any_spawned = _log_spawn_results(results)
+                        ready_pending = await _dispatcher_service(dispatcher.ready_nonempty)
+                        bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                    now = int(time.time())
+                    if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
+                        held = _kbd.describe_suppression(res for _slug, res in (results or []))
+                        logger.warning(
+                            "kanban dispatcher stuck: ready queue non-empty for "
+                            "%d consecutive ticks but 0 workers spawned.%s Check "
+                            "profile health (venv, PATH, credentials) and "
+                            "`hermes kanban list --status ready`.",
+                            bad_ticks, f" Last tick held back: {held}." if held else "",
+                        )
+                        last_warn_at = now
+                except asyncio.CancelledError:
+                    logger.debug("kanban dispatcher: cancelled")
+                    raise
+                except Exception:
+                    logger.exception("kanban dispatcher: unexpected watcher error")
+
+                await self._sleep_between_ticks(interval)
+        finally:
+            # Cancellation can arrive during initial delay or between ticks too.
+            self._release_kanban_dispatcher_lock()
