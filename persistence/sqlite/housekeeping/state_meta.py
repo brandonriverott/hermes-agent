@@ -30,6 +30,40 @@ class SQLiteStateMetaRepository:
         with translated():
             self._store.holder().set_meta(key, value)
 
+    def insert_if_absent(self, key: str, value: str) -> bool:
+        if not key:
+            raise ValueError("state_meta key must be non-empty")
+        with translated():
+            return self._store.holder()._write_rowcount(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                (key, value),
+            ) == 1
+
+    def replace_if_current(self, key: str, expected: str, value: str) -> bool:
+        if not key:
+            raise ValueError("state_meta key must be non-empty")
+        with translated():
+            return self._store.holder()._write_rowcount(
+                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?", (value, key, expected)
+            ) == 1
+
+    def move_if_current(self, source: str, target: str, expected: str, archive: str) -> bool:
+        if not source or not target or source == target:
+            raise ValueError("state_meta move requires two distinct non-empty keys")
+
+        def move(conn):
+            inserted = conn.execute(
+                "INSERT INTO state_meta (key, value) SELECT ?, value FROM state_meta "
+                "WHERE key = ? AND value = ? ON CONFLICT(key) DO NOTHING", (target, source, expected)
+            )
+            if inserted.rowcount != 1:
+                return False
+            conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (archive, source))
+            return True
+
+        with translated():
+            return self._store.holder()._execute_write(move)
+
     def list_prefix(self, prefix: str) -> tuple[StateMetaEntry, ...]:
         if not prefix:
             raise ValueError("state_meta prefix must be non-empty")

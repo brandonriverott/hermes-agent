@@ -9,6 +9,7 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -451,6 +452,8 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: list[GoalGate] = field(default_factory=list)
+    # An archived parent can still receive a control from its open frontend.
+    continued_session_id: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -467,6 +470,7 @@ class GoalState:
             max_turns=int(data.get("max_turns") or DEFAULT_MAX_TURNS),
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
+            continued_session_id=data.get("continued_session_id") or "",
             paused_reason=data.get("paused_reason"),
             subgoals=[str(s).strip() for s in raw_subgoals if str(s).strip()] if isinstance(raw_subgoals, list) else [],
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
@@ -631,11 +635,15 @@ def load_goal(session_id: str) -> Optional[GoalState]:
     except Exception as exc:
         logger.debug("GoalManager: get_meta failed: %s", exc)
         return None
+    return _decode_stored_goal(session_id, raw)
+
+
+def _decode_stored_goal(session_id: str, raw: Optional[str]) -> Optional[GoalState]:
     if not raw:
         return None
     try:
         return GoalState.from_json(raw)
-    except Exception as exc:
+    except (AttributeError, TypeError, ValueError, OverflowError, RecursionError) as exc:
         logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
         return None
 
@@ -663,6 +671,51 @@ def clear_goal(session_id: str) -> None:
     save_goal(session_id, state)
 
 
+_CONTROL_CONTENTION_LIMIT = 32
+
+
+class _GoalChangedDuringEvaluation(Exception):
+    """A user control, rotation, or another evaluator won the write."""
+
+
+def _apply_goal_control(session_id: str, *, clear: bool) -> Optional[GoalState]:
+    if not session_id:
+        return None
+    db = _get_session_db()
+    if db is None:
+        raise RuntimeError("Goal control requires available session storage")
+    meta = db.state_meta
+    expected_goal = None
+    seen = set()
+    for _ in range(_CONTROL_CONTENTION_LIMIT):
+        key = _meta_key(session_id)
+        raw = meta.get(key)
+        if raw is None:
+            if expected_goal is not None or meta.insert_if_absent(key, ""):
+                return None
+            continue
+        state = _decode_stored_goal(session_id, raw)
+        if state is None:
+            return None
+        identity = (state.created_at, state.goal)
+        if expected_goal is not None and identity != expected_goal:
+            return None  # The child belongs to a later explicit goal.
+        if state.status == "cleared" and state.continued_session_id:
+            if session_id in seen:
+                raise RuntimeError("Goal continuation cycle")
+            seen.add(session_id)
+            expected_goal, session_id = identity, state.continued_session_id
+            continue
+        had_goal = state.status in {"active", "paused"}
+        state.status = "cleared" if clear else "paused"
+        if not clear:
+            state.paused_reason = "user-paused"
+            state.clear_wait()
+        if meta.replace_if_current(key, raw, state.to_json()):
+            return state if had_goal or not clear else None
+    raise RuntimeError("Goal changed repeatedly while applying the user control")
+
+
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
     """Carry a persistent /goal from a parent session to its continuation. Best-effort, never raises
     (a failure here must not block compression). Returns True when a goal was migrated.
@@ -676,17 +729,28 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_goal(old_session_id)
-        if state is None or state.status == "cleared":
+        db = _get_session_db()
+        if db is None:
             return False
-        # Don't clobber a goal already set on the child (e.g. a resumed lineage).
-        if load_goal(new_session_id) is not None:
-            return False
-        save_goal(new_session_id, state)
-        # Archive the parent's row so it isn't double-counted as active.
-        clear_goal(old_session_id)
-        logger.debug("GoalManager: migrated goal %s -> %s (%s)", old_session_id, new_session_id, reason or "rotation")
-        return True
+        meta = db.state_meta
+        source, target = _meta_key(old_session_id), _meta_key(new_session_id)
+        for _ in range(_CONTROL_CONTENTION_LIMIT):
+            raw = meta.get(source)
+            if raw is None or meta.get(target) is not None:
+                return False
+            state = GoalState.from_json(raw) if raw else None
+            if state is None or state.status == "cleared":
+                if state is not None and state.continued_session_id:
+                    return False
+                if meta.move_if_current(source, target, raw, raw):
+                    return False
+                continue
+            state.status = "cleared"
+            state.continued_session_id = new_session_id
+            if meta.move_if_current(source, target, raw, state.to_json()):
+                logger.debug("GoalManager: migrated goal %s -> %s (%s)", old_session_id, new_session_id, reason)
+                return True
+        raise RuntimeError("Goal kept changing during compression")
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("GoalManager: goal migration failed: %s", exc)
         return False
@@ -1085,11 +1149,13 @@ class GoalManager:
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        self._evaluation_write = None
+        self.refresh()
 
     def refresh(self) -> None:
         """Re-read state from the DB (another writer, e.g. a tool, moved it)."""
         self._state = load_goal(self.session_id)
+        self._persisted_state = self._state.to_json() if self._state is not None else None
 
     # --- introspection ------------------------------------------------
 
@@ -1134,8 +1200,22 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
+    def apply_user_control(self, *, clear: bool) -> Optional[GoalState]:
+        """Apply the user's control to the persisted goal, including an in-flight rotation."""
+        updated = _apply_goal_control(self.session_id, clear=clear)
+        self.refresh()
+        return updated
+
     def _save(self) -> Optional[GoalState]:
-        save_goal(self.session_id, self._state)
+        value = self._state.to_json()
+        if self._evaluation_write is None:
+            save_goal(self.session_id, self._state)
+        else:
+            meta, expected = self._evaluation_write
+            if not meta.replace_if_current(_meta_key(self.session_id), expected, value):
+                raise _GoalChangedDuringEvaluation
+            self._evaluation_write = meta, value
+        self._persisted_state = value
         return self._state
 
     def _require_goal(self) -> GoalState:
@@ -1477,10 +1557,29 @@ class GoalManager:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
         own continuations increment ``turns_used`` — both consume model budget."""
-        state = self._state
-        if state is None or state.status != "active":
-            return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+        db = _get_session_db()
+        raw = db.state_meta.get(_meta_key(self.session_id)) if db is not None else None
+        stored = _decode_stored_goal(self.session_id, raw)
+        if stored is None or stored.status != "active":
+            return _decision(stored.status if stored else None, False, None, "inactive", "no active goal", "")
+        # No shared mutable manager or database lock crosses a shell gate or model call.
+        # A local state edit can be used only when its original persisted version is current.
+        evaluation = copy.copy(self)
+        evaluation._state = copy.deepcopy(self._state) if self._persisted_state == stored.to_json() else stored
+        evaluation._persisted_state = stored.to_json()
+        evaluation._evaluation_write = db.state_meta, raw
+        try:
+            decision = evaluation._evaluate_active(last_response, background_processes, active_delegations)
+        except _GoalChangedDuringEvaluation:
+            decision = None
+        self.refresh()
+        if decision is None or self._persisted_state != evaluation._persisted_state:
+            status = self._state.status if self._state else None
+            return _decision(status, False, None, "inactive", "goal changed during evaluation", "")
+        return decision
 
+    def _evaluate_active(self, last_response, background_processes, active_delegations):
+        state = self._state
         # Parked on a live process or an unexpired deadline: quiesce without burning a turn.
         if self.is_waiting():
             return self._waiting_decision(state)

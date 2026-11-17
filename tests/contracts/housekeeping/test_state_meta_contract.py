@@ -33,6 +33,16 @@ def test_set_then_get_and_upsert_overwrites(backend, scope_a):
     assert store_a.state_meta.get("gate:one") == "2"
 
 
+def test_atomic_insert_preserves_existing_empty_values_and_profile_scope(backend, scope_a, scope_b):
+    a = backend.open(scope_a).state_meta
+    b = backend.open(scope_b).state_meta
+    assert a.insert_if_absent("goal:one", "")
+    assert not a.insert_if_absent("goal:one", "replacement")
+    assert a.get("goal:one") == ""
+    assert b.insert_if_absent("goal:one", "other")
+    with pytest.raises(ValueError):
+        a.insert_if_absent("", "unused")
+
 def test_values_are_opaque_strings(backend, scope_a):
     store_a = backend.open(scope_a)
     payload = '{"state": "running", "n": 3, "path": "/tmp/%_x"}'

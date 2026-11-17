@@ -255,6 +255,12 @@
         "hermes_cli.session_worktree:restore",
         "hermes_cli.session_worktree:finish"
       ]
+    },
+    {
+      "source": "plugins/index.md § Accepted task plans and native completion tracking",
+      "entries": [
+        "hermes_cli.goal_autostart:start_goal_if_absent"
+      ]
     }
   ]
 }

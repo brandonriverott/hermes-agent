@@ -41,6 +41,18 @@ class StateMetaRepository(Protocol):
         """Upsert ``key`` to ``value`` in this scope: a first write creates, a later write overwrites, and a following ``get`` reads the latest value. Empty ``key`` raises ``ValueError`` before any store access; a read-only assembly refuses with a typed store error and writes nothing."""
         ...
 
+    def insert_if_absent(self, key: str, value: str) -> bool:
+        """Atomically store value only for a missing key; return whether this call inserted it."""
+        ...
+
+    def replace_if_current(self, key: str, expected: str, value: str) -> bool:
+        """Replace an existing value only while it still equals expected."""
+        ...
+
+    def move_if_current(self, source: str, target: str, expected: str, archive: str) -> bool:
+        """Atomically copy expected into an absent target and archive its unchanged source."""
+        ...
+
     def list_prefix(self, prefix: str) -> tuple[StateMetaEntry, ...]:
         """Every key in this scope that starts with ``prefix`` (wildcard characters are literal; ASCII letters match either case, every other character only itself), with its value, in the order the keys were first stored (``set`` on a stored key keeps its place); an unmatched prefix reads an empty tuple. Empty ``prefix`` raises ``ValueError`` before any store access: this is a bounded read, never an enumeration. Read-only assemblies serve this read."""
         ...

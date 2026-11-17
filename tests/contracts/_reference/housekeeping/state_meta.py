@@ -51,6 +51,32 @@ class InMemoryStateMetaRepository:
         require_key(key)
         state_meta_table(self._backend, scope)[key] = value
 
+    def insert_if_absent(self, key: str, value: str) -> bool:
+        require_key(key)
+        table = state_meta_table(self._backend, self._backend.scope)
+        if key in table:
+            return False
+        table[key] = value
+        return True
+
+    def replace_if_current(self, key: str, expected: str, value: str) -> bool:
+        require_key(key)
+        table = state_meta_table(self._backend, self._backend.scope)
+        if table.get(key) != expected:
+            return False
+        table[key] = value
+        return True
+
+    def move_if_current(self, source: str, target: str, expected: str, archive: str) -> bool:
+        if not source or not target or source == target:
+            raise ValueError("state_meta move requires two distinct non-empty keys")
+        table = state_meta_table(self._backend, self._backend.scope)
+        if table.get(source) != expected or target in table:
+            return False
+        table[target] = expected
+        table[source] = archive
+        return True
+
     def list_prefix(self, prefix: str) -> tuple[StateMetaEntry, ...]:
         scope = self._backend.scope
         require_key(prefix)

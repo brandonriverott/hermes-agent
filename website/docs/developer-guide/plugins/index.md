@@ -2995,3 +2995,16 @@ def handler(args, **kwargs):
 # Good — model knows exactly when and how
 "description": "Evaluate a mathematical expression. Use for arithmetic, trig, logarithms. Supports: +, -, *, /, **, sqrt, sin, cos, log, pi, e."
 ```
+
+### Accepted task plans and native completion tracking
+
+A workflow plugin may call `hermes_cli.goal_autostart.start_goal_if_absent(session_id,
+request=original_user_request, outcome=accepted_outcome, verification=acceptance_criteria)`
+after accepting a user-authorized task plan, under the owning native session and profile scope.
+This is an opt-in integration, not a prompt classifier. It atomically creates a native goal
+only when no record exists and returns `started` or `existing`; persistence errors raise.
+Paused, cleared, done and malformed records are preserved, as are existing counters and
+contracts. The configured goal budget and native frontend Stop/judge/continuation behavior
+remain authoritative. No shell gates or follow-up turns are dispatched by this function.
+Store the actual plan and verification evidence through the coordinator's authorized record
+route; the runtime goal does not file anything in a vault or confer acceptance.

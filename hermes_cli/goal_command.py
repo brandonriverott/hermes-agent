@@ -36,7 +36,7 @@ def _show(mgr, arg, render):
 
 
 def _pause(mgr, arg, render):
-    state = mgr.pause(reason="user-paused")
+    state = mgr.apply_user_control(clear=False)
     return GoalCommandResult(
         render("gateway.goal.paused", "⏸ Goal paused: {goal}", goal=state.goal) if state
         else render("gateway.goal.no_goal_set", "No goal set."),
@@ -53,8 +53,7 @@ def _resume(mgr, arg, render):
 
 
 def _clear(mgr, arg, render):
-    had = mgr.has_goal()
-    mgr.clear()
+    had = mgr.apply_user_control(clear=True) is not None
     return GoalCommandResult(render("gateway.goal_cleared", "✓ Goal cleared.") if had else
                              render("gateway.no_active_goal", "No active goal."), clear_pending="clear")
 
